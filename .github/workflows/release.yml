@@ -139,6 +139,10 @@ jobs:
           (github.ref_type == 'tag' ||
            github.event_name == 'schedule' ||
            github.event_name == 'workflow_dispatch') }}
+    env:
+      # Pinned official client release under test. Bump when upstream ships
+      # a new client version worth testing against.
+      OFFICIAL_CLIENT_VERSION: v0.4.0
     steps:
       - uses: actions/checkout@v4
 
@@ -147,16 +151,12 @@ jobs:
           name: x86_64-unknown-linux-gnu
           path: relay-dist
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build official client (pinned upstream commit)
+      - name: Download official client release
         run: |
-          git init -q /tmp/upstream
-          cd /tmp/upstream
-          git remote add origin https://github.com/anomalyco/opentunnel.git
-          git fetch --depth 1 origin 91c2767a0a6de838fd4d8a3be9ec8ca41bd775d3
-          git checkout -q FETCH_HEAD
-          cargo build --release --locked -p opentunnel-cli
+          curl -fsSL -o /tmp/official-client.tgz \
+            "https://github.com/anomalyco/opentunnel/releases/download/${OFFICIAL_CLIENT_VERSION}/opentunnel-linux-x64.tar.gz"
+          mkdir -p /tmp/official-client && tar -xzf /tmp/official-client.tgz -C /tmp/official-client
+          /tmp/official-client/opentunnel --version
 
       - name: Official client <-> our relay, end to end
         env:
@@ -166,5 +166,5 @@ jobs:
         run: |
           tar -xzf relay-dist/opentunnel-relay-x86_64-unknown-linux-gnu.tar.gz -C /tmp
           RELAY_BIN=/tmp/opentunnel-relay-x86_64-unknown-linux-gnu/opentunnel-relay \
-          CLIENT_BIN=/tmp/upstream/target/release/opentunnel \
+          CLIENT_BIN=/tmp/official-client/opentunnel \
           bash .github/scripts/integration-test.sh
