@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - name: Test official client fetch script (offline)
@@ -40,6 +42,8 @@ jobs:
           - target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -112,6 +116,8 @@ jobs:
       # NOTE: checkout first! actions/checkout runs `git clean -ffdx` by
       # default, which would wipe the downloaded artifacts below.
       # Keep the floating `latest` tag on the commit that produced it.
+      # Credentials persist on purpose: the `git push` in "Move latest tag"
+      # needs them.
       - uses: actions/checkout@v5
         if: github.ref_type != 'tag'
         with:
