@@ -32,18 +32,21 @@ pub struct Config {
     #[arg(long, env = "OT_CF_ZONE_ID")]
     pub cf_zone_id: String,
 
-    /// ACME external account binding (ZeroSSL dashboard -> Developer).
-    #[arg(long, env = "OT_ACME_EAB_KID")]
+    /// ACME external account binding. Only needed for CAs that require it
+    /// (e.g. ZeroSSL: dashboard -> Developer). Leave empty for Let's Encrypt.
+    #[arg(long, env = "OT_ACME_EAB_KID", default_value = "")]
     pub acme_eab_kid: String,
 
-    #[arg(long, env = "OT_ACME_EAB_HMAC")]
+    #[arg(long, env = "OT_ACME_EAB_HMAC", default_value = "")]
     pub acme_eab_hmac: String,
 
-    /// ACME directory URL. Defaults to ZeroSSL (free unlimited 90-day certs via ACME).
+    /// ACME directory URL. Defaults to Let's Encrypt production.
+    /// For testing, use the staging server:
+    /// https://acme-staging-v02.api.letsencrypt.org/directory
     #[arg(
         long,
         env = "OT_ACME_URL",
-        default_value = "https://acme.zerossl.com/v2/DV90"
+        default_value = "https://acme-v02.api.letsencrypt.org/directory"
     )]
     pub acme_url: String,
 

@@ -8,7 +8,7 @@
 //!   `*.<domain>` is forwarded as opaque encrypted bytes to the tunnel's
 //!   bridge WebSocket (blind TLS: this server never sees plaintext).
 //! - Tunnels, token hashes, CSRs and certificates persist in SQLite.
-//! - Certificates are issued/renewed via ACME DNS-01 (ZeroSSL by default).
+//! - Certificates are issued/renewed via ACME DNS-01 (Let's Encrypt by default).
 //!
 //! Existing clients (the Rust CLI/SDK) work unchanged: point them at this
 //! server with `OPENTUNNEL_API=https://<domain>`.

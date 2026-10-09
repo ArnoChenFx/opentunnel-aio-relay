@@ -1,4 +1,4 @@
-//! ACME client (RFC 8555) with ZeroSSL external account binding, plus
+//! ACME client (RFC 8555, DNS-01), with optional external account binding, plus
 //! certificate lifecycle management.
 //!
 //! This replaces the Cloudflare Workflow of the hosted deployment. The flow
@@ -173,7 +173,7 @@ fn jws_body(pkcs8: &[u8], protected: &Value, payload: &[u8]) -> Result<Value> {
     Ok(json!({"protected": p, "payload": pl, "signature": s}))
 }
 
-/// Builds the externalAccountBinding object for ZeroSSL.
+/// Builds the externalAccountBinding object (for CAs that require it, e.g. ZeroSSL).
 fn external_account_binding(
     eab_kid: &str,
     eab_hmac_b64: &str,
@@ -293,22 +293,26 @@ impl Acme {
     }
 
     async fn new_account(&mut self) -> Result<()> {
-        let eab = external_account_binding(
-            &self.cfg.eab_kid,
-            &self.cfg.eab_hmac,
-            &self.dir.new_account,
-            &self.account_jwk,
-        )?;
         let nonce = self.nonce().await?;
         let protected = json!({
             "alg": "ES256", "jwk": self.account_jwk,
             "nonce": nonce, "url": self.dir.new_account,
         });
-        let payload = json!({
+        let mut payload = json!({
             "contact": [format!("mailto:{}", self.cfg.email)],
             "termsOfServiceAgreed": true,
-            "externalAccountBinding": eab,
         });
+        // External account binding is only sent for CAs that require it
+        // (e.g. ZeroSSL). Let's Encrypt does not use EAB.
+        if !self.cfg.eab_kid.is_empty() && !self.cfg.eab_hmac.is_empty() {
+            let eab = external_account_binding(
+                &self.cfg.eab_kid,
+                &self.cfg.eab_hmac,
+                &self.dir.new_account,
+                &self.account_jwk,
+            )?;
+            payload["externalAccountBinding"] = eab;
+        }
         let body = jws_body(&self.key_pkcs8, &protected, serde_json::to_vec(&payload)?.as_slice())?;
         let res = self
             .http

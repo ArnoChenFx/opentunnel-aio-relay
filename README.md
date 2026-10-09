@@ -48,8 +48,7 @@ tunnel.example.com      A    203.0.113.10
 ### 2. Credentials
 
 - **Cloudflare API token** with DNS-edit access to the zone (for ACME DNS-01).
-- **ZeroSSL EAB credentials** (free at zerossl.com → Developer): `EAB KID` and
-  `EAB HMAC Key`. Certificate issuance is free and unlimited via ACME.
+  Certificates come from **Let's Encrypt** by default — no extra account needed.
 
 ### 3. Run
 
@@ -57,8 +56,8 @@ tunnel.example.com      A    203.0.113.10
 export OT_DOMAIN=tunnel.example.com
 export OT_CF_TOKEN=your-cloudflare-token
 export OT_CF_ZONE_ID=your-zone-id
-export OT_ACME_EAB_KID=your-eab-kid
-export OT_ACME_EAB_HMAC=your-eab-hmac-key
+# Optional: test against Let's Encrypt staging first
+# export OT_ACME_URL=https://acme-staging-v02.api.letsencrypt.org/directory
 
 ./opentunnel-relay
 # or: ./opentunnel-relay --domain tunnel.example.com --cf-token ... (see --help)
@@ -88,8 +87,8 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_LISTEN` | `0.0.0.0:443` | TCP listen address |
 | `OT_DATA_DIR` | `./data` | SQLite db + API certificate storage |
 | `OT_CF_TOKEN` / `OT_CF_ZONE_ID` | — (required) | Cloudflare DNS for ACME challenges |
-| `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | — (required) | ZeroSSL external account binding |
-| `OT_ACME_URL` | ZeroSSL DV90 | ACME directory (any RFC 8555 CA works) |
+| `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | — (empty) | Only for CAs that require EAB (e.g. ZeroSSL) |
+| `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
 | `OT_ACME_EMAIL` | `acme@localhost` | ACME account contact |
 
 ## systemd example
