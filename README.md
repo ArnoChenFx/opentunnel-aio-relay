@@ -156,10 +156,10 @@ cargo test
 ### End-to-end with the official client (CI)
 
 The `integration` job downloads the official `opentunnel` CLI release binary
-(pinned version, see `OFFICIAL_CLIENT_VERSION` in the workflow), starts this
-relay, and runs a real tunnel: provision via the HTTP API → attach the bridge
-WebSocket → fetch a page through the SNI-routed TLS connection that the client
-terminates. It needs real Let's Encrypt certificates (the official client only
+(tracks upstream `latest` by default — see `OFFICIAL_CLIENT_RELEASE` in the
+workflow; pin a version for reproducible runs), starts this relay, and runs a
+real tunnel: provision via the HTTP API → attach the bridge WebSocket → fetch
+a page through the SNI-routed TLS connection that the client terminates. It needs real Let's Encrypt certificates (the official client only
 trusts the bundled Mozilla roots), so it performs live ACME DNS-01 issuance —
 2 certificates per run.
 

@@ -140,9 +140,10 @@ jobs:
            github.event_name == 'schedule' ||
            github.event_name == 'workflow_dispatch') }}
     env:
-      # Pinned official client release under test. Bump when upstream ships
-      # a new client version worth testing against.
-      OFFICIAL_CLIENT_VERSION: v0.4.0
+      # Which official client release to test against. "latest" tracks
+      # upstream's newest release so incompatibilities surface fast; pin a
+      # version like "v0.4.0" for reproducible runs.
+      OFFICIAL_CLIENT_RELEASE: latest
     steps:
       - uses: actions/checkout@v4
 
@@ -153,8 +154,12 @@ jobs:
 
       - name: Download official client release
         run: |
-          curl -fsSL -o /tmp/official-client.tgz \
-            "https://github.com/anomalyco/opentunnel/releases/download/${OFFICIAL_CLIENT_VERSION}/opentunnel-linux-x64.tar.gz"
+          if [ "${OFFICIAL_CLIENT_RELEASE}" = "latest" ]; then
+            URL="https://github.com/anomalyco/opentunnel/releases/latest/download/opentunnel-linux-x64.tar.gz"
+          else
+            URL="https://github.com/anomalyco/opentunnel/releases/download/${OFFICIAL_CLIENT_RELEASE}/opentunnel-linux-x64.tar.gz"
+          fi
+          curl -fsSL -o /tmp/official-client.tgz "$URL"
           mkdir -p /tmp/official-client && tar -xzf /tmp/official-client.tgz -C /tmp/official-client
           /tmp/official-client/opentunnel --version
 
