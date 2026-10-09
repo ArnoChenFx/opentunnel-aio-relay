@@ -389,7 +389,15 @@ where
     )
     .await;
     for record_id in &placed {
-        let _ = crate::dns::delete_txt(http, &cfg.cf_zone_id, &cfg.cf_token, record_id).await;
+        if let Err(error) =
+            crate::dns::delete_txt(http, &cfg.cf_zone_id, &cfg.cf_token, record_id).await
+        {
+            tracing::warn!(
+                record = %record_id,
+                error = %error,
+                "could not delete ACME TXT record; it stays in DNS"
+            );
+        }
     }
     outcome.map_err(|_| {
         anyhow!(

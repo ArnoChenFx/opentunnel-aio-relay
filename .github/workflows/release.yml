@@ -171,10 +171,11 @@ jobs:
     concurrency:
       group: opentunnel-integration
       cancel-in-progress: false
-    # Real Let's Encrypt issuance happens here (2 certs per run on CI_DOMAIN:
-    # one for the API domain, one for the tunnel). Let's Encrypt allows 50
-    # certs per registered domain per week, so this runs on tags, the weekly
-    # schedule, and manual dispatch -- not on every push.
+    # Real Let's Encrypt issuance happens here (2 certs per run). Each run gets
+    # its own hostname, run-<run id>-<attempt>.<CI_DOMAIN>, because Let's
+    # Encrypt allows only 5 certs per identical name set per week. Let's
+    # Encrypt also allows 50 certs per registered domain per week, so this runs
+    # on tags, the weekly schedule, and manual dispatch -- not on every push.
     #
     if: >-
       ${{ github.ref_type == 'tag' ||

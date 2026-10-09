@@ -234,6 +234,13 @@ connection that the client terminates. It needs real Let's Encrypt
 certificates (the official client only trusts the bundled Mozilla roots), so
 it performs live ACME DNS-01 issuance — 2 certificates per run.
 
+Each run serves its own hostname, `run-<run id>-<attempt>.<CI_DOMAIN>`, so the
+certificate names never repeat. Let's Encrypt allows only 5 certificates per
+identical name set per week, which a fixed hostname would exhaust after a few
+reruns. The script deletes DNS-01 TXT records under that hostname when it
+exits, and it deletes `_acme-challenge.run-*` records left by interrupted runs
+before it starts. Failures are logged and do not fail the job.
+
 One-time setup (repo Settings → Secrets → Actions):
 
 | Secret | Purpose |

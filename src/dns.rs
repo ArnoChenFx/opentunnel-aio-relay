@@ -80,13 +80,19 @@ pub async fn create_txt(
         .ok_or_else(|| anyhow!("DNS response had no record id"))
 }
 
+/// Deletes a TXT record by id. A record that is already gone counts as deleted.
 pub async fn delete_txt(http: &Client, zone_id: &str, token: &str, record_id: &str) -> Result<()> {
-    let _ = http
+    let res = http
         .delete(format!("{}/{}", endpoint(zone_id), record_id))
         .bearer_auth(token)
         .send()
-        .await;
-    Ok(())
+        .await
+        .context("deleting DNS TXT record")?;
+    let status = res.status();
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    bail!("DNS record deletion failed with HTTP {status}");
 }
 
 async fn query_doh(http: &Client, url: &str, name: &str) -> HashSet<String> {
