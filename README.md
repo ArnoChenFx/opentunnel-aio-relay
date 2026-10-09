@@ -105,6 +105,8 @@ WorkingDirectory=/opt/opentunnel-relay
 EnvironmentFile=/opt/opentunnel-relay/secrets.env
 ExecStart=/opt/opentunnel-relay/opentunnel-relay
 Restart=on-failure
+# Keep newly created database, WAL, and key files private.
+UMask=0077
 # 443 needs a privileged port:
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
@@ -113,6 +115,8 @@ WantedBy=multi-user.target
 ```
 
 `secrets.env` holds the `OT_*` variables (mode 600, owned by the service user).
+The service data directory should be owned by `opentunnel` and mode 700; the
+relay also restricts the SQLite database and API private key to mode 600.
 
 ## Certificates
 
@@ -122,7 +126,8 @@ WantedBy=multi-user.target
 - **Renewal**: a background task renews certificates expiring within 30 days
   for tunnels seen in the last 90 days, reusing the stored CSR (the key never
   changes). Attaching with a near-expiry certificate also triggers renewal.
-- **API certificate**: issued at first startup, reused afterwards.
+- **API certificate**: issued at first startup, reused afterwards, and renewed
+  in the background before expiry; new TLS handshakes use the renewed cert.
 
 ## Building
 
@@ -150,7 +155,9 @@ cargo test
   data-frame encoding, control-message round-trips. If these pass, this server
   speaks the exact wire protocol of the official clients.
 - `tests/e2e.rs` — full loop over real sockets: TCP ingress → SNI routing →
-  API TLS → REST provisioning → bridge WebSocket attach → proxied `open`.
+  API TLS → REST provisioning → bridge WebSocket attach → proxied `open`,
+  including half-close response delivery, multiple-bridge isolation, and
+  immediate connection shutdown after tunnel deletion.
 - Unit tests: ClientHello parser, CSR validation (incl. tampered signatures).
 
 ### End-to-end with the official client (CI)

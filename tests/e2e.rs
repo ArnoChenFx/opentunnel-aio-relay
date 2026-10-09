@@ -9,12 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opentunnel_relay::{
-    acme, api,
-    bridge::SessionManager,
-    config::Config,
-    db::Db,
-    ingress,
-    state::AppState,
+    acme, api, bridge::SessionManager, config::Config, db::Db, ingress, state::AppState,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -64,8 +59,7 @@ async fn start_server() -> TestServer {
 
     // Throwaway self-signed API certificate (ACME is bypassed: the files
     // already exist, so ensure_api_cert never dials out).
-    let certified =
-        rcgen::generate_simple_self_signed(vec![DOMAIN.to_string()]).unwrap();
+    let certified = rcgen::generate_simple_self_signed(vec![DOMAIN.to_string()]).unwrap();
     let cert_pem = certified.cert.pem();
     std::fs::write(data_dir.join("api-cert.pem"), &cert_pem).unwrap();
     std::fs::write(
@@ -78,12 +72,24 @@ async fn start_server() -> TestServer {
     let db = Arc::new(Db::open(&data_dir.join("relay.db")).unwrap());
     let http = reqwest::Client::builder().build().unwrap();
     let api_tls = acme::ensure_api_cert(&config, &db, &http).await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(data_dir.join("api-key.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     let state = Arc::new(AppState {
         config,
         db,
         sessions: SessionManager::default(),
-        api_tls,
+        api_tls: Arc::new(tokio::sync::RwLock::new(api_tls)),
         http,
     });
     let router = api::router(state.clone());
@@ -99,10 +105,7 @@ async fn start_server() -> TestServer {
 }
 
 /// TLS to 127.0.0.1 with SNI = relay.test, trusting the test CA.
-async fn tls_connect(
-    port: u16,
-    cert_pem: &str,
-) -> tokio_rustls::client::TlsStream<TcpStream> {
+async fn tls_connect(port: u16, cert_pem: &str) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
         roots.add(cert.unwrap()).unwrap();
@@ -131,7 +134,7 @@ async fn http_request(
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {DOMAIN}\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {DOMAIN}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     tls.write_all(req.as_bytes()).await.unwrap();
@@ -229,6 +232,69 @@ where
     }
 }
 
+async fn expect_end<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, expected_conn: u32)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use futures_util::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for end")
+            .expect("bridge closed")
+            .unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            let control: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if control["type"] == "end" && control["conn"].as_u64() == Some(expected_conn as u64) {
+                return;
+            }
+        }
+    }
+}
+
+async fn expect_close<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use futures_util::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for WebSocket close")
+            .expect("WebSocket ended without a close frame")
+            .unwrap();
+        if matches!(msg, tokio_tungstenite::tungstenite::Message::Close(_)) {
+            return;
+        }
+    }
+}
+
+async fn expect_data<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    expected_conn: u32,
+    expected_payload: &[u8],
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use futures_util::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for proxied data")
+            .expect("bridge closed")
+            .unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Binary(frame) = msg {
+            if let Some((conn, payload)) =
+                opentunnel_relay::proto::bridge::decode_data_frame(&frame)
+            {
+                if conn == expected_conn && payload == expected_payload {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn api_provisioning_flow() {
     let srv = start_server().await;
@@ -249,14 +315,8 @@ async fn api_provisioning_flow() {
     let (status, _) = http_request(&srv, "GET", &format!("/api/tunnel/{id}"), None, "").await;
     assert_eq!(status, 401);
 
-    let (status, body) = http_request(
-        &srv,
-        "GET",
-        &format!("/api/tunnel/{id}"),
-        Some(&token),
-        "",
-    )
-    .await;
+    let (status, body) =
+        http_request(&srv, "GET", &format!("/api/tunnel/{id}"), Some(&token), "").await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&hostname));
 
@@ -270,6 +330,49 @@ async fn api_provisioning_flow() {
     )
     .await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn retrying_same_csr_does_not_restart_active_issuance() {
+    let srv = start_server().await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["tunnel"]["id"].as_str().unwrap().to_string();
+    let hostname = created["tunnel"]["hostname"].as_str().unwrap();
+    let token = created["token"].as_str().unwrap().to_string();
+
+    let mut params = rcgen::CertificateParams::new(vec![hostname.to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, hostname);
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let csr = params.serialize_request(&key).unwrap().pem().unwrap();
+    srv.state
+        .db
+        .begin_issuance(&id, "cert_already_issuing", &csr)
+        .unwrap();
+
+    let body = serde_json::json!({"csr": csr}).to_string();
+    let (status, response) = http_request(
+        &srv,
+        "POST",
+        &format!("/api/tunnel/{id}/certificate"),
+        Some(&token),
+        &body,
+    )
+    .await;
+    assert_eq!(status, 202, "{response}");
+    assert_eq!(
+        srv.state
+            .db
+            .get_tunnel(&id)
+            .unwrap()
+            .unwrap()
+            .cert_id
+            .as_deref(),
+        Some("cert_already_issuing")
+    );
 }
 
 #[tokio::test]
@@ -306,7 +409,7 @@ async fn bridge_attach_and_sni_routing() {
 
     let attach = serde_json::json!({
         "type": "attach",
-        "token": token,
+        "token": token.clone(),
         "transport": "ws",
         "routes": ["@", "api"],
         "client": {"version": "0.1.0", "max_conns": 256},
@@ -317,10 +420,34 @@ async fn bridge_attach_and_sni_routing() {
     .await
     .unwrap();
 
-    let attached: serde_json::Value =
-        serde_json::from_str(&recv_text(&mut ws).await).unwrap();
+    let attached: serde_json::Value = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
     assert_eq!(attached["type"], "attached");
     assert_eq!(attached["heartbeat_ms"], 15000);
+
+    // Attach a second bridge to a disjoint route in the same tunnel session.
+    let tls2 = tls_connect(srv.port, &srv.cert_pem).await;
+    let mut req2 = format!("wss://{DOMAIN}:{}/api/tunnel/{id}/connect", srv.port)
+        .into_client_request()
+        .unwrap();
+    req2.headers_mut()
+        .insert("sec-websocket-protocol", "opentunnel".parse().unwrap());
+    let (mut ws2, _) = tokio_tungstenite::client_async(req2, tls2).await.unwrap();
+    let attach2 = serde_json::json!({
+        "type": "attach",
+        "token": token.clone(),
+        "transport": "ws",
+        "routes": ["extra"],
+        "client": {"version": "0.1.0", "max_conns": 256},
+    });
+    ws2.send(tokio_tungstenite::tungstenite::Message::Text(
+        attach2.to_string().into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&recv_text(&mut ws2).await).unwrap()["type"],
+        "attached"
+    );
 
     // A public TCP connection with SNI = <id>.relay.test must produce `open`.
     let mut public = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
@@ -340,6 +467,76 @@ async fn bridge_attach_and_sni_routing() {
     let conn2 = expect_open(&mut ws, &format!("api.{id}.{DOMAIN}")).await;
     assert_eq!(conn2, 2);
 
+    let mut public_extra = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    public_extra
+        .write_all(&client_hello(&format!("extra.{id}.{DOMAIN}")))
+        .await
+        .unwrap();
+    let conn3 = expect_open(&mut ws2, &format!("extra.{id}.{DOMAIN}")).await;
+    assert_eq!(conn3, 3);
+
+    let request = b"client request before half-close";
+    public.write_all(request).await.unwrap();
+    expect_data(&mut ws, conn1, request).await;
+
+    // A client half-close must signal End upstream but keep the reverse pump
+    // alive long enough to deliver the server's final response.
+    public.shutdown().await.unwrap();
+    expect_end(&mut ws, conn1).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        opentunnel_relay::proto::bridge::encode_data_frame(conn1, b"response after half-close")
+            .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"type": "end", "conn": conn1})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), public.read_to_end(&mut response))
+        .await
+        .expect("response after half-close was not completed")
+        .unwrap();
+    assert_eq!(response, b"response after half-close");
+
+    // A bridge disconnect must reset only its own channels. The second
+    // bridge's already-open connection remains usable.
+    ws.close(None).await.unwrap();
+    expect_close(&mut ws).await;
+    let mut disconnected_response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        public2.read_to_end(&mut disconnected_response),
+    )
+    .await
+    .expect("connection owned by the disconnected bridge stayed open")
+    .unwrap();
+    ws2.send(tokio_tungstenite::tungstenite::Message::Binary(
+        opentunnel_relay::proto::bridge::encode_data_frame(conn3, b"other bridge survived").into(),
+    ))
+    .await
+    .unwrap();
+    ws2.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"type": "end", "conn": conn3})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let mut extra_response = [0u8; 21];
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        public_extra.read_exact(&mut extra_response),
+    )
+    .await
+    .expect("other bridge channel was incorrectly reset")
+    .unwrap();
+    assert_eq!(&extra_response, b"other bridge survived");
+
     // Unknown SNI: connection is dropped, nothing arrives on the bridge.
     let mut public3 = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
     public3
@@ -347,4 +544,24 @@ async fn bridge_attach_and_sni_routing() {
         .await
         .unwrap();
     drop(public3);
+
+    // Deleting the tunnel closes its bridge WebSocket and active public socket.
+    let (status, _) = http_request(
+        &srv,
+        "DELETE",
+        &format!("/api/tunnel/{id}"),
+        Some(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, 204);
+    let mut deleted_conn = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        public_extra.read_to_end(&mut deleted_conn),
+    )
+    .await
+    .expect("active public connection stayed open after tunnel deletion")
+    .unwrap();
+    expect_close(&mut ws2).await;
 }

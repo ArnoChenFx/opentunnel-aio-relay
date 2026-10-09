@@ -7,22 +7,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc,
 };
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, RwLock};
 
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::proto::bridge::{
-    self, ClientMessage, ConnId, ServerMessage, Transport, decode_data_frame, encode_data_frame,
+    self, decode_data_frame, encode_data_frame, ClientMessage, ConnId, ServerMessage, Transport,
 };
 use crate::proto::names;
-use crate::state::{AppState, now_rfc3339};
+use crate::state::{now_rfc3339, AppState};
 
 /// Outgoing frames queued for one bridge WebSocket.
 #[derive(Debug)]
@@ -52,8 +52,15 @@ pub struct Session {
     pub token_hash: String,
     pub cert_ready: AtomicBool,
     bridges: AsyncMutex<Vec<BridgeHandle>>,
-    channels: AsyncMutex<HashMap<ConnId, mpsc::Sender<ChannelMsg>>>,
+    channels: AsyncMutex<HashMap<ConnId, ChannelHandle>>,
     next_conn: AtomicU32,
+    closed: AtomicBool,
+    shutdown: watch::Sender<bool>,
+}
+
+struct ChannelHandle {
+    bridge_id: String,
+    tx: mpsc::Sender<ChannelMsg>,
 }
 
 #[derive(Default)]
@@ -64,13 +71,30 @@ pub struct SessionManager {
 impl SessionManager {
     /// Returns the in-memory session, loading it from the DB on first use.
     pub async fn get_or_load(&self, db: &Db, id: &str) -> Result<Option<Arc<Session>>> {
-        if let Some(session) = self.inner.read().await.get(id) {
-            return Ok(Some(session.clone()));
+        let existing = { self.inner.read().await.get(id).cloned() };
+        if let Some(session) = existing {
+            if session.is_closed() {
+                return Ok(None);
+            }
+            match db.get_tunnel(id)? {
+                Some(record) if record.deleted_at.is_none() => return Ok(Some(session)),
+                _ => {
+                    session.signal_shutdown();
+                    return Ok(None);
+                }
+            }
         }
+        let mut sessions = self.inner.write().await;
+        if let Some(session) = sessions.get(id) {
+            return Ok((!session.is_closed()).then(|| session.clone()));
+        }
+        // Recheck under the insertion lock: deletion persists its tombstone
+        // before SessionManager::remove takes this lock.
         let record = match db.get_tunnel(id)? {
             Some(record) if record.deleted_at.is_none() => record,
             _ => return Ok(None),
         };
+        let (shutdown, _) = watch::channel(false);
         let session = Arc::new(Session {
             id: record.id.clone(),
             hostname: record.hostname.clone(),
@@ -79,8 +103,10 @@ impl SessionManager {
             bridges: AsyncMutex::new(Vec::new()),
             channels: AsyncMutex::new(HashMap::new()),
             next_conn: AtomicU32::new(1),
+            closed: AtomicBool::new(false),
+            shutdown,
         });
-        self.inner.write().await.insert(id.to_string(), session.clone());
+        sessions.insert(id.to_string(), session.clone());
         Ok(Some(session))
     }
 
@@ -89,7 +115,11 @@ impl SessionManager {
     }
 
     pub async fn remove(&self, id: &str) {
-        self.inner.write().await.remove(id);
+        let session = self.inner.write().await.remove(id);
+        if let Some(session) = session {
+            session.signal_shutdown();
+            session.shutdown_live_connections().await;
+        }
     }
 }
 
@@ -168,6 +198,11 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             return Ok(());
         }
     };
+    let mut shutdown_rx = session.shutdown.subscribe();
+    if session.is_closed() {
+        let _ = socket.close().await;
+        return Ok(());
+    }
 
     if hash_token(&token) != session.token_hash {
         send_text(
@@ -217,11 +252,9 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
     // A route belongs to one bridge at a time (takeover via retry).
     {
         let bridges = session.bridges.lock().await;
-        let conflict = bridges.iter().any(|b| {
-            b.routes
-                .iter()
-                .any(|r| routes.iter().any(|want| want == r))
-        });
+        let conflict = bridges
+            .iter()
+            .any(|b| b.routes.iter().any(|r| routes.iter().any(|want| want == r)));
         if conflict {
             drop(bridges);
             send_text(
@@ -270,6 +303,12 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
 
     loop {
         tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    tracing::debug!(tunnel = %tunnel_id, "bridge closed because tunnel was deleted");
+                    break;
+                }
+            }
             _ = &mut idle => {
                 tracing::debug!(tunnel = %tunnel_id, "bridge idle timeout");
                 break;
@@ -292,7 +331,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                 match msg {
                     Message::Text(text) => {
                         if let Some(control) = parse_client_message(&text) {
-                            if let Some(reply) = handle_control(&session, control).await {
+                            if let Some(reply) = handle_control(&session, &bridge_id, control).await {
                                 if send_text(socket, &reply).await.is_err() {
                                     break;
                                 }
@@ -301,8 +340,14 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                     }
                     Message::Binary(data) => {
                         if let Some((conn, payload)) = decode_data_frame(&data) {
-                            let channels = session.channels.lock().await;
-                            if let Some(tx) = channels.get(&conn) {
+                            let tx = {
+                                let channels = session.channels.lock().await;
+                                channels
+                                    .get(&conn)
+                                    .filter(|channel| channel.bridge_id == bridge_id)
+                                    .map(|channel| channel.tx.clone())
+                            };
+                            if let Some(tx) = tx {
                                 let _ = tx.send(ChannelMsg::Data(payload.to_vec())).await;
                             }
                         }
@@ -329,15 +374,22 @@ async fn detach_bridge(state: &AppState, session: &Arc<Session>, bridge_id: &str
         bridges.retain(|b| b.id != bridge_id);
         remaining = bridges.len();
     }
-    // Abort channels owned by this bridge.
-    {
+    // Abort only channels owned by this bridge; other bridges remain active.
+    let owned_senders = {
         let mut channels = session.channels.lock().await;
-        let owned: Vec<ConnId> = channels.keys().copied().collect();
-        for conn in owned {
-            if let Some(tx) = channels.remove(&conn) {
-                let _ = tx.send(ChannelMsg::Reset("bridge_disconnected".into())).await;
-            }
-        }
+        let owned: Vec<ConnId> = channels
+            .iter()
+            .filter_map(|(conn, channel)| (channel.bridge_id == bridge_id).then_some(*conn))
+            .collect();
+        owned
+            .into_iter()
+            .filter_map(|conn| channels.remove(&conn).map(|channel| channel.tx))
+            .collect::<Vec<_>>()
+    };
+    for tx in owned_senders {
+        let _ = tx
+            .send(ChannelMsg::Reset("bridge_disconnected".into()))
+            .await;
     }
     if remaining == 0 {
         let _ = state.db.set_online(&session.id, false, &now_rfc3339());
@@ -346,21 +398,23 @@ async fn detach_bridge(state: &AppState, session: &Arc<Session>, bridge_id: &str
 }
 
 /// Handles an incoming control message. Returns a reply to send, if any.
-async fn handle_control(session: &Arc<Session>, control: ClientMessage) -> Option<ServerMessage> {
+async fn handle_control(
+    session: &Arc<Session>,
+    bridge_id: &str,
+    control: ClientMessage,
+) -> Option<ServerMessage> {
     match control {
         ClientMessage::Ping { time_sent } => Some(ServerMessage::Pong { time_sent }),
         ClientMessage::Pong { .. } => None,
-        ClientMessage::End { conn } | ClientMessage::Reset { conn, .. } => {
-            let is_reset = matches!(control, ClientMessage::Reset { .. });
-            let channels = session.channels.lock().await;
-            if let Some(tx) = channels.get(&conn) {
-                let _ = tx
-                    .send(if is_reset {
-                        ChannelMsg::Reset("reset".into())
-                    } else {
-                        ChannelMsg::End
-                    })
-                    .await;
+        ClientMessage::End { conn } => {
+            if let Some(tx) = channel_sender_for_bridge(session, bridge_id, conn).await {
+                let _ = tx.send(ChannelMsg::End).await;
+            }
+            None
+        }
+        ClientMessage::Reset { conn, code } => {
+            if let Some(tx) = channel_sender_for_bridge(session, bridge_id, conn).await {
+                let _ = tx.send(ChannelMsg::Reset(code)).await;
             }
             None
         }
@@ -368,14 +422,26 @@ async fn handle_control(session: &Arc<Session>, control: ClientMessage) -> Optio
     }
 }
 
+async fn channel_sender_for_bridge(
+    session: &Session,
+    bridge_id: &str,
+    conn: ConnId,
+) -> Option<mpsc::Sender<ChannelMsg>> {
+    session
+        .channels
+        .lock()
+        .await
+        .get(&conn)
+        .filter(|channel| channel.bridge_id == bridge_id)
+        .map(|channel| channel.tx.clone())
+}
+
 /// Lenient decode: unknown message types are ignored per the protocol spec.
 fn parse_client_message(text: &str) -> Option<ClientMessage> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let kind = value.get("type")?.as_str()?;
     match kind {
-        "attach" | "ping" | "pong" | "end" | "reset" => {
-            serde_json::from_value(value).ok()
-        }
+        "attach" | "ping" | "pong" | "end" | "reset" => serde_json::from_value(value).ok(),
         _ => None,
     }
 }
@@ -398,28 +464,38 @@ pub fn random_session_id() -> String {
 
 impl Session {
     /// Finds the bridge currently holding `route`, if any.
-    pub async fn bridge_for_route(&self, route: &str) -> Option<mpsc::Sender<OutMsg>> {
+    pub async fn bridge_for_route(&self, route: &str) -> Option<(String, mpsc::Sender<OutMsg>)> {
         let bridges = self.bridges.lock().await;
         bridges
             .iter()
             .find(|b| b.routes.iter().any(|r| r == route))
-            .map(|b| b.tx.clone())
+            .map(|b| (b.id.clone(), b.tx.clone()))
     }
 
     /// Registers a new proxied connection; returns its connection id.
-    pub async fn open_channel(&self) -> (ConnId, mpsc::Receiver<ChannelMsg>) {
+    pub async fn open_channel(&self, bridge_id: &str) -> (ConnId, mpsc::Receiver<ChannelMsg>) {
         let mut conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel::<ChannelMsg>(256);
         let mut channels = self.channels.lock().await;
         while conn == 0 || channels.contains_key(&conn) {
             conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
         }
-        channels.insert(conn, tx);
+        channels.insert(
+            conn,
+            ChannelHandle {
+                bridge_id: bridge_id.to_string(),
+                tx,
+            },
+        );
         (conn, rx)
     }
 
     pub async fn channel_sender(&self, conn: ConnId) -> Option<mpsc::Sender<ChannelMsg>> {
-        self.channels.lock().await.get(&conn).cloned()
+        self.channels
+            .lock()
+            .await
+            .get(&conn)
+            .map(|channel| channel.tx.clone())
     }
 
     pub async fn close_channel(&self, conn: ConnId) {
@@ -432,6 +508,9 @@ impl Session {
         conn: ConnId,
         payload: &[u8],
     ) -> bool {
+        if self.is_closed() {
+            return false;
+        }
         for chunk in payload.chunks(bridge::MAX_PAYLOAD_SIZE) {
             let frame = encode_data_frame(conn, chunk);
             if bridge_tx.send(OutMsg::Binary(frame)).await.is_err() {
@@ -439,5 +518,33 @@ impl Session {
             }
         }
         true
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    fn signal_shutdown(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.shutdown.send_replace(true);
+        }
+    }
+
+    async fn shutdown_live_connections(&self) {
+        self.bridges.lock().await.clear();
+        let senders = {
+            let mut channels = self.channels.lock().await;
+            channels
+                .drain()
+                .map(|(_, channel)| channel.tx)
+                .collect::<Vec<_>>()
+        };
+        for tx in senders {
+            let _ = tx.send(ChannelMsg::Reset("tunnel_deleted".into())).await;
+        }
     }
 }

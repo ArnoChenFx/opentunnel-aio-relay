@@ -2,7 +2,8 @@
 //! Cloudflare deployment: one row per tunnel holds the metadata the DO kept
 //! in `ctx.storage` (identity, token hash, certificate state, CSR).
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -66,6 +67,9 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        // SQLite otherwise creates databases according to the process umask.
+        // The database also contains the ACME account key and tunnel metadata.
+        secure_database_file(path)?;
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -93,6 +97,7 @@ impl Db {
                  value TEXT NOT NULL
              );",
         )?;
+        secure_database_file(path)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -102,7 +107,13 @@ impl Db {
         self.conn.lock().map_err(|e| Error::Internal(e.to_string()))
     }
 
-    pub fn create_tunnel(&self, id: &str, hostname: &str, token_hash: &str, now: &str) -> Result<bool> {
+    pub fn create_tunnel(
+        &self,
+        id: &str,
+        hostname: &str,
+        token_hash: &str,
+        now: &str,
+    ) -> Result<bool> {
         let conn = self.lock()?;
         let rows = conn.execute(
             "INSERT OR IGNORE INTO tunnels (id, hostname, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -133,7 +144,10 @@ impl Db {
                 params![now, id],
             )?;
         } else {
-            conn.execute("UPDATE tunnels SET state = 'offline' WHERE id = ?1", params![id])?;
+            conn.execute(
+                "UPDATE tunnels SET state = 'offline' WHERE id = ?1",
+                params![id],
+            )?;
         }
         Ok(())
     }
@@ -159,6 +173,21 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically claims a certificate issuance unless one is already active.
+    /// Returns `false` if the tunnel was deleted, missing, or another request
+    /// already moved it into the challenge/issuing state.
+    pub fn try_begin_issuance(&self, id: &str, cert_id: &str, csr_pem: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let rows = conn.execute(
+            "UPDATE tunnels SET cert_id = ?1, cert_state = 'issuing', csr_pem = ?2,
+                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL
+             WHERE id = ?3 AND deleted_at IS NULL
+               AND cert_state NOT IN ('challenge', 'issuing')",
+            params![cert_id, csr_pem, id],
+        )?;
+        Ok(rows == 1)
+    }
+
     pub fn set_challenge(&self, cert_id: &str, token: &str, key: &str) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
@@ -169,7 +198,13 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_ready(&self, cert_id: &str, cert_pem: &str, chain_pem: &str, expiry: &str) -> Result<()> {
+    pub fn set_ready(
+        &self,
+        cert_id: &str,
+        cert_pem: &str,
+        chain_pem: &str,
+        expiry: &str,
+    ) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
             "UPDATE tunnels SET cert_state = 'ready', cert_pem = ?1, chain_pem = ?2,
@@ -204,7 +239,12 @@ impl Db {
 
     /// Tunnels whose certificate expires within `within_secs` and that were
     /// connected in the last `active_within_secs` (or are online now).
-    pub fn renewal_candidates(&self, within_secs: i64, active_within_secs: i64, now_secs: i64) -> Result<Vec<TunnelRecord>> {
+    pub fn renewal_candidates(
+        &self,
+        within_secs: i64,
+        active_within_secs: i64,
+        now_secs: i64,
+    ) -> Result<Vec<TunnelRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
@@ -253,9 +293,11 @@ impl Db {
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let conn = self.lock()?;
-        conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
-            row.get(0)
-        })
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(Error::from)
     }
@@ -293,8 +335,68 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<TunnelRecord> {
     })
 }
 
+fn secure_database_file(path: &Path) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(path)?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn parse_rfc3339_secs(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_path() -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ot-relay-db-{}-{nonce}.sqlite", std::process::id()))
+    }
+
+    #[test]
+    fn issuance_claim_is_atomic_and_database_is_private() {
+        let path = test_path();
+        let db = Db::open(&path).unwrap();
+        assert!(db
+            .create_tunnel("t1", "t1.example.test", "hash", "now")
+            .unwrap());
+        assert!(db.try_begin_issuance("t1", "cert1", "csr").unwrap());
+        assert!(!db.try_begin_issuance("t1", "cert2", "csr").unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name(format!(
+            "{}-wal",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+        let _ = std::fs::remove_file(path.with_file_name(format!(
+            "{}-shm",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+    }
 }

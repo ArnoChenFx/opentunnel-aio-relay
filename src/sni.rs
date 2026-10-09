@@ -123,10 +123,9 @@ pub fn parse_client_hello(data: &[u8]) -> Parse {
                     break;
                 }
                 if name_type == 0 {
-                    server_name = String::from_utf8_lossy(
-                        &hello[name_offset..name_offset + name_length],
-                    )
-                    .into_owned();
+                    server_name =
+                        String::from_utf8_lossy(&hello[name_offset..name_offset + name_length])
+                            .into_owned();
                     break;
                 }
                 name_offset += name_length;
@@ -136,10 +135,8 @@ pub fn parse_client_hello(data: &[u8]) -> Parse {
             let list_end = (offset + 2 + u16(hello, offset)).min(end);
             let protocol_length = hello[offset + 2] as usize;
             if offset + 3 + protocol_length <= list_end {
-                alpn = String::from_utf8_lossy(
-                    &hello[offset + 3..offset + 3 + protocol_length],
-                )
-                .into_owned();
+                alpn = String::from_utf8_lossy(&hello[offset + 3..offset + 3 + protocol_length])
+                    .into_owned();
             }
         }
 
