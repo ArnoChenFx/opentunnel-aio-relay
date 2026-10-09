@@ -41,8 +41,12 @@ tunnel.example.com      A    203.0.113.10
 
 ### 2. 凭证
 
-- **Cloudflare API token**，对该 zone 有 DNS 编辑权限（用于 ACME DNS-01）。
-  证书默认来自 **Let's Encrypt**——不需要额外注册账号。
+ACME DNS-01 需要一套能写 `_acme-challenge` TXT 记录的 DNS 凭证，二选一：
+
+- **Cloudflare API token**，对该 zone 有 DNS 编辑权限（默认）。
+- **阿里云 RAM 用户的 AccessKey**，只授予 DNS 相关权限。见下文[阿里云 DNS](#阿里云-dns)。
+
+证书默认来自 **Let's Encrypt**——不需要额外注册账号。
 
 ### 3. 运行
 
@@ -58,6 +62,8 @@ export OT_CF_ZONE_ID=your-zone-id
 ```
 
 首次启动会通过 ACME DNS-01 为 `tunnel.example.com` 签发 TLS 证书，存到 `./data/`（和 `relay.db` 在一起）。不用手动处理证书。
+
+改用阿里云 DNS 时，把 `OT_CF_*` 换成阿里云的凭证，完整示例见[阿里云 DNS](#阿里云-dns)。ACME 目录和联系邮箱的设置见[ACME 地址和联系邮箱](#acme-地址和联系邮箱)。
 
 ### 4. 使用
 
@@ -78,10 +84,14 @@ opentunnel route add 3000
 | `OT_DOMAIN` | —（必填） | 公网域名，如 `tunnel.example.com` |
 | `OT_LISTEN` | `0.0.0.0:443` | TCP 监听地址 |
 | `OT_DATA_DIR` | `./data` | SQLite 数据库 + API 证书存放目录 |
-| `OT_CF_TOKEN` / `OT_CF_ZONE_ID` | —（必填） | Cloudflare DNS，用于 ACME 验证 |
+| `OT_DNS_PROVIDER` | 自动 | DNS 服务：`cloudflare` 或 `aliyun`。留空时，只有阿里云凭证就用阿里云，有 Cloudflare 凭证就用 Cloudflare（两套都有也用 Cloudflare），都没有则启动报错 |
+| `OT_CF_TOKEN` / `OT_CF_ZONE_ID` | —（用 Cloudflare 时必填） | Cloudflare DNS，用于 ACME 验证 |
+| `OT_ALIYUN_ACCESS_KEY_ID` / `OT_ALIYUN_ACCESS_KEY_SECRET` | —（用阿里云时必填） | 阿里云 RAM 用户的 AccessKey，用于 ACME 验证，权限见[阿里云 DNS](#阿里云-dns) |
+| `OT_ALIYUN_DOMAIN` | —（空：自动查找） | 阿里云账号里包含 `OT_DOMAIN` 的注册域名，如 `example.com` |
+| `OT_ALIYUN_ENDPOINT` | `alidns.aliyuncs.com` | 阿里云 DNS API 地址，只填主机名 |
 | `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | —（空） | 只给需要 EAB 的 CA 用（如 ZeroSSL） |
-| `OT_ACME_URL` | Let's Encrypt 生产环境 | ACME 目录；测试用 `https://acme-staging-v02.api.letsencrypt.org/directory` |
-| `OT_ACME_EMAIL` | `acme@localhost` | ACME 账号联系邮箱 |
+| `OT_ACME_URL` | `https://acme-v02.api.letsencrypt.org/directory`（Let's Encrypt 生产） | ACME 目录。测试用 staging，见[ACME 地址和联系邮箱](#acme-地址和联系邮箱) |
+| `OT_ACME_EMAIL` | `acme@localhost`（占位符） | ACME 账号联系邮箱，见[ACME 地址和联系邮箱](#acme-地址和联系邮箱) |
 | `OT_MAX_CONNECTIONS` | `1024` | 监听器上同时打开的连接数（API、bridge、访客 socket 都算）。超出的在 accept 时直接拒绝。`0` 表示不限制 |
 | `OT_RESERVED_CONNECTIONS` | `64` | 在 `OT_MAX_CONNECTIONS` 里给访客 socket 禁止占用的预留位，保证访客满了 API 和 bridge 还能连进来。必须小于 `OT_MAX_CONNECTIONS`（除非后者为 `0`） |
 | `OT_MAX_CONNECTIONS_PER_IP` | `64` | 单个源地址同时可保持的 socket 数。IPv6 按 /64 统计。超出的在 accept 时拒绝。`0` 表示不限制 |
@@ -92,7 +102,26 @@ opentunnel route add 3000
 | `OT_RATE_LIMIT_PER_HOUR` | `30` | 单个源地址每小时可调用隧道创建和证书绑定的次数。IPv6 按 /64 统计。`0` 表示不限制 |
 | `OT_CREATE_ALLOW_CIDRS` | —（空：允许所有来源） | 允许创建隧道和绑定证书的 IPv4/IPv6 地址或 CIDR 段，逗号分隔 |
 
-不可配置的固定限制：ClientHello 和 TLS 握手必须在 10 秒内完成，每个请求的 header 必须在 10 秒内到达。访客 ClientHello 发出后 15 秒内 bridge 还没发来第一个字节，该转发连接会被以 `connection_terminated` 重置；第一个字节到达后这个检查停止，静默流改由 `OT_STREAM_IDLE_SECS` 管。访客 10 秒内一个字节都不读、且有中转数据在等它，会被单独重置并标记 `backpressure`。除 bridge 的 WebSocket 升级外，每个 API 响应都带 `Connection: close`。单个 ACME 订单最多跑 10 分钟。ACME 和 Cloudflare 的调用 10 秒建连超时、30 秒总超时。
+不可配置的固定限制：ClientHello 和 TLS 握手必须在 10 秒内完成，每个请求的 header 必须在 10 秒内到达。访客 ClientHello 发出后 15 秒内 bridge 还没发来第一个字节，该转发连接会被以 `connection_terminated` 重置；第一个字节到达后这个检查停止，静默流改由 `OT_STREAM_IDLE_SECS` 管。访客 10 秒内一个字节都不读、且有中转数据在等它，会被单独重置并标记 `backpressure`。除 bridge 的 WebSocket 升级外，每个 API 响应都带 `Connection: close`。单个 ACME 订单最多跑 10 分钟。ACME 和 DNS API（Cloudflare、阿里云）的调用 10 秒建连超时、30 秒总超时。
+
+### ACME 地址和联系邮箱
+
+`OT_ACME_URL` 指定签发证书的 ACME 目录，`OT_ACME_EMAIL` 是 ACME 账号的联系邮箱。两者可以用环境变量设置，也可以用命令行参数 `--acme-url`、`--acme-email`。
+
+| 环境 | `OT_ACME_URL` | 说明 |
+|---|---|---|
+| 生产（代码默认值） | `https://acme-v02.api.letsencrypt.org/directory` | 证书受浏览器和官方客户端信任。受 Let's Encrypt 速率限制，每注册域名每周 50 张 |
+| staging（测试） | `https://acme-staging-v02.api.letsencrypt.org/directory` | 限额宽松，但签发的证书不受信任。官方客户端会拒绝连接，这是预期的 |
+
+测试时用单独的数据目录，避免 staging 证书混进生产数据：
+
+```bash
+export OT_ACME_URL=https://acme-staging-v02.api.letsencrypt.org/directory
+export OT_DATA_DIR=./data-staging
+```
+
+- **切回生产前删除旧的 API 证书。** 中转只检查已保存的 API 证书是否有效、是否覆盖 `OT_DOMAIN`，不检查签发机构。从 staging 切到生产后，删掉数据目录里的 `api-cert.pem` 和 `api-key.pem`（默认是 `./data/`）再启动。否则会一直用 staging 证书，直到进入到期前 30 天的续签窗口。
+- **`OT_ACME_EMAIL` 默认是 `acme@localhost`，只是占位符。** 签发时它会以 `mailto:` 形式提交给 ACME 服务器，作为账号联系方式。生产环境请设成你能收信的地址，例如 `export OT_ACME_EMAIL=ops@example.com`。
 
 ### 给慢访客的缓冲
 
@@ -108,6 +137,62 @@ opentunnel route add 3000
 
 - socket 按 TCP 对端地址统计。同一 NAT/代理后的客户端共用一个份额，中转前面架负载均衡会让所有客户端看起来像一个地址。这种部署把 `OT_MAX_CONNECTIONS_PER_IP` 调大或设为 `0`。
 - 还没发 ClientHello 的 socket 只计入全局和按地址的上限。大批来自不同地址的这种 socket 能把全局池占满，直到 10 秒 ClientHello 超时把它们关掉。如果这对你的部署重要，在网络边缘做过滤或限流。
+
+## 阿里云 DNS
+
+除了 Cloudflare，中转也能用阿里云云解析 DNS 发布 ACME DNS-01 的 TXT 记录。前提：
+
+- 要签发证书的域名已经托管在阿里云云解析 DNS，并且域名的 NS 指向阿里云。否则公网解析器看不到记录，验证会失败。
+- 使用只授予下面权限的 RAM 用户的 AccessKey，不要用阿里云主账号的 AccessKey。
+
+### RAM 权限
+
+在 RAM 控制台为中转新建一个用户，开通 **OpenAPI 调用访问**，并为它创建 AccessKey。然后创建下面这条自定义权限策略，授权给该用户：
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "alidns:DescribeDomains",
+        "alidns:DescribeDomainRecords",
+        "alidns:AddDomainRecord",
+        "alidns:DeleteDomainRecord"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+这四个动作分别用于查找域名、查找已有记录、添加 TXT 记录和删除 TXT 记录。中转只增删它自己添加的 `_acme-challenge` 记录。
+
+### 启动示例
+
+```bash
+export OT_DOMAIN=tunnel.example.com
+export OT_ALIYUN_ACCESS_KEY_ID=your-access-key-id
+export OT_ALIYUN_ACCESS_KEY_SECRET=your-access-key-secret
+export OT_ALIYUN_DOMAIN=example.com   # 可省略，见下文"域名查找"
+
+./opentunnel-relay
+```
+
+只设置了阿里云凭证、没有设置 `OT_CF_*` 时，中转自动选用阿里云。两套凭证都设置时用 Cloudflare。要明确指定时，设置 `OT_DNS_PROVIDER=aliyun` 或 `OT_DNS_PROVIDER=cloudflare`。
+
+### 行为说明
+
+- **域名查找**：`OT_ALIYUN_DOMAIN` 没设置时，第一次添加 TXT 记录会调用 `DescribeDomains`（分页读取，最多 5000 个域名），取账号里包含 `OT_DOMAIN` 的最长注册域名，结果在进程内缓存。找不到时签发失败，并提示设置 `OT_ALIYUN_DOMAIN`。设置了的话，`OT_DOMAIN` 必须在它之内，否则启动报错。
+- **记录**：TXT 记录的 TTL 固定为 600 秒，阿里云免费版不接受更小的 TTL。如果同名同值的记录已经存在（比如上次中断的签发留下的），直接复用，不报错。
+- **传播等待**：和 Cloudflare 相同。记录添加后，中转用公共 DoH 解析器（Cloudflare 和 Google）确认记录可见，最多等 60 秒，然后才让 CA 验证。
+- **清理**：签发结束后（无论成功还是失败）删除这次添加的记录，已经不存在的记录视为删除成功。删除失败只记 warning 日志，记录会留在 DNS 中。
+- **认证与重试**：每个请求都使用阿里云 V3 签名（`ACS3-HMAC-SHA256`），不需要额外的 token，也不支持 STS 临时凭证。遇到限流错误（错误码以 `Throttling` 开头）时最多尝试 3 次，间隔 1 秒和 2 秒。
+- **错误信息**：阿里云返回的错误码和消息会写进日志。日志和错误信息里不会出现 AccessKey secret。
+- **endpoint**：`OT_ALIYUN_ENDPOINT` 只填主机名，可以带端口，例如 `alidns.aliyuncs.com`。不要带 `https://` 或路径。
+
+中转启动时不会扫描并清理残留的 `_acme-challenge` 记录。被打断的订单重新排队时，阿里云上同值的记录会被复用。其他残留记录不影响验证（CA 只要求期望的值在记录里），但会留在 DNS 中，可以在控制台手动删除。CI 的集成测试脚本会在启动前清理被打断的测试运行留下的记录。
 
 ## 防滥用
 
@@ -157,7 +242,7 @@ WantedBy=multi-user.target
 - **隧道证书**（`<id>.tunnel.example.com` + 通配符）：客户端提交 CSR 时按需签发。客户端私钥永远不出客户端的机器——服务器只见得到 CSR。
 - **续签**：后台任务给 30 天内到期、且 90 天内活跃过的隧道续签，复用存着的 CSR（密钥不变）。拿着快到期证书来 attach 也会触发续签。
 - **续签失败不会替换正在用的证书。** 隧道继续用当前证书服务到它过期。失败的尝试按指数退避重试：1 小时、2 小时、4 小时、8 小时，之后每 12 小时一次。
-- **单个订单有时限**：ACME 订单必须在 10 分钟内完成（含 DNS 生效时间），失败时删掉它放的 DNS TXT 记录。重启时被打断的订单会在启动时重新排队。
+- **单个订单有时限**：ACME 订单必须在 10 分钟内完成（含 DNS 生效时间），订单结束后（无论成功或失败）删掉它放的 DNS TXT 记录。重启时被打断的订单会在启动时重新排队。
 - **API 证书**：首次启动时签发，之后只要还有效且覆盖 `OT_DOMAIN` 就复用。到期前在后台续签，新握手用新证书。续签失败的话，还有效的旧证书继续服务并记一条 warning 日志。
 
 ## 构建
@@ -184,7 +269,9 @@ cargo test
 - `tests/vectors.rs` —— 用从 `anomalyco/opentunnel` 拷来的 spec 向量（`spec/vectors`）校验路由合法性、SNI 路由、数据帧编码和控制消息往返。通过只说明这些向量对得上，不是完整的一致性测试。
 - `tests/e2e.rs` —— 真 socket 全链路：TCP 接入 → SNI 路由 → API TLS → REST 开通 → bridge WebSocket attach → 代理 `open`，含半关闭响应投递、多 bridge 隔离、删隧道后立即断开。还覆盖开通管控、隧道和连接上限（全局、按地址、访客份额）、header 和空闲超时、bridge 停滞和溢出处理。
 - 单元测试：ClientHello 解析、CSR 校验（含篡改签名）、CIDR 解析和限流、数据库和 bridge 状态机。
+- DNS 提供方：阿里云 V3 签名对照阿里云文档的示例校验；Cloudflare 和阿里云的 API 调用（请求内容、限流重试、重复记录、删除）用本地 mock 服务器验证；`OT_DNS_PROVIDER` 的自动选择和凭证校验也有单元测试。
 - `.github/scripts/test-fetch-official-client.sh` —— CI 下载脚本的离线检查：digest 对得上才成功，digest 对不上或缺失就 fail-closed，什么都不解压。
+- `.github/scripts/test-dns-cleanup.sh` —— CI 清理脚本的离线检查：用本地 stand-in 模拟阿里云 DNS API，并逐个校验请求的签名。覆盖删除、启动前的残留清理、记录已不存在时的处理，以及密钥错误时的报错。
 - `memory_probe_reports_rss_per_stage`（`#[ignore]`）—— 运行时内存探针：在进程内启动中转，分阶段加压（隧道、连接、stream buffer）并打印每阶段的 RSS。
   `cargo test --test e2e memory_probe -- --ignored --nocapture`
 
@@ -200,11 +287,16 @@ cargo test
 
 | Secret | 用途 |
 |---|---|
-| `CI_DOMAIN` | 如 `ci-relay.example.com` —— DNS 托管在 Cloudflare；不需要 A 记录 |
-| `CI_CF_TOKEN` | Cloudflare API token，对该 zone 有 DNS 编辑权限 |
-| `CI_CF_ZONE_ID` | 该域名的 Cloudflare zone ID |
+| `CI_DOMAIN` | 如 `ci-relay.example.com` —— DNS 托管在 Cloudflare 或阿里云；不需要 A 记录 |
+| `CI_CF_TOKEN` | Cloudflare API token，对该 zone 有 DNS 编辑权限（用 Cloudflare 时） |
+| `CI_CF_ZONE_ID` | 该域名的 Cloudflare zone ID（用 Cloudflare 时） |
+| `CI_ALIYUN_ACCESS_KEY_ID` | 阿里云 RAM 用户的 AccessKey ID（用阿里云时），权限见[阿里云 DNS](#阿里云-dns) |
+| `CI_ALIYUN_ACCESS_KEY_SECRET` | 上面 AccessKey 的 secret（用阿里云时） |
+| `CI_ALIYUN_DOMAIN` | 阿里云账号里包含 `CI_DOMAIN` 的注册域名，如 `example.com`（用阿里云时） |
 
-没配这些 secret 的话任务自动跳过（fork 保持绿色）。为了尊重 Let's Encrypt 的限流（每注册域名每周 50 张），它只在 tag 推送、每周定时（周一）和手动触发时跑——不在每次 push 跑。每周定时也顺带跑单元测试和 release 构建。中转的数据目录不在 run 之间缓存，所以签发的密钥和账号密钥不会进 Actions 缓存。
+没配 DNS 相关 secret 的话任务自动跳过（fork 保持绿色）。两套都配时用 Cloudflare，和中转的选择规则一致；要用阿里云，就不要配 `CI_CF_*`。
+
+为了尊重 Let's Encrypt 的限流（每注册域名每周 50 张），它只在 tag 推送、每周定时（周一）和手动触发时跑——不在每次 push 跑。每周定时也顺带跑单元测试和 release 构建。中转的数据目录不在 run 之间缓存，所以签发的密钥和账号密钥不会进 Actions 缓存。
 
 ## 安全模型
 
