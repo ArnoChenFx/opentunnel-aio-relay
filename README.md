@@ -103,8 +103,9 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 Fixed limits that are not configurable: the ClientHello and TLS handshake must
 finish within 10 s, and each request's headers must arrive within 10 s. A
 forwarded connection whose bridge sends nothing within 15 s of the visitor's
-ClientHello is reset with `connection_terminated`; once the first byte arrives,
-only `OT_STREAM_IDLE_SECS` applies. A visitor that accepts no data for 10 s
+ClientHello is reset with `connection_terminated`. Once the first byte arrives
+this check stops, and `OT_STREAM_IDLE_SECS` governs quiet streams. A visitor that
+accepts no data for 10 s
 while relayed data waits for it is reset alone, with `backpressure`. Every API
 response except the bridge's WebSocket upgrade carries `Connection: close`. An
 ACME order may run for 10 min. Calls to ACME and Cloudflare time out after 10 s
