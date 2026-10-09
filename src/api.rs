@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::{
-    Json, Router,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
-use axum::extract::ws::{WebSocketUpgrade, WebSocket};
 
 use crate::bridge::{self, hash_token, random_token, random_tunnel_id};
 use crate::db::{CertState, Db};
@@ -19,7 +19,7 @@ use crate::proto::api::{
     ApiError, BindCertificateRequest, CertificateInfo, CertificateState, CreateTunnelResponse,
     TunnelInfo, TunnelState,
 };
-use crate::state::{AppState, now_rfc3339};
+use crate::state::{now_rfc3339, AppState};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -44,7 +44,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 fn authed_record(db: &Db, id: &str, headers: &HeaderMap) -> Result<crate::db::TunnelRecord> {
-    let token = bearer_token(headers).ok_or_else(|| Error::Unauthorized("missing bearer token".into()))?;
+    let token =
+        bearer_token(headers).ok_or_else(|| Error::Unauthorized("missing bearer token".into()))?;
     let record = db
         .get_tunnel(id)?
         .filter(|r| r.deleted_at.is_none())
@@ -99,9 +100,10 @@ async fn create_tunnel(State(state): State<Arc<AppState>>) -> Result<impl IntoRe
         let id = random_tunnel_id();
         let hostname = format!("{id}.{domain}");
         let token = random_token();
-        let created = state
-            .db
-            .create_tunnel(&id, &hostname, &hash_token(&token), &now_rfc3339())?;
+        let created =
+            state
+                .db
+                .create_tunnel(&id, &hostname, &hash_token(&token), &now_rfc3339())?;
         if !created {
             continue;
         }
@@ -142,23 +144,33 @@ async fn bind_certificate(
     let record = authed_record(&state.db, &id, &headers)?;
     let (request_hostname, identifiers) = validate_csr(&body.csr, &record.hostname)?;
 
-    // Idempotent retry with the same CSR.
-    if record.cert_id.is_some() && record.csr_pem.as_deref() == Some(&body.csr) {
-        let cert_id = record.cert_id.clone().unwrap();
-        crate::acme::spawn_issuance(state.clone(), record.id.clone(), cert_id);
+    // Repeated submissions of the same CSR must not enqueue duplicate ACME
+    // orders, including after a fast failure; submit a new CSR to start a new
+    // issuance attempt.
+    if record.cert_id.is_some() && record.csr_pem.as_deref() == Some(body.csr.as_str()) {
         return Ok((StatusCode::ACCEPTED, Json(certificate_info(&record)?)));
     }
-    if matches!(
-        record.cert_state,
-        CertState::Challenge | CertState::Issuing
-    ) {
+    if matches!(record.cert_state, CertState::Challenge | CertState::Issuing) {
         return Err(Error::Conflict("certificate issuance in progress".into()));
     }
 
     let cert_id = format!("cert_{}", bridge::random_session_id());
-    state
+    let claimed = state
         .db
-        .begin_issuance(&record.id, &cert_id, &body.csr)?;
+        .try_begin_issuance(&record.id, &cert_id, &body.csr)?;
+    if !claimed {
+        let latest = state
+            .db
+            .get_tunnel(&record.id)?
+            .filter(|r| r.deleted_at.is_none())
+            .ok_or_else(|| Error::NotFound("tunnel not found".into()))?;
+        if latest.cert_id.is_some() && latest.csr_pem.as_deref() == Some(body.csr.as_str()) {
+            return Ok((StatusCode::ACCEPTED, Json(certificate_info(&latest)?)));
+        }
+        return Err(Error::Conflict(
+            "certificate issuance state changed; retry request".into(),
+        ));
+    }
     tracing::info!(tunnel = %record.id, cert = %cert_id, hostname = %request_hostname, identifiers = ?identifiers, "certificate issuance started");
     crate::acme::spawn_issuance(state.clone(), record.id.clone(), cert_id.clone());
 
@@ -228,9 +240,10 @@ async fn delete_tunnel(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse> {
     let record = authed_record(&state.db, &id, &headers)?;
-    // Drop in-memory state first so bridges/channels stop.
-    state.sessions.remove(&record.id).await;
     state.db.delete_tunnel(&record.id, &now_rfc3339())?;
+    // The persistent tombstone prevents a concurrent lookup from recreating
+    // the session while its live bridges and channels are being shut down.
+    state.sessions.remove(&record.id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -310,10 +323,7 @@ mod tests {
 
     #[test]
     fn csr_rejects_extra_san() {
-        let csr = make_csr(
-            "abc123.relay.test",
-            &["abc123.relay.test", "other.test"],
-        );
+        let csr = make_csr("abc123.relay.test", &["abc123.relay.test", "other.test"]);
         assert!(validate_csr(&csr, "abc123.relay.test").is_err());
     }
 

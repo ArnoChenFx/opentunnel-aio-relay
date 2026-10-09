@@ -17,12 +17,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use opentunnel_relay::{
-    acme, api,
-    bridge::SessionManager,
-    config::Config,
-    db::Db,
-    ingress,
-    state::AppState,
+    acme, api, bridge::SessionManager, config::Config, db::Db, ingress, state::AppState,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -37,6 +32,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     std::fs::create_dir_all(&config.data_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let db = Arc::new(Db::open(&config.data_dir.join("relay.db"))?);
     let http = reqwest::Client::builder()
         .user_agent("opentunnel-relay/0.1.0")
@@ -44,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
 
     // The API certificate must exist before we can serve anything on 443.
     // Issued via ACME DNS-01 on first run; reused afterwards.
-    let api_tls = acme::ensure_api_cert(&config, &db, &http).await?;
+    let api_tls = Arc::new(tokio::sync::RwLock::new(
+        acme::ensure_api_cert(&config, &db, &http).await?,
+    ));
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -57,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Background certificate renewals.
     tokio::spawn(acme::renewal_loop(state.clone()));
+    tokio::spawn(acme::api_certificate_renewal_loop(state.clone()));
 
     tracing::info!(
         domain = %config.domain,

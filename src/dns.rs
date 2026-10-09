@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -125,12 +125,7 @@ pub async fn wait_for_txt(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let cf = query_doh(
-            http,
-            "https://cloudflare-dns.com/dns-query",
-            name,
-        )
-        .await;
+        let cf = query_doh(http, "https://cloudflare-dns.com/dns-query", name).await;
         let google = query_doh(http, "https://dns.google/resolve", name).await;
         if expected.iter().all(|v| cf.contains(v)) || expected.iter().all(|v| google.contains(v)) {
             return Ok(());

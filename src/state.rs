@@ -11,8 +11,8 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub sessions: SessionManager,
     /// TLS server config for the API domain (SNI == config.domain).
-    /// Built at startup from the auto-issued API certificate.
-    pub api_tls: Arc<rustls::ServerConfig>,
+    /// Swapped after background certificate renewal for new handshakes.
+    pub api_tls: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>>,
     pub http: reqwest::Client,
 }
 

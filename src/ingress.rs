@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use crate::bridge::{ChannelMsg, OutMsg};
 use crate::error::{Error, Result};
 use crate::proto::{bridge as proto, names};
-use crate::sni::{Parse, parse_client_hello};
+use crate::sni::{parse_client_hello, Parse};
 use crate::state::AppState;
 
 const CLIENT_HELLO_LIMIT: usize = 64 * 1024;
@@ -55,34 +55,48 @@ async fn handle_connection(
     state: Arc<AppState>,
     router: Router,
 ) -> Result<()> {
-    // Read just enough to parse the ClientHello.
-    let mut buf = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 4096];
-    let hello = loop {
-        let n = tokio::time::timeout(CLIENT_HELLO_TIMEOUT, socket.read(&mut chunk))
-            .await
-            .map_err(|_| Error::Internal("ClientHello timeout".into()))?
-            .map_err(Error::Io)?;
-        if n == 0 {
-            return Err(Error::Internal("connection closed before ClientHello".into()));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        match parse_client_hello(&buf) {
-            Parse::Complete(hello) => break hello,
-            Parse::Invalid(reason) => return Err(Error::Internal(format!("bad ClientHello: {reason}"))),
-            Parse::Incomplete => {
-                if buf.len() >= CLIENT_HELLO_LIMIT {
-                    return Err(Error::Internal("ClientHello exceeded inspection limit".into()));
-                }
-            }
-        }
-    };
+    let (buf, hello) = read_client_hello(&mut socket, CLIENT_HELLO_TIMEOUT).await?;
 
     let domain = state.config.domain.to_lowercase();
     if hello.server_name == domain {
         return serve_api(socket, buf, state, router).await;
     }
     serve_tunnel(socket, peer, buf, hello.server_name, hello.alpn, state).await
+}
+
+async fn read_client_hello(
+    socket: &mut TcpStream,
+    timeout: Duration,
+) -> Result<(Vec<u8>, crate::sni::ClientHello)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let hello = loop {
+        let n = tokio::time::timeout_at(deadline, socket.read(&mut chunk))
+            .await
+            .map_err(|_| Error::Internal("ClientHello timeout".into()))?
+            .map_err(Error::Io)?;
+        if n == 0 {
+            return Err(Error::Internal(
+                "connection closed before ClientHello".into(),
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        match parse_client_hello(&buf) {
+            Parse::Complete(hello) => break hello,
+            Parse::Invalid(reason) => {
+                return Err(Error::Internal(format!("bad ClientHello: {reason}")))
+            }
+            Parse::Incomplete => {
+                if buf.len() >= CLIENT_HELLO_LIMIT {
+                    return Err(Error::Internal(
+                        "ClientHello exceeded inspection limit".into(),
+                    ));
+                }
+            }
+        }
+    };
+    Ok((buf, hello))
 }
 
 /// A stream with already-read bytes prepended back in front.
@@ -132,8 +146,14 @@ impl<R: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prepended<R> {
 }
 
 /// Terminates TLS for the API domain and serves the axum router over it.
-async fn serve_api(socket: TcpStream, initial: Vec<u8>, state: Arc<AppState>, router: Router) -> Result<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(state.api_tls.clone());
+async fn serve_api(
+    socket: TcpStream,
+    initial: Vec<u8>,
+    state: Arc<AppState>,
+    router: Router,
+) -> Result<()> {
+    let tls_config = state.api_tls.read().await.clone();
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
     let stream = Prepended {
         buf: std::io::Cursor::new(initial),
         inner: socket,
@@ -191,17 +211,21 @@ async fn serve_tunnel(
         .get_or_load(&state.db, tunnel_id)
         .await?
         .ok_or_else(|| Error::Internal("unknown tunnel".into()))?;
+    let mut shutdown_rx = session.subscribe_shutdown();
+    if session.is_closed() {
+        return Err(Error::Internal("tunnel was deleted".into()));
+    }
     if !session.cert_ready.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(Error::Internal("certificate not ready".into()));
     }
-    let route =
-        names::route_for_sni(&sni, &session.hostname).ok_or_else(|| Error::Internal("unknown route".into()))?;
-    let bridge_tx = session
+    let route = names::route_for_sni(&sni, &session.hostname)
+        .ok_or_else(|| Error::Internal("unknown route".into()))?;
+    let (bridge_id, bridge_tx) = session
         .bridge_for_route(&route)
         .await
         .ok_or_else(|| Error::Internal("no bridge for route".into()))?;
 
-    let (conn, mut chan_rx) = session.open_channel().await;
+    let (conn, mut chan_rx) = session.open_channel(&bridge_id).await;
     tracing::debug!(tunnel = %session.id, %route, %conn, %peer, "proxying connection");
 
     // Tell the bridge about the new connection, then replay the buffered
@@ -212,10 +236,10 @@ async fn serve_tunnel(
         sni: sni.clone(),
         alpn,
     })?;
-    bridge_tx
-        .send(OutMsg::Text(open))
-        .await
-        .map_err(|_| Error::Internal("bridge gone".into()))?;
+    if bridge_tx.send(OutMsg::Text(open)).await.is_err() {
+        session.close_channel(conn).await;
+        return Err(Error::Internal("bridge gone".into()));
+    }
     if !session.send_data(&bridge_tx, conn, &initial).await {
         session.close_channel(conn).await;
         return Err(Error::Internal("bridge gone".into()));
@@ -247,30 +271,60 @@ async fn serve_tunnel(
 
     // Bridge -> public socket.
     let pump_down = async move {
-        while let Some(msg) = chan_rx.recv().await {
-            match msg {
-                ChannelMsg::Data(data) => writer.write_all(&data).await?,
-                ChannelMsg::End => {
-                    writer.shutdown().await.ok();
-                    break;
+        loop {
+            match chan_rx.recv().await {
+                Some(ChannelMsg::Data(data)) => writer.write_all(&data).await?,
+                Some(ChannelMsg::End) => {
+                    writer.shutdown().await?;
+                    return Ok::<(), anyhow::Error>(());
                 }
-                ChannelMsg::Reset(_) => break,
+                Some(ChannelMsg::Reset(reason)) => {
+                    return Err(anyhow::anyhow!("bridge reset: {reason}"));
+                }
+                None => return Err(anyhow::anyhow!("bridge channel closed")),
             }
         }
-        Ok::<(), anyhow::Error>(())
     };
 
-    tokio::select! {
-        result = pump_up => {
-            if let Err(e) = result {
-                let _ = bridge_tx.send(OutMsg::Text(
-                    serde_json::to_string(&proto::ServerMessage::Reset { conn, code: "client_io_error".into() }).unwrap(),
-                )).await;
-                tracing::debug!(%conn, error = %e, "upstream pump failed");
-            }
-        }
-        _ = pump_down => {}
+    let result = tokio::select! {
+        _ = shutdown_rx.changed() => Err(anyhow::anyhow!("tunnel was deleted")),
+        result = async { tokio::try_join!(pump_up, pump_down).map(|_| ()) } => result,
+    };
+    if let Err(error) = result {
+        let reset = serde_json::to_string(&proto::ServerMessage::Reset {
+            conn,
+            code: "connection_terminated".into(),
+        })
+        .unwrap();
+        let _ = bridge_tx.try_send(OutMsg::Text(reset));
+        tracing::debug!(%conn, error = %error, "proxy connection terminated");
     }
     session.close_channel(conn).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn client_hello_slow_drip_cannot_extend_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_client_hello(&mut socket, Duration::from_millis(220)).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[0x16]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = client.write_all(&[0x03]).await;
+
+        let result = tokio::time::timeout(Duration::from_millis(300), server)
+            .await
+            .expect("ClientHello deadline should be absolute")
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("timeout"));
+    }
 }

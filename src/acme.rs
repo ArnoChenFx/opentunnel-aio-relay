@@ -12,11 +12,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::bridge::random_session_id;
 use crate::config::Config;
@@ -147,11 +147,7 @@ fn der_sig_to_raw(der: &[u8]) -> Result<[u8; 64]> {
     Ok(out)
 }
 
-fn jws_parts(
-    pkcs8: &[u8],
-    protected: &Value,
-    payload: &[u8],
-) -> Result<(String, String, String)> {
+fn jws_parts(pkcs8: &[u8], protected: &Value, payload: &[u8]) -> Result<(String, String, String)> {
     let protected_b64 = b64(serde_json::to_vec(protected)?.as_slice());
     let payload_b64 = b64(payload);
     let message = format!("{protected_b64}.{payload_b64}");
@@ -188,10 +184,7 @@ fn external_account_binding(
     let payload_b64 = b64(serde_json::to_vec(account_jwk)?.as_slice());
     let key_bytes = b64d(eab_hmac_b64).context("invalid EAB HMAC key")?;
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes);
-    let tag = ring::hmac::sign(
-        &key,
-        format!("{protected_b64}.{payload_b64}").as_bytes(),
-    );
+    let tag = ring::hmac::sign(&key, format!("{protected_b64}.{payload_b64}").as_bytes());
     Ok(json!({
         "protected": protected_b64,
         "payload": payload_b64,
@@ -259,7 +252,12 @@ impl Acme {
     }
 
     /// POST with JWS; retries once on badNonce.
-    async fn post_jws(&self, url: &str, use_kid: bool, payload: &Value) -> Result<reqwest::Response> {
+    async fn post_jws(
+        &self,
+        url: &str,
+        use_kid: bool,
+        payload: &Value,
+    ) -> Result<reqwest::Response> {
         for attempt in 0..2 {
             let nonce = self.nonce().await?;
             let mut protected = json!({"alg": "ES256", "nonce": nonce, "url": url});
@@ -281,7 +279,10 @@ impl Acme {
                 }
                 bail!("ACME request failed: {text}");
             }
-            return res.error_for_status().context("ACME request failed").map_err(|e| anyhow!("{e}"));
+            return res
+                .error_for_status()
+                .context("ACME request failed")
+                .map_err(|e| anyhow!("{e}"));
         }
         unreachable!()
     }
@@ -313,7 +314,11 @@ impl Acme {
             )?;
             payload["externalAccountBinding"] = eab;
         }
-        let body = jws_body(&self.key_pkcs8, &protected, serde_json::to_vec(&payload)?.as_slice())?;
+        let body = jws_body(
+            &self.key_pkcs8,
+            &protected,
+            serde_json::to_vec(&payload)?.as_slice(),
+        )?;
         let res = self
             .http
             .post(&self.dir.new_account)
@@ -359,14 +364,18 @@ pub async fn issue(
     csr_pem: &str,
     on_challenge: impl Fn(&str, &str),
 ) -> Result<Issued> {
-    let mut acme = Acme::new(http.clone(), db, AcmeConfig {
-        directory_url: cfg.directory_url.clone(),
-        email: cfg.email.clone(),
-        eab_kid: cfg.eab_kid.clone(),
-        eab_hmac: cfg.eab_hmac.clone(),
-        cf_token: cfg.cf_token.clone(),
-        cf_zone_id: cfg.cf_zone_id.clone(),
-    })
+    let mut acme = Acme::new(
+        http.clone(),
+        db,
+        AcmeConfig {
+            directory_url: cfg.directory_url.clone(),
+            email: cfg.email.clone(),
+            eab_kid: cfg.eab_kid.clone(),
+            eab_hmac: cfg.eab_hmac.clone(),
+            cf_token: cfg.cf_token.clone(),
+            cf_zone_id: cfg.cf_zone_id.clone(),
+        },
+    )
     .await?;
     acme.new_account().await?;
 
@@ -376,7 +385,11 @@ pub async fn issue(
         .map(|d| json!({"type": "dns", "value": d}))
         .collect();
     let res = acme
-        .post_jws(&acme.dir.new_order.clone(), true, &json!({"identifiers": order_ids}))
+        .post_jws(
+            &acme.dir.new_order.clone(),
+            true,
+            &json!({"identifiers": order_ids}),
+        )
         .await?;
     if res.status().as_u16() != 201 {
         bail!("ACME newOrder failed: {}", res.status());
@@ -410,7 +423,10 @@ pub async fn issue(
         let challenge = auth
             .get("challenges")
             .and_then(|v| v.as_array())
-            .and_then(|cs| cs.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some("dns-01")))
+            .and_then(|cs| {
+                cs.iter()
+                    .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("dns-01"))
+            })
             .ok_or_else(|| anyhow!("ACME server did not offer dns-01"))?;
         let token = challenge
             .get("token")
@@ -445,7 +461,8 @@ pub async fn issue(
     let place = async {
         for ch in &challenges {
             let name = format!("_acme-challenge.{}", ch.base);
-            let id = crate::dns::create_txt(http, &cfg.cf_zone_id, &cfg.cf_token, &name, &ch.key).await?;
+            let id = crate::dns::create_txt(http, &cfg.cf_zone_id, &cfg.cf_token, &name, &ch.key)
+                .await?;
             record_ids.push(id);
         }
         anyhow::Ok(())
@@ -557,8 +574,8 @@ fn split_pem_chain(chain: &str) -> Vec<String> {
 
 pub fn cert_expiry_pem(cert_pem: &str) -> Result<String> {
     use x509_parser::prelude::*;
-    let (_rem, pem) = parse_x509_pem(cert_pem.as_bytes())
-        .map_err(|_| anyhow!("invalid certificate PEM"))?;
+    let (_rem, pem) =
+        parse_x509_pem(cert_pem.as_bytes()).map_err(|_| anyhow!("invalid certificate PEM"))?;
     let (_, cert) =
         X509Certificate::from_der(&pem.contents).map_err(|_| anyhow!("invalid certificate DER"))?;
     let ts = cert.validity().not_after.timestamp();
@@ -575,8 +592,7 @@ pub fn cert_expiry_pem(cert_pem: &str) -> Result<String> {
 /// back to the CN when there are none (mirrors the original server).
 fn identifiers_from_csr(csr_pem: &str) -> Result<Vec<String>> {
     use x509_parser::prelude::*;
-    let (_rem, pem) =
-        parse_x509_pem(csr_pem.as_bytes()).map_err(|_| anyhow!("bad CSR PEM"))?;
+    let (_rem, pem) = parse_x509_pem(csr_pem.as_bytes()).map_err(|_| anyhow!("bad CSR PEM"))?;
     let (_, csr) =
         X509CertificationRequest::from_der(&pem.contents).map_err(|_| anyhow!("bad CSR DER"))?;
     let cn = csr
@@ -611,7 +627,9 @@ pub fn spawn_issuance(state: Arc<AppState>, tunnel_id: String, cert_id: String) 
     tokio::spawn(async move {
         match issue_for_tunnel(&state, &tunnel_id, &cert_id).await {
             Ok(()) => tracing::info!(tunnel = %tunnel_id, cert = %cert_id, "certificate ready"),
-            Err(e) => tracing::error!(tunnel = %tunnel_id, cert = %cert_id, error = %e, "issuance failed"),
+            Err(e) => {
+                tracing::error!(tunnel = %tunnel_id, cert = %cert_id, error = %e, "issuance failed")
+            }
         }
     });
 }
@@ -628,7 +646,10 @@ async fn issue_for_tunnel(state: &AppState, tunnel_id: &str, cert_id: &str) -> R
     if record.cert_id.as_deref() != Some(cert_id) {
         return Ok(()); // superseded by a newer issuance
     }
-    let csr_pem = record.csr_pem.clone().ok_or_else(|| anyhow!("no CSR stored"))?;
+    let csr_pem = record
+        .csr_pem
+        .clone()
+        .ok_or_else(|| anyhow!("no CSR stored"))?;
     let identifiers = identifiers_from_csr(&csr_pem)?;
     let cfg = AcmeConfig::from_config(&state.config);
     let issued = match issue(
@@ -672,16 +693,17 @@ pub async fn renewal_loop(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
         let now = chrono::Utc::now().timestamp();
-        let candidates = match state
-            .db
-            .renewal_candidates(RENEW_BEFORE_SECS, ACTIVE_WINDOW_SECS, now)
-        {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::error!(error = %e, "renewal scan failed");
-                continue;
-            }
-        };
+        let candidates =
+            match state
+                .db
+                .renewal_candidates(RENEW_BEFORE_SECS, ACTIVE_WINDOW_SECS, now)
+            {
+                Ok(list) => list,
+                Err(e) => {
+                    tracing::error!(error = %e, "renewal scan failed");
+                    continue;
+                }
+            };
         for record in candidates {
             // Skip if an issuance is already in flight.
             let fresh = match state.db.get_tunnel(&record.id) {
@@ -693,7 +715,11 @@ pub async fn renewal_loop(state: Arc<AppState>) {
                 None => continue,
             };
             let cert_id = format!("cert_{}", random_session_id());
-            if state.db.begin_issuance(&record.id, &cert_id, &csr).is_ok() {
+            if state
+                .db
+                .try_begin_issuance(&record.id, &cert_id, &csr)
+                .unwrap_or(false)
+            {
                 tracing::info!(tunnel = %record.id, "starting certificate renewal");
                 spawn_issuance(state.clone(), record.id.clone(), cert_id);
             }
@@ -715,6 +741,7 @@ pub async fn ensure_api_cert(
 
     let load = || -> Result<Arc<rustls::ServerConfig>> {
         let cert_pem = std::fs::read_to_string(&cert_path)?;
+        restrict_private_file(&key_path)?;
         let key_pem = std::fs::read_to_string(&key_path)?;
         build_server_config(&cert_pem, &key_pem)
     };
@@ -747,16 +774,67 @@ pub async fn ensure_api_cert(
     let key_pem = key_pair.serialize_pem();
 
     let cfg = AcmeConfig::from_config(config);
-    let issued = issue(http, db, &cfg, std::slice::from_ref(&config.domain), &csr_pem, |_, _| {}).await?;
+    let issued = issue(
+        http,
+        db,
+        &cfg,
+        std::slice::from_ref(&config.domain),
+        &csr_pem,
+        |_, _| {},
+    )
+    .await?;
     let fullchain = if issued.chain_pem.is_empty() {
         issued.certificate_pem.clone()
     } else {
         format!("{}\n{}", issued.certificate_pem, issued.chain_pem)
     };
     std::fs::write(&cert_path, &fullchain)?;
-    std::fs::write(&key_path, &key_pem)?;
+    write_private_file(&key_path, key_pem.as_bytes())?;
     tracing::info!("API certificate issued");
     build_server_config(&fullchain, &key_pem)
+}
+
+/// Periodically rechecks the API certificate and renews it within 30 days of
+/// expiry. The replacement config is swapped only after issuance succeeds, so
+/// existing connections remain intact and new handshakes use the new cert.
+pub async fn api_certificate_renewal_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+        match ensure_api_cert(&state.config, &state.db, &state.http).await {
+            Ok(config) => {
+                *state.api_tls.write().await = config;
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "API certificate renewal check failed");
+            }
+        }
+    }
+}
+
+fn restrict_private_file(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    restrict_private_file(path)
 }
 
 fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::ServerConfig>> {
@@ -798,7 +876,11 @@ pub async fn maybe_renew_on_attach(state: Arc<AppState>, tunnel_id: &str) {
         None => return,
     };
     let cert_id = format!("cert_{}", random_session_id());
-    if state.db.begin_issuance(tunnel_id, &cert_id, &csr).is_ok() {
+    if state
+        .db
+        .try_begin_issuance(tunnel_id, &cert_id, &csr)
+        .unwrap_or(false)
+    {
         tracing::info!(tunnel = %tunnel_id, "renewing certificate on attach");
         spawn_issuance(state, tunnel_id.to_string(), cert_id);
     }

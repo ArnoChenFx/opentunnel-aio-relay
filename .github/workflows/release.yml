@@ -54,7 +54,22 @@ jobs:
         if: github.ref_type == 'tag'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          sed -i "0,/^version = /s//version = \"$VERSION\"/" Cargo.toml
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid semantic version in tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          python3 - "$VERSION" <<'PY'
+          import pathlib, re, sys
+          version = sys.argv[1]
+          path = pathlib.Path("Cargo.toml")
+          text = path.read_text()
+          text, count = re.subn(r'(?m)^version = "[^\"]+"$', f'version = "{version}"', text, count=1)
+          if count != 1:
+              raise SystemExit("Could not locate the package version in Cargo.toml")
+          path.write_text(text)
+          PY
+          cargo update --workspace
+          cargo metadata --locked --no-deps --format-version=1 >/dev/null
           grep -m1 '^version' Cargo.toml
 
       - name: Build release binary
