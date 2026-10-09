@@ -22,6 +22,7 @@ use tower::ServiceExt;
 
 use crate::bridge::{ChannelMsg, OutMsg, VisitorChannel};
 use crate::error::{Error, Result};
+use crate::guard::{SourceLimiter, SourcePermit};
 use crate::proto::{bridge as proto, names};
 use crate::sni::{parse_client_hello, Parse};
 use crate::state::AppState;
@@ -36,6 +37,12 @@ pub async fn run(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     run_on(listener, state, router).await
 }
 
+/// Capacity held by one connection until it closes.
+struct Admission {
+    _connection: OwnedSemaphorePermit,
+    _source: SourcePermit,
+}
+
 /// Accepts connections until the process stops. An accept error (for example
 /// file-descriptor exhaustion) is logged and retried with backoff; it never
 /// ends the loop.
@@ -44,11 +51,12 @@ pub async fn run_on(
     state: Arc<AppState>,
     router: Router,
 ) -> anyhow::Result<()> {
-    let limit = match state.config.max_connections {
-        0 => Semaphore::MAX_PERMITS,
-        n => n,
-    };
-    let connections = Arc::new(Semaphore::new(limit));
+    let connections = Arc::new(Semaphore::new(pool_size(state.config.max_connections, 0)));
+    let visitors = Arc::new(Semaphore::new(pool_size(
+        state.config.max_connections,
+        state.config.reserved_connections,
+    )));
+    let sources = SourceLimiter::new(state.config.max_connections_per_ip);
     let mut backoff = Duration::ZERO;
     loop {
         let (socket, peer) = match listener.accept().await {
@@ -67,18 +75,39 @@ pub async fn run_on(
                 continue;
             }
         };
-        let Some(permit) = try_acquire_connection(&connections) else {
+        let Some(source) = sources.acquire(peer.ip()) else {
+            tracing::warn!(%peer, "per-address connection limit reached; refusing connection");
+            drop(socket);
+            continue;
+        };
+        let Some(connection) = try_acquire_connection(&connections) else {
             tracing::warn!(%peer, "connection limit reached; refusing connection");
             drop(socket);
             continue;
         };
+        let admission = Admission {
+            _connection: connection,
+            _source: source,
+        };
         let state = state.clone();
         let router = router.clone();
+        let visitors = visitors.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, peer, state, router, permit).await {
+            if let Err(e) =
+                handle_connection(socket, peer, state, router, admission, visitors).await
+            {
                 tracing::debug!(%peer, error = %e, "ingress connection closed");
             }
         });
+    }
+}
+
+/// Slots in a pool once `reserved` of `total` are kept back. A total of zero
+/// means the pool is unlimited.
+fn pool_size(total: usize, reserved: usize) -> usize {
+    match total {
+        0 => Semaphore::MAX_PERMITS,
+        n => n.saturating_sub(reserved),
     }
 }
 
@@ -99,25 +128,23 @@ async fn handle_connection(
     peer: SocketAddr,
     state: Arc<AppState>,
     router: Router,
-    permit: OwnedSemaphorePermit,
+    admission: Admission,
+    visitors: Arc<Semaphore>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + state.config.timeouts.client_hello;
     let (buf, hello) = read_client_hello_until(&mut socket, deadline).await?;
 
     let domain = state.config.domain.to_lowercase();
     if hello.server_name == domain {
-        return serve_api(socket, buf, state, router, deadline, peer, permit).await;
+        return serve_api(socket, buf, state, router, deadline, peer, admission).await;
     }
-    serve_tunnel(
-        socket,
-        peer,
-        buf,
-        hello.server_name,
-        hello.alpn,
-        state,
-        permit,
-    )
-    .await
+    // Visitors may never take the reserved slots, so bridges and API requests
+    // are not starved by a crowd of visitors.
+    let Some(visitor) = try_acquire_connection(&visitors) else {
+        tracing::warn!(%peer, "visitor limit reached; refusing connection");
+        return Ok(());
+    };
+    serve_tunnel(socket, peer, buf, hello, state, admission, visitor).await
 }
 
 async fn read_client_hello_until(
@@ -201,7 +228,7 @@ impl<R: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prepended<R> {
 }
 
 /// Terminates TLS for the API domain and serves the axum router over it. The
-/// connection permit is held until the connection closes.
+/// admission is held until the connection closes.
 async fn serve_api(
     socket: TcpStream,
     initial: Vec<u8>,
@@ -209,7 +236,7 @@ async fn serve_api(
     router: Router,
     deadline: tokio::time::Instant,
     peer: SocketAddr,
-    _permit: OwnedSemaphorePermit,
+    _admission: Admission,
 ) -> Result<()> {
     let tls_config = state.api_tls.read().await.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -264,11 +291,15 @@ async fn serve_tunnel(
     socket: TcpStream,
     peer: SocketAddr,
     initial: Vec<u8>,
-    sni: String,
-    alpn: String,
+    hello: crate::sni::ClientHello,
     state: Arc<AppState>,
-    _permit: OwnedSemaphorePermit,
+    _admission: Admission,
+    _visitor: OwnedSemaphorePermit,
 ) -> Result<()> {
+    let crate::sni::ClientHello {
+        server_name: sni,
+        alpn,
+    } = hello;
     let domain = state.config.domain.to_lowercase();
     let suffix = format!(".{domain}");
     let Some(labels) = sni.strip_suffix(&suffix) else {
@@ -368,7 +399,7 @@ async fn serve_tunnel(
         }
     };
 
-    let idle_limit = state.config.timeouts.tunnel_idle;
+    let idle_limit = state.config.stream_idle;
     // `biased` makes a bridge-side cancel win over the pumps. A cancel is set
     // before the channel is dropped, so `None` above can only follow a cancel.
     let result = tokio::select! {
@@ -427,8 +458,11 @@ impl Activity {
         self.last_ms.store(now, Ordering::Relaxed);
     }
 
-    /// Resolves once nothing has moved for `limit`.
+    /// Resolves once nothing has moved for `limit`. A zero limit never resolves.
     async fn idle(&self, limit: Duration) {
+        if limit.is_zero() {
+            std::future::pending::<()>().await;
+        }
         loop {
             let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
             let quiet_for = self.origin.elapsed().saturating_sub(last);
@@ -568,6 +602,20 @@ mod tests {
         drop(first);
         assert!(try_acquire_connection(&permits).is_some());
         drop(second);
+    }
+
+    #[test]
+    fn pools_keep_back_the_reserved_slots() {
+        assert_eq!(pool_size(10, 4), 6);
+        assert_eq!(pool_size(3, 9), 0);
+        assert_eq!(pool_size(0, 9), Semaphore::MAX_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn zero_stream_idle_limit_never_expires() {
+        let activity = Activity::new();
+        let quiet = tokio::time::timeout(Duration::from_millis(100), activity.idle(Duration::ZERO));
+        assert!(quiet.await.is_err());
     }
 
     #[test]

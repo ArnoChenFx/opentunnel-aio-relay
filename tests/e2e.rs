@@ -42,7 +42,10 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         max_tunnels: 0,
         max_certs_per_day: 0,
         max_connections: 1024,
+        reserved_connections: 64,
+        max_connections_per_ip: 0,
         stream_buffer_bytes: 2 * 1024 * 1024,
+        stream_idle: Duration::from_secs(3600),
         create_allow_cidrs: CidrList::default(),
         rate_limit_per_hour: 0,
         timeouts: Timeouts {
@@ -660,11 +663,14 @@ async fn attached_bridge(srv: &TestServer) -> (String, Bridge) {
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
     let token = created["token"].as_str().unwrap().to_string();
-    begin_issuance(&srv.state.db, &id, "cert_streams", "dummy-csr").await;
+    // Certificate ids are shared by every tunnel that uses them, so each
+    // tunnel gets its own.
+    let cert_id = format!("cert_{}", opentunnel_relay::bridge::random_session_id());
+    begin_issuance(&srv.state.db, &id, &cert_id, "dummy-csr").await;
     assert!(srv
         .state
         .db
-        .set_ready("cert_streams", "CERT", "CHAIN", "2099-01-01T00:00:00Z")
+        .set_ready(&cert_id, "CERT", "CHAIN", "2099-01-01T00:00:00Z")
         .await
         .unwrap());
 
@@ -1066,7 +1072,7 @@ async fn simultaneous_attach_to_same_route_has_one_winner() {
 
 #[tokio::test]
 async fn idle_stream_is_closed_and_the_bridge_is_told() {
-    let srv = start_server_with(|c| c.timeouts.tunnel_idle = Duration::from_millis(300)).await;
+    let srv = start_server_with(|c| c.stream_idle = Duration::from_millis(300)).await;
     let (id, mut ws) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
@@ -1083,7 +1089,7 @@ async fn traffic_in_either_direction_keeps_a_stream_open() {
     use futures_util::SinkExt;
     use opentunnel_relay::proto::bridge::encode_data_frame;
 
-    let srv = start_server_with(|c| c.timeouts.tunnel_idle = Duration::from_millis(400)).await;
+    let srv = start_server_with(|c| c.stream_idle = Duration::from_millis(400)).await;
     let (id, mut ws) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
@@ -1124,7 +1130,11 @@ async fn stalled_api_request_is_closed_by_the_header_timeout() {
 
 #[tokio::test]
 async fn connection_limit_refuses_excess_and_recovers() {
-    let srv = start_server_with(|c| c.max_connections = 1).await;
+    let srv = start_server_with(|c| {
+        c.max_connections = 1;
+        c.reserved_connections = 0;
+    })
+    .await;
 
     let holder = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1140,6 +1150,58 @@ async fn connection_limit_refuses_excess_and_recovers() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (status, _) = http_request(&srv, "GET", "/health", None, "").await;
     assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn one_address_cannot_hold_more_than_its_share_of_connections() {
+    let srv = start_server_with(|c| c.max_connections_per_ip = 2).await;
+
+    let first = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    let _second = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut third = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+        .await
+        .expect("connection beyond the per-address share was left open")
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "connection beyond the per-address share must be closed"
+    );
+
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (status, _) = http_request(&srv, "GET", "/health", None, "").await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn visitors_cannot_take_the_slots_reserved_for_bridges() {
+    let srv = start_server_with(|c| {
+        c.max_connections = 6;
+        c.reserved_connections = 4;
+        c.max_connections_per_ip = 0;
+    })
+    .await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+
+    // Visitors may hold only max - reserved = 2 connections.
+    let (_first, _) = open_visitor(srv.port, &mut ws, &sni, None).await;
+    let (_second, _) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    let mut third = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    third.write_all(&client_hello(&sni)).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+        .await
+        .expect("visitor beyond its pool was left open")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "visitor beyond its pool must be closed");
+
+    let (_other_id, _other_ws) = attached_bridge(&srv).await;
 }
 
 #[tokio::test]

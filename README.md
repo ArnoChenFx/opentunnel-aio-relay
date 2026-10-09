@@ -91,7 +91,10 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
 | `OT_ACME_EMAIL` | `acme@localhost` | ACME account contact |
 | `OT_MAX_CONNECTIONS` | `1024` | Connections open at once on the listener (API, bridge, and visitor sockets). Extra connections are refused at accept. `0` disables |
+| `OT_RESERVED_CONNECTIONS` | `64` | Slots within `OT_MAX_CONNECTIONS` that visitor sockets may never take, so API and bridge connections still get in while visitors are at their limit. Must be below `OT_MAX_CONNECTIONS` unless that is `0` |
+| `OT_MAX_CONNECTIONS_PER_IP` | `64` | Sockets one source address may hold open at once. IPv6 sources are counted per /64. Extra sockets are refused at accept. `0` disables |
 | `OT_STREAM_BUFFER_BYTES` | `2097152` (2 MiB) | Data held for one visitor that has not read it yet. A visitor that falls further behind is reset with `backpressure`. Minimum `65536` |
+| `OT_STREAM_IDLE_SECS` | `3600` (1 h) | Seconds a forwarded connection may go without bytes in either direction before it is closed and the bridge is told with `connection_terminated`. `0` disables the limit; raise it for long SSH or WebSocket sessions that stay quiet |
 | `OT_MAX_TUNNELS` | `1000` | Live tunnels (not deleted). Creating one past the cap returns `503`. `0` disables |
 | `OT_MAX_CERTS_PER_DAY` | `7` | New certificate orders per rolling 24 hours across all tunnels. Renewals are never refused. `0` disables |
 | `OT_RATE_LIMIT_PER_HOUR` | `30` | Requests per hour from one source address to tunnel creation and certificate binding. IPv6 sources are counted per /64. `0` disables |
@@ -100,9 +103,8 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 Fixed limits that are not configurable: the ClientHello and TLS handshake must
 finish within 10 s, and each request's headers must arrive within 10 s. A
 visitor that accepts no data for 10 s while relayed data waits for it is reset
-alone, with `backpressure`. A forwarded stream with no traffic for 5 min is
-closed. An ACME order may run for 10 min. Calls to ACME and Cloudflare time out
-after 10 s to connect and 30 s in total.
+alone, with `backpressure`. An ACME order may run for 10 min. Calls to ACME and
+Cloudflare time out after 10 s to connect and 30 s in total.
 
 ### Buffering for slow visitors
 
@@ -118,6 +120,25 @@ the bridge sends, for longer than its buffer holds, is reset. Raise
 `OT_STREAM_BUFFER_BYTES` for bulk transfers to slow clients. Memory use can
 reach that value for each open connection, so keep the product within the
 relay's RAM.
+
+### Connection limits
+
+Every accepted socket counts against the global cap (`OT_MAX_CONNECTIONS`) and
+against its source address's share (`OT_MAX_CONNECTIONS_PER_IP`). A socket whose
+SNI names a tunnel, a visitor, also takes one of the visitor slots. Those slots
+are the global cap minus `OT_RESERVED_CONNECTIONS`, so the reserved slots stay
+free for API and bridge connections while visitors are at their limit.
+
+Trade-offs to know:
+
+- Sockets are counted by TCP peer address. Clients behind one NAT or proxy
+  share a single share, and a load balancer in front of the relay makes every
+  client look like one address. In those setups raise
+  `OT_MAX_CONNECTIONS_PER_IP` or set it to `0`.
+- A socket that has not sent its ClientHello yet counts only against the global
+  and per-address caps. A flood of such sockets from many addresses can fill the
+  global pool until the 10 s ClientHello timeout closes them. Filter or
+  rate-limit at the network edge if that matters for your deployment.
 
 ## Abuse controls
 
@@ -224,8 +245,9 @@ cargo test
   API TLS → REST provisioning → bridge WebSocket attach → proxied `open`,
   including half-close response delivery, multiple-bridge isolation, and
   immediate connection shutdown after tunnel deletion. It also covers the
-  provisioning controls, the tunnel and connection caps, header and idle
-  timeouts, and bridge stall and overflow handling.
+  provisioning controls, the tunnel and connection caps (global, per address,
+  and visitor share), header and idle timeouts, and bridge stall and overflow
+  handling.
 - Unit tests: ClientHello parser, CSR validation (incl. tampered signatures),
   CIDR parsing and rate limiting, and the database and bridge state machines.
 - `.github/scripts/test-fetch-official-client.sh` — offline checks for the CI

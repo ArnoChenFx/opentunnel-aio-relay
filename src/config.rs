@@ -72,12 +72,35 @@ pub struct Config {
     #[arg(long, env = "OT_MAX_CONNECTIONS", default_value_t = 1024)]
     pub max_connections: usize,
 
+    /// Connection slots that visitors may never take. While visitors are at
+    /// their limit, API and bridge connections can still use these slots.
+    /// Must be below OT_MAX_CONNECTIONS unless that is 0.
+    #[arg(long, env = "OT_RESERVED_CONNECTIONS", default_value_t = 64)]
+    pub reserved_connections: usize,
+
+    /// Connections one source address may hold open at once, counting API,
+    /// bridge, and visitor sockets. IPv6 sources are counted per /64. Excess
+    /// connections are refused at accept. 0 disables the limit.
+    #[arg(long, env = "OT_MAX_CONNECTIONS_PER_IP", default_value_t = 64)]
+    pub max_connections_per_ip: usize,
+
     /// Bytes the relay will hold for one visitor that is not reading. A visitor
     /// that falls further behind is reset with `backpressure`; other connections
     /// are unaffected. Worst-case memory is this value times the number of open
     /// connections, so size it with OT_MAX_CONNECTIONS.
     #[arg(long, env = "OT_STREAM_BUFFER_BYTES", default_value_t = 2 * 1024 * 1024)]
     pub stream_buffer_bytes: usize,
+
+    /// Seconds a forwarded connection may go without bytes in either direction
+    /// before it is closed. Long-lived sessions such as SSH or WebSockets need
+    /// a generous value. 0 disables the limit.
+    #[arg(
+        long = "stream-idle-secs",
+        env = "OT_STREAM_IDLE_SECS",
+        default_value = "3600",
+        value_parser = parse_seconds
+    )]
+    pub stream_idle: Duration,
 
     /// Source addresses allowed to create tunnels and order certificates, as
     /// comma-separated IPv4 or IPv6 addresses or CIDR ranges. Empty allows any
@@ -105,12 +128,26 @@ impl Config {
             self.stream_buffer_bytes >= MIN_STREAM_BUFFER_BYTES,
             "OT_STREAM_BUFFER_BYTES must be at least {MIN_STREAM_BUFFER_BYTES}"
         );
+        anyhow::ensure!(
+            self.max_connections == 0 || self.reserved_connections < self.max_connections,
+            "OT_RESERVED_CONNECTIONS ({}) must be below OT_MAX_CONNECTIONS ({})",
+            self.reserved_connections,
+            self.max_connections
+        );
         Ok(())
     }
 }
 
 /// Two full-size frames: enough for one in flight and one waiting.
 const MIN_STREAM_BUFFER_BYTES: usize = 2 * crate::proto::bridge::MAX_PAYLOAD_SIZE;
+
+fn parse_seconds(value: &str) -> Result<Duration, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|_| format!("expected a whole number of seconds, got {value:?}"))
+}
 
 /// Lowercases a domain and strips surrounding whitespace and trailing dots,
 /// so `Tunnel.Example.COM.` and `tunnel.example.com` name the same zone.
@@ -132,9 +169,6 @@ pub struct Timeouts {
     /// order is marked failed and its TXT records are removed. An issuance
     /// still marked in flight after twice this long is taken over.
     pub issuance: Duration,
-    /// A forwarded stream that moves no bytes in either direction for this long
-    /// is closed, and its bridge connection is reset.
-    pub tunnel_idle: Duration,
 }
 
 impl Timeouts {
@@ -152,7 +186,6 @@ impl Default for Timeouts {
             client_hello: Duration::from_secs(10),
             bridge_stall: Duration::from_secs(10),
             issuance: Duration::from_secs(600),
-            tunnel_idle: Duration::from_secs(300),
         }
     }
 }
@@ -170,6 +203,63 @@ mod tests {
         );
         assert_eq!(normalize_domain("  relay.test  "), "relay.test");
         assert_eq!(normalize_domain("relay.test.."), "relay.test");
+    }
+
+    fn parse(extra: &[&str]) -> Config {
+        let mut args = vec![
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--cf-token",
+            "t",
+            "--cf-zone-id",
+            "z",
+        ];
+        args.extend_from_slice(extra);
+        Config::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn stream_idle_is_read_in_seconds_and_zero_disables_it() {
+        assert_eq!(parse(&[]).stream_idle, Duration::from_secs(3600));
+        assert_eq!(
+            parse(&["--stream-idle-secs", "90"]).stream_idle,
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            parse(&["--stream-idle-secs", "0"]).stream_idle,
+            Duration::ZERO
+        );
+        assert!(Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--cf-token",
+            "t",
+            "--cf-zone-id",
+            "z",
+            "--stream-idle-secs",
+            "5m",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn reserved_connections_must_leave_room_for_visitors() {
+        let mut config = parse(&["--max-connections", "64", "--reserved-connections", "64"]);
+        assert!(config.normalize().is_err());
+
+        let mut config = parse(&["--max-connections", "64", "--reserved-connections", "63"]);
+        assert!(config.normalize().is_ok());
+
+        let mut config = parse(&["--max-connections", "0", "--reserved-connections", "64"]);
+        assert!(config.normalize().is_ok());
+    }
+
+    #[test]
+    fn stream_buffer_has_a_floor() {
+        let mut config = parse(&["--stream-buffer-bytes", "1024"]);
+        assert!(config.normalize().is_err());
     }
 
     #[test]
