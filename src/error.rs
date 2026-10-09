@@ -4,8 +4,10 @@
 //! keys its certificate polling on `CertificateInProgressError`, so a generic
 //! conflict tag would make it fail where it should wait.
 
+use std::time::Duration;
+
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -32,6 +34,11 @@ pub enum Error {
     CertificateInProgress { tunnel_id: String },
     #[error("service unavailable: {0}")]
     Unavailable(String),
+    #[error("{message}")]
+    RateLimited {
+        message: String,
+        retry_after: Duration,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -78,6 +85,11 @@ impl IntoResponse for Error {
                 "ServiceUnavailableError",
                 message.clone(),
             ),
+            Error::RateLimited { message, .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "RateLimitedError",
+                message.clone(),
+            ),
             Error::Db(_) | Error::Io(_) | Error::Json(_) | Error::Internal(_) => {
                 tracing::error!(error = %self, "internal error while serving request");
                 (
@@ -98,7 +110,14 @@ impl IntoResponse for Error {
             message: &message,
             tunnel_id,
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Error::RateLimited { retry_after, .. } = &self {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from(retry_after.as_secs().max(1)),
+            );
+        }
+        response
     }
 }
 
@@ -136,6 +155,17 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["_tag"], "TunnelNotFoundError");
         assert_eq!(body["tunnelID"], "t2");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_responses_carry_retry_after() {
+        let response = Error::RateLimited {
+            message: "slow down".into(),
+            retry_after: Duration::from_secs(90),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "90");
     }
 
     #[tokio::test]

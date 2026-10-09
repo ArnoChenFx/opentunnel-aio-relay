@@ -12,9 +12,9 @@ use opentunnel_relay::{
     acme, api,
     bridge::SessionManager,
     config::{Config, Timeouts},
-    db::Db,
+    db::{Claim, Db},
     ingress,
-    state::AppState,
+    state::{now_millis, AppState},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -38,8 +38,11 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         acme_eab_hmac: "test".to_string(),
         acme_url: "https://example.invalid".to_string(),
         acme_email: "test@example.invalid".to_string(),
+        max_tunnels: 0,
+        max_certs_per_day: 0,
         timeouts: Timeouts {
             bridge_stall: Duration::from_millis(500),
+            ..Timeouts::default()
         },
     }
 }
@@ -110,6 +113,16 @@ async fn start_server() -> TestServer {
         cert_pem,
         state,
     }
+}
+
+/// Moves a tunnel into the issuing state for `cert_id`, as a certificate POST
+/// does, without contacting ACME.
+async fn begin_issuance(db: &Db, id: &str, cert_id: &str, csr: &str) {
+    let claim = db
+        .claim_issuance(id, cert_id, csr, now_millis(), 20 * 60 * 1000, 0)
+        .await
+        .unwrap();
+    assert_eq!(claim, Claim::Claimed);
 }
 
 /// TLS to 127.0.0.1 with SNI = relay.test, trusting the test CA.
@@ -356,10 +369,7 @@ async fn retrying_same_csr_does_not_restart_active_issuance() {
         .push(rcgen::DnType::CommonName, hostname);
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let csr = params.serialize_request(&key).unwrap().pem().unwrap();
-    srv.state
-        .db
-        .begin_issuance(&id, "cert_already_issuing", &csr)
-        .unwrap();
+    begin_issuance(&srv.state.db, &id, "cert_already_issuing", &csr).await;
 
     let body = serde_json::json!({"csr": csr}).to_string();
     let (status, response) = http_request(
@@ -375,6 +385,7 @@ async fn retrying_same_csr_does_not_restart_active_issuance() {
         srv.state
             .db
             .get_tunnel(&id)
+            .await
             .unwrap()
             .unwrap()
             .cert_id
@@ -399,14 +410,13 @@ async fn retrying_same_csr_restarts_failed_issuance() {
         .push(rcgen::DnType::CommonName, hostname);
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let csr = params.serialize_request(&key).unwrap().pem().unwrap();
-    srv.state
-        .db
-        .begin_issuance(&id, "cert_failed", &csr)
-        .unwrap();
-    srv.state
+    begin_issuance(&srv.state.db, &id, "cert_failed", &csr).await;
+    assert!(srv
+        .state
         .db
         .set_failed("cert_failed", "temporary CA outage")
-        .unwrap();
+        .await
+        .unwrap());
 
     let body = serde_json::json!({"csr": csr.clone()}).to_string();
     let (status, response) = http_request(
@@ -418,7 +428,7 @@ async fn retrying_same_csr_restarts_failed_issuance() {
     )
     .await;
     assert_eq!(status, 202, "{response}");
-    let record = srv.state.db.get_tunnel(&id).unwrap().unwrap();
+    let record = srv.state.db.get_tunnel(&id).await.unwrap().unwrap();
     assert_ne!(record.cert_id.as_deref(), Some("cert_failed"));
     assert_eq!(record.csr_pem.as_deref(), Some(csr.as_str()));
 }
@@ -437,14 +447,13 @@ async fn bridge_attach_and_sni_routing() {
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
     let token = created["token"].as_str().unwrap().to_string();
-    srv.state
-        .db
-        .begin_issuance(&id, "cert_e2e", "dummy-csr")
-        .unwrap();
-    srv.state
+    begin_issuance(&srv.state.db, &id, "cert_e2e", "dummy-csr").await;
+    assert!(srv
+        .state
         .db
         .set_ready("cert_e2e", "CERT", "CHAIN", "2099-01-01T00:00:00Z")
-        .unwrap();
+        .await
+        .unwrap());
 
     // Open the bridge WebSocket manually over our own TLS stream (no DNS).
     let tls = tls_connect(srv.port, &srv.cert_pem).await;
@@ -627,14 +636,13 @@ async fn attached_bridge(srv: &TestServer) -> (String, Bridge) {
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
     let token = created["token"].as_str().unwrap().to_string();
-    srv.state
-        .db
-        .begin_issuance(&id, "cert_streams", "dummy-csr")
-        .unwrap();
-    srv.state
+    begin_issuance(&srv.state.db, &id, "cert_streams", "dummy-csr").await;
+    assert!(srv
+        .state
         .db
         .set_ready("cert_streams", "CERT", "CHAIN", "2099-01-01T00:00:00Z")
-        .unwrap();
+        .await
+        .unwrap());
 
     let tls = tls_connect(srv.port, &srv.cert_pem).await;
     let mut req = format!("wss://{DOMAIN}:{}/api/tunnel/{id}/connect", srv.port)
@@ -850,11 +858,9 @@ async fn simultaneous_attach_to_same_route_has_one_winner() {
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
     let token = created["token"].as_str().unwrap().to_string();
-    srv.state
-        .db
-        .begin_issuance(&id, "cert_concurrent_attach", "dummy-csr")
-        .unwrap();
-    srv.state
+    begin_issuance(&srv.state.db, &id, "cert_concurrent_attach", "dummy-csr").await;
+    assert!(srv
+        .state
         .db
         .set_ready(
             "cert_concurrent_attach",
@@ -862,7 +868,8 @@ async fn simultaneous_attach_to_same_route_has_one_winner() {
             "CHAIN",
             "2099-01-01T00:00:00Z",
         )
-        .unwrap();
+        .await
+        .unwrap());
 
     let tls1 = tls_connect(srv.port, &srv.cert_pem).await;
     let mut req1 = format!("wss://{DOMAIN}:{}/api/tunnel/{id}/connect", srv.port)

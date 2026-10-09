@@ -12,14 +12,16 @@ use axum::{
     Json, Router,
 };
 
+use std::time::Duration;
+
 use crate::bridge::{self, hash_token, random_token, random_tunnel_id, token_matches};
-use crate::db::{CertState, Db};
+use crate::db::{CertState, Claim, CreateOutcome, Db, TunnelRecord};
 use crate::error::{Error, Result};
 use crate::proto::api::{
     ApiError, BindCertificateRequest, CertificateInfo, CertificateState, CreateTunnelResponse,
     TunnelInfo, TunnelState,
 };
-use crate::state::{now_rfc3339, AppState};
+use crate::state::{now_millis, now_rfc3339, AppState};
 
 const MAX_BRIDGE_WS_MESSAGE_SIZE: usize = 64 * 1024;
 
@@ -45,11 +47,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     value.strip_prefix("Bearer ").map(|t| t.to_string())
 }
 
-fn authed_record(db: &Db, id: &str, headers: &HeaderMap) -> Result<crate::db::TunnelRecord> {
+async fn authed_record(db: &Db, id: &str, headers: &HeaderMap) -> Result<TunnelRecord> {
     let token =
         bearer_token(headers).ok_or_else(|| Error::Unauthorized("missing bearer token".into()))?;
     let record = db
-        .get_tunnel(id)?
+        .get_tunnel(id)
+        .await?
         .filter(|r| r.deleted_at.is_none())
         .ok_or_else(|| Error::TunnelNotFound {
             tunnel_id: id.to_string(),
@@ -60,7 +63,13 @@ fn authed_record(db: &Db, id: &str, headers: &HeaderMap) -> Result<crate::db::Tu
     Ok(record)
 }
 
-fn tunnel_info(record: &crate::db::TunnelRecord) -> TunnelInfo {
+/// How long an issuance may stay marked in flight before a new request may
+/// take it over: twice the ACME order budget, so a live order is never raced.
+fn stale_issuance_after(config: &crate::config::Config) -> i64 {
+    i64::try_from(config.timeouts.lease().as_millis()).unwrap_or(i64::MAX)
+}
+
+fn tunnel_info(record: &TunnelRecord) -> TunnelInfo {
     TunnelInfo {
         id: record.id.clone(),
         hostname: record.hostname.clone(),
@@ -73,7 +82,7 @@ fn tunnel_info(record: &crate::db::TunnelRecord) -> TunnelInfo {
     }
 }
 
-fn certificate_info(record: &crate::db::TunnelRecord) -> Result<CertificateInfo> {
+fn certificate_info(record: &TunnelRecord) -> Result<CertificateInfo> {
     let no_certificate = || Error::CertificateNotFound {
         tunnel_id: record.id.clone(),
     };
@@ -98,20 +107,35 @@ fn certificate_info(record: &crate::db::TunnelRecord) -> Result<CertificateInfo>
 }
 
 async fn create_tunnel(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse> {
-    let domain = state.config.domain.to_lowercase();
     // Retry on the (unlikely) id collision.
     for _ in 0..5 {
         let id = random_tunnel_id();
-        let hostname = format!("{id}.{domain}");
+        let hostname = format!("{id}.{}", state.config.domain);
         let token = random_token();
-        let created =
-            state
-                .db
-                .create_tunnel(&id, &hostname, &hash_token(&token), &now_rfc3339())?;
-        if !created {
-            continue;
+        match state
+            .db
+            .create_tunnel(
+                &id,
+                &hostname,
+                &hash_token(&token),
+                &now_rfc3339(),
+                state.config.max_tunnels,
+            )
+            .await?
+        {
+            CreateOutcome::Created => {}
+            CreateOutcome::IdTaken => continue,
+            CreateOutcome::LimitReached => {
+                return Err(Error::Unavailable(
+                    "this relay has reached its tunnel limit".into(),
+                ))
+            }
         }
-        let record = state.db.get_tunnel(&id)?.expect("just created");
+        let record = state
+            .db
+            .get_tunnel(&id)
+            .await?
+            .ok_or_else(|| Error::Internal("tunnel missing right after creation".into()))?;
         let body = CreateTunnelResponse {
             tunnel: tunnel_info(&record),
             token,
@@ -126,7 +150,7 @@ async fn get_tunnel(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse> {
-    let record = authed_record(&state.db, &id, &headers)?;
+    let record = authed_record(&state.db, &id, &headers).await?;
     Ok(Json(tunnel_info(&record)))
 }
 
@@ -135,7 +159,7 @@ async fn get_certificate(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse> {
-    let record = authed_record(&state.db, &id, &headers)?;
+    let record = authed_record(&state.db, &id, &headers).await?;
     Ok(Json(certificate_info(&record)?))
 }
 
@@ -145,7 +169,7 @@ async fn bind_certificate(
     headers: HeaderMap,
     Json(body): Json<BindCertificateRequest>,
 ) -> Result<impl IntoResponse> {
-    let record = authed_record(&state.db, &id, &headers)?;
+    let record = authed_record(&state.db, &id, &headers).await?;
     let (request_hostname, identifiers) = validate_csr(&body.csr, &record.hostname)?;
 
     // Repeated submissions of the same CSR must not enqueue duplicate orders
@@ -163,28 +187,57 @@ async fn bind_certificate(
     }
 
     let cert_id = format!("cert_{}", bridge::random_session_id());
-    let claimed = state
+    let claim = state
         .db
-        .try_begin_issuance(&record.id, &cert_id, &body.csr)?;
-    if !claimed {
-        let latest = state
-            .db
-            .get_tunnel(&record.id)?
-            .filter(|r| r.deleted_at.is_none())
-            .ok_or_else(|| Error::TunnelNotFound {
+        .claim_issuance(
+            &record.id,
+            &cert_id,
+            &body.csr,
+            now_millis(),
+            stale_issuance_after(&state.config),
+            state.config.max_certs_per_day,
+        )
+        .await?;
+    match claim {
+        Claim::Claimed => {}
+        Claim::NotFound => {
+            return Err(Error::TunnelNotFound {
                 tunnel_id: record.id.clone(),
-            })?;
-        if latest.cert_id.is_some() && latest.csr_pem.as_deref() == Some(body.csr.as_str()) {
-            return Ok((StatusCode::ACCEPTED, Json(certificate_info(&latest)?)));
+            })
         }
-        return Err(Error::CertificateInProgress {
-            tunnel_id: record.id.clone(),
-        });
+        Claim::Busy => {
+            let latest = state
+                .db
+                .get_tunnel(&record.id)
+                .await?
+                .filter(|r| r.deleted_at.is_none())
+                .ok_or_else(|| Error::TunnelNotFound {
+                    tunnel_id: record.id.clone(),
+                })?;
+            if latest.cert_id.is_some() && latest.csr_pem.as_deref() == Some(body.csr.as_str()) {
+                return Ok((StatusCode::ACCEPTED, Json(certificate_info(&latest)?)));
+            }
+            return Err(Error::CertificateInProgress {
+                tunnel_id: record.id.clone(),
+            });
+        }
+        Claim::DailyLimit { retry_after_ms } => {
+            return Err(Error::RateLimited {
+                message: "daily certificate limit reached; retry later".into(),
+                retry_after: Duration::from_millis(u64::try_from(retry_after_ms).unwrap_or(0)),
+            })
+        }
     }
     tracing::info!(tunnel = %record.id, cert = %cert_id, hostname = %request_hostname, identifiers = ?identifiers, "certificate issuance started");
     crate::acme::spawn_issuance(state.clone(), record.id.clone(), cert_id.clone());
 
-    let record = state.db.get_tunnel(&record.id)?.expect("exists");
+    let record = state
+        .db
+        .get_tunnel(&record.id)
+        .await?
+        .ok_or_else(|| Error::TunnelNotFound {
+            tunnel_id: record.id.clone(),
+        })?;
     Ok((StatusCode::ACCEPTED, Json(certificate_info(&record)?)))
 }
 
@@ -254,8 +307,8 @@ async fn delete_tunnel(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse> {
-    let record = authed_record(&state.db, &id, &headers)?;
-    state.db.delete_tunnel(&record.id, &now_rfc3339())?;
+    let record = authed_record(&state.db, &id, &headers).await?;
+    state.db.delete_tunnel(&record.id, &now_rfc3339()).await?;
     // The persistent tombstone prevents a concurrent lookup from recreating
     // the session while its live bridges and channels are being shut down.
     state.sessions.remove(&record.id).await;

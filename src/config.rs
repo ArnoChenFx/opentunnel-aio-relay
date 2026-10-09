@@ -54,6 +54,16 @@ pub struct Config {
     #[arg(long, env = "OT_ACME_EMAIL", default_value = "acme@localhost")]
     pub acme_email: String,
 
+    /// Maximum number of live (not deleted) tunnels. 0 disables the limit.
+    #[arg(long, env = "OT_MAX_TUNNELS", default_value_t = 1000)]
+    pub max_tunnels: u64,
+
+    /// Maximum new certificate orders per rolling 24 hours, counted across all
+    /// tunnels. Renewals are never refused, but they count toward the total so
+    /// the figure reflects what Let's Encrypt sees. 0 disables the limit.
+    #[arg(long, env = "OT_MAX_CERTS_PER_DAY", default_value_t = 7)]
+    pub max_certs_per_day: u64,
+
     #[arg(skip)]
     pub timeouts: Timeouts,
 }
@@ -82,12 +92,26 @@ pub struct Timeouts {
     /// with a 30 s budget; this relay uses a shorter one because the reader is
     /// shared, so every other stream on the bridge waits while it blocks.
     pub bridge_stall: Duration,
+    /// Upper bound for one ACME order, including DNS propagation. A timed-out
+    /// order is marked failed and its TXT records are removed. An issuance
+    /// still marked in flight after twice this long is taken over.
+    pub issuance: Duration,
+}
+
+impl Timeouts {
+    /// How long an issuance or renewal lease may be held before another
+    /// attempt may take it over. Set well above `issuance` so a slow but live
+    /// order is never raced.
+    pub fn lease(&self) -> Duration {
+        self.issuance * 2
+    }
 }
 
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
             bridge_stall: Duration::from_secs(10),
+            issuance: Duration::from_secs(600),
         }
     }
 }

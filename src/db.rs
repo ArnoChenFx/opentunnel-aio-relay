@@ -1,13 +1,24 @@
-//! SQLite persistence. Replaces the Durable Object storage of the
-//! Cloudflare deployment: one row per tunnel holds the metadata the DO kept
-//! in `ctx.storage` (identity, token hash, certificate state, CSR).
+//! SQLite persistence. One row per tunnel holds the identity, token hash,
+//! certificate state, and CSR. Renewal bookkeeping sits beside the active
+//! certificate so a failing renewal never changes what clients are served.
+//!
+//! One connection sits behind a std mutex. Every call runs on the blocking
+//! pool, so async workers never wait on disk I/O, and each closure is atomic
+//! with respect to the others because it holds the mutex for its whole body.
+//! Timestamps used for scheduling are unix milliseconds; `created_at` and
+//! `deleted_at` stay RFC 3339 strings as the protocol exposes them.
 
-use rusqlite::{params, Connection, OptionalExtension};
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::error::{Error, Result};
+
+/// Length of the rolling window the daily certificate budget counts over.
+pub const ISSUANCE_WINDOW_MS: i64 = 24 * 3600 * 1000;
+const HOUR_MS: i64 = 3600 * 1000;
 
 /// Certificate lifecycle state, mirroring the protocol's CertificateState.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +72,79 @@ pub struct TunnelRecord {
     pub last_connected_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    Created,
+    IdTaken,
+    LimitReached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    Claimed,
+    Busy,
+    NotFound,
+    /// The daily order budget is spent. `retry_after_ms` is when the oldest
+    /// counted order leaves the window and frees a slot.
+    DailyLimit {
+        retry_after_ms: i64,
+    },
+}
+
+/// Delay before the next renewal attempt after `attempts` consecutive failures:
+/// one hour, doubling, capped at twelve hours.
+pub fn renewal_backoff_ms(attempts: u32) -> i64 {
+    let shift = attempts.saturating_sub(1).min(16);
+    (HOUR_MS << shift).min(12 * HOUR_MS)
+}
+
+const RECORD_COLUMNS: &str = "id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
+    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
+    fail_reason, csr_pem, created_at, last_connected_at";
+
+/// Ordered schema migrations. The index + 1 is the `user_version` they produce.
+/// Databases created before versioning have user_version 0 and tables that
+/// already exist, so version 1 is a no-op for them and version 2 adds columns.
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS tunnels (
+         id TEXT PRIMARY KEY,
+         hostname TEXT NOT NULL UNIQUE,
+         token_hash TEXT NOT NULL,
+         state TEXT NOT NULL DEFAULT 'offline',
+         deleted_at TEXT,
+         cert_id TEXT,
+         cert_state TEXT NOT NULL DEFAULT 'none',
+         cert_pem TEXT,
+         chain_pem TEXT,
+         cert_expiry TEXT,
+         challenge_token TEXT,
+         challenge_key TEXT,
+         fail_reason TEXT,
+         csr_pem TEXT,
+         created_at TEXT NOT NULL,
+         last_connected_at TEXT
+     );
+     CREATE TABLE IF NOT EXISTS meta (
+         key TEXT PRIMARY KEY,
+         value TEXT NOT NULL
+     );",
+    "ALTER TABLE tunnels ADD COLUMN cert_started_at INTEGER;
+     ALTER TABLE tunnels ADD COLUMN renewal_id TEXT;
+     ALTER TABLE tunnels ADD COLUMN renewal_started_at INTEGER;
+     ALTER TABLE tunnels ADD COLUMN renewal_attempts INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE tunnels ADD COLUMN renewal_next_at INTEGER;
+     ALTER TABLE tunnels ADD COLUMN renewal_error TEXT;
+     CREATE TABLE IF NOT EXISTS issuances (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         tunnel_id TEXT NOT NULL,
+         kind TEXT NOT NULL,
+         created_at INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS issuances_created_at ON issuances (created_at);",
+];
+
 pub struct Db {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Db {
@@ -70,33 +152,9 @@ impl Db {
         // SQLite otherwise creates databases according to the process umask.
         // The database also contains the ACME account key and tunnel metadata.
         secure_database_file(path)?;
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             CREATE TABLE IF NOT EXISTS tunnels (
-                 id TEXT PRIMARY KEY,
-                 hostname TEXT NOT NULL UNIQUE,
-                 token_hash TEXT NOT NULL,
-                 state TEXT NOT NULL DEFAULT 'offline',
-                 deleted_at TEXT,
-                 cert_id TEXT,
-                 cert_state TEXT NOT NULL DEFAULT 'none',
-                 cert_pem TEXT,
-                 chain_pem TEXT,
-                 cert_expiry TEXT,
-                 challenge_token TEXT,
-                 challenge_key TEXT,
-                 fail_reason TEXT,
-                 csr_pem TEXT,
-                 created_at TEXT NOT NULL,
-                 last_connected_at TEXT
-             );
-             CREATE TABLE IF NOT EXISTS meta (
-                 key TEXT PRIMARY KEY,
-                 value TEXT NOT NULL
-             );",
-        )?;
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+        migrate(&mut conn)?;
         // No bridge survives a process restart; do not expose stale online
         // status from the previous process lifetime.
         conn.execute(
@@ -105,219 +163,457 @@ impl Db {
         )?;
         secure_database_file(path)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|e| Error::Internal(e.to_string()))
+    async fn run<T, F>(&self, work: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            work(&mut guard)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("database task failed: {e}")))?
     }
 
-    pub fn create_tunnel(
+    /// Inserts a tunnel unless the id is taken or `max_tunnels` live tunnels
+    /// already exist. The count and insert run under one lock, so concurrent
+    /// creations cannot both pass the limit.
+    pub async fn create_tunnel(
         &self,
         id: &str,
         hostname: &str,
         token_hash: &str,
         now: &str,
-    ) -> Result<bool> {
-        let conn = self.lock()?;
-        let rows = conn.execute(
-            "INSERT OR IGNORE INTO tunnels (id, hostname, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, hostname, token_hash, now],
-        )?;
-        Ok(rows == 1)
-    }
-
-    pub fn get_tunnel(&self, id: &str) -> Result<Option<TunnelRecord>> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
-                    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
-                    fail_reason, csr_pem, created_at, last_connected_at
-             FROM tunnels WHERE id = ?1",
-            params![id],
-            row_to_record,
-        )
-        .optional()
-        .map_err(Error::from)
-    }
-
-    pub fn set_online(&self, id: &str, online: bool, now: &str) -> Result<()> {
-        let conn = self.lock()?;
-        if online {
-            conn.execute(
-                "UPDATE tunnels SET state = 'online', last_connected_at = ?1 WHERE id = ?2",
-                params![now, id],
+        max_tunnels: u64,
+    ) -> Result<CreateOutcome> {
+        let (id, hostname, token_hash, now) = (
+            id.to_owned(),
+            hostname.to_owned(),
+            token_hash.to_owned(),
+            now.to_owned(),
+        );
+        self.run(move |conn| {
+            if max_tunnels > 0 {
+                let live: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM tunnels WHERE deleted_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if u64::try_from(live).unwrap_or(0) >= max_tunnels {
+                    return Ok(CreateOutcome::LimitReached);
+                }
+            }
+            let rows = conn.execute(
+                "INSERT OR IGNORE INTO tunnels (id, hostname, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, hostname, token_hash, now],
             )?;
-        } else {
-            conn.execute(
-                "UPDATE tunnels SET state = 'offline' WHERE id = ?1",
-                params![id],
+            Ok(if rows == 1 {
+                CreateOutcome::Created
+            } else {
+                CreateOutcome::IdTaken
+            })
+        })
+        .await
+    }
+
+    pub async fn get_tunnel(&self, id: &str) -> Result<Option<TunnelRecord>> {
+        let id = id.to_owned();
+        self.run(move |conn| load_record(conn, &id)).await
+    }
+
+    pub async fn set_online(&self, id: &str, online: bool, now: &str) -> Result<()> {
+        let (id, now) = (id.to_owned(), now.to_owned());
+        self.run(move |conn| {
+            if online {
+                conn.execute(
+                    "UPDATE tunnels SET state = 'online', last_connected_at = ?1 WHERE id = ?2",
+                    params![now, id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE tunnels SET state = 'offline' WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Starts an initial issuance for `csr_pem`. Refused when the tunnel is
+    /// gone, when another issuance is in flight and not stale, or when the
+    /// daily order budget is spent. The claim and its ledger entry are written
+    /// together, so the budget cannot be overrun by concurrent requests.
+    pub async fn claim_issuance(
+        &self,
+        id: &str,
+        cert_id: &str,
+        csr_pem: &str,
+        now_ms: i64,
+        stale_after_ms: i64,
+        daily_limit: u64,
+    ) -> Result<Claim> {
+        let (id, cert_id, csr_pem) = (id.to_owned(), cert_id.to_owned(), csr_pem.to_owned());
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let current: Option<(Option<String>, String, Option<i64>)> = tx
+                .query_row(
+                    "SELECT deleted_at, cert_state, cert_started_at FROM tunnels WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((deleted_at, cert_state, started_at)) = current else {
+                return Ok(Claim::NotFound);
+            };
+            if deleted_at.is_some() {
+                return Ok(Claim::NotFound);
+            }
+            let in_flight = matches!(cert_state.as_str(), "challenge" | "issuing");
+            let stale = started_at.is_none_or(|started| started < now_ms - stale_after_ms);
+            if in_flight && !stale {
+                return Ok(Claim::Busy);
+            }
+            if daily_limit > 0 {
+                let window_start = now_ms - ISSUANCE_WINDOW_MS;
+                if issuances_since(&tx, window_start)? >= daily_limit {
+                    let oldest: Option<i64> = tx.query_row(
+                        "SELECT MIN(created_at) FROM issuances WHERE created_at > ?1",
+                        params![window_start],
+                        |row| row.get(0),
+                    )?;
+                    let retry_after_ms =
+                        oldest.map_or(HOUR_MS, |t| t + ISSUANCE_WINDOW_MS - now_ms);
+                    return Ok(Claim::DailyLimit {
+                        retry_after_ms: retry_after_ms.max(60_000),
+                    });
+                }
+            }
+            tx.execute(
+                "UPDATE tunnels SET cert_id = ?1, cert_state = 'issuing', csr_pem = ?2,
+                     cert_started_at = ?3, challenge_token = NULL, challenge_key = NULL,
+                     fail_reason = NULL, renewal_id = NULL, renewal_started_at = NULL,
+                     renewal_next_at = NULL, renewal_attempts = 0, renewal_error = NULL
+                 WHERE id = ?4",
+                params![cert_id, csr_pem, now_ms, id],
             )?;
-        }
-        Ok(())
+            record_issuance(&tx, &id, "order", now_ms)?;
+            tx.commit()?;
+            Ok(Claim::Claimed)
+        })
+        .await
     }
 
-    pub fn touch_connected(&self, id: &str, now: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE tunnels SET last_connected_at = ?1 WHERE id = ?2",
-            params![now, id],
-        )?;
-        Ok(())
+    pub async fn set_challenge(&self, cert_id: &str, token: &str, key: &str) -> Result<()> {
+        let (cert_id, token, key) = (cert_id.to_owned(), token.to_owned(), key.to_owned());
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE tunnels SET cert_state = 'challenge', challenge_token = ?1, challenge_key = ?2
+                 WHERE cert_id = ?3 AND cert_state IN ('issuing', 'challenge')",
+                params![token, key, cert_id],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
-    /// Starts (or restarts) issuance for the given CSR. Returns the cert id.
-    pub fn begin_issuance(&self, id: &str, cert_id: &str, csr_pem: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE tunnels SET cert_id = ?1, cert_state = 'issuing', csr_pem = ?2,
-                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL
-             WHERE id = ?3",
-            params![cert_id, csr_pem, id],
-        )?;
-        Ok(())
-    }
-
-    /// Atomically claims a certificate issuance unless one is already active.
-    /// Returns `false` if the tunnel was deleted, missing, or another request
-    /// already moved it into the challenge/issuing state.
-    pub fn try_begin_issuance(&self, id: &str, cert_id: &str, csr_pem: &str) -> Result<bool> {
-        let conn = self.lock()?;
-        let rows = conn.execute(
-            "UPDATE tunnels SET cert_id = ?1, cert_state = 'issuing', csr_pem = ?2,
-                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL
-             WHERE id = ?3 AND deleted_at IS NULL
-               AND cert_state NOT IN ('challenge', 'issuing')",
-            params![cert_id, csr_pem, id],
-        )?;
-        Ok(rows == 1)
-    }
-
-    pub fn set_challenge(&self, cert_id: &str, token: &str, key: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE tunnels SET cert_state = 'challenge', challenge_token = ?1, challenge_key = ?2
-             WHERE cert_id = ?3",
-            params![token, key, cert_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_ready(
+    /// Makes the issued certificate the active one. Returns false if the
+    /// issuance was superseded or the tunnel was deleted meanwhile.
+    pub async fn set_ready(
         &self,
         cert_id: &str,
         cert_pem: &str,
         chain_pem: &str,
         expiry: &str,
-    ) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE tunnels SET cert_state = 'ready', cert_pem = ?1, chain_pem = ?2,
-                 cert_expiry = ?3, fail_reason = NULL WHERE cert_id = ?4",
-            params![cert_pem, chain_pem, expiry, cert_id],
-        )?;
-        Ok(())
+    ) -> Result<bool> {
+        let (cert_id, cert_pem, chain_pem, expiry) = (
+            cert_id.to_owned(),
+            cert_pem.to_owned(),
+            chain_pem.to_owned(),
+            expiry.to_owned(),
+        );
+        self.run(move |conn| {
+            let rows = conn.execute(
+                "UPDATE tunnels SET cert_state = 'ready', cert_pem = ?1, chain_pem = ?2,
+                     cert_expiry = ?3, fail_reason = NULL, challenge_token = NULL, challenge_key = NULL
+                 WHERE cert_id = ?4 AND cert_state IN ('issuing', 'challenge') AND deleted_at IS NULL",
+                params![cert_pem, chain_pem, expiry, cert_id],
+            )?;
+            Ok(rows == 1)
+        })
+        .await
     }
 
-    pub fn set_failed(&self, cert_id: &str, reason: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE tunnels SET cert_state = 'failed', fail_reason = ?1 WHERE cert_id = ?2",
-            params![reason, cert_id],
-        )?;
-        Ok(())
+    pub async fn set_failed(&self, cert_id: &str, reason: &str) -> Result<bool> {
+        let (cert_id, reason) = (cert_id.to_owned(), reason.to_owned());
+        self.run(move |conn| {
+            let rows = conn.execute(
+                "UPDATE tunnels SET cert_state = 'failed', fail_reason = ?1, challenge_token = NULL, challenge_key = NULL
+                 WHERE cert_id = ?2 AND cert_state IN ('issuing', 'challenge')",
+                params![reason, cert_id],
+            )?;
+            Ok(rows == 1)
+        })
+        .await
     }
 
-    pub fn get_by_cert_id(&self, cert_id: &str) -> Result<Option<TunnelRecord>> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
-                    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
-                    fail_reason, csr_pem, created_at, last_connected_at
-             FROM tunnels WHERE cert_id = ?1",
-            params![cert_id],
+    /// Re-arms issuances that were in flight when the previous process stopped
+    /// and drops renewal leases held by it. Returns `(tunnel_id, cert_id)` for
+    /// each issuance to resume. The stored CSR makes the resumed order
+    /// identical to the interrupted one.
+    pub async fn requeue_interrupted(&self, now_ms: i64) -> Result<Vec<(String, String)>> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let pending: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, cert_id FROM tunnels
+                     WHERE deleted_at IS NULL AND cert_state IN ('challenge', 'issuing') AND cert_id IS NOT NULL",
+                )?;
+                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (tunnel_id, _) in &pending {
+                tx.execute(
+                    "UPDATE tunnels SET cert_state = 'issuing', challenge_token = NULL,
+                         challenge_key = NULL, cert_started_at = ?1 WHERE id = ?2",
+                    params![now_ms, tunnel_id],
+                )?;
+                record_issuance(&tx, tunnel_id, "requeue", now_ms)?;
+            }
+            tx.execute(
+                "UPDATE tunnels SET renewal_id = NULL, renewal_started_at = NULL WHERE renewal_id IS NOT NULL",
+                [],
+            )?;
+            tx.commit()?;
+            Ok(pending)
+        })
+        .await
+    }
+
+    /// Ready tunnels with a stored CSR whose renewal is neither leased nor in
+    /// backoff. The caller applies expiry and activity policy.
+    pub async fn renewal_candidates(
+        &self,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> Result<Vec<TunnelRecord>> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RECORD_COLUMNS} FROM tunnels
+                 WHERE deleted_at IS NULL
+                   AND cert_state = 'ready'
+                   AND csr_pem IS NOT NULL
+                   AND cert_expiry IS NOT NULL
+                   AND (renewal_id IS NULL OR renewal_started_at IS NULL OR renewal_started_at <= ?1)
+                   AND (renewal_next_at IS NULL OR renewal_next_at <= ?2)"
+            ))?;
+            let rows = stmt.query_map(params![now_ms - lease_ms, now_ms], row_to_record)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    /// Takes the renewal lease for a tunnel. Renewals are never refused by the
+    /// daily budget, but they are recorded in it.
+    pub async fn claim_renewal(
+        &self,
+        id: &str,
+        renewal_id: &str,
+        csr_pem: &str,
+        now_ms: i64,
+        lease_ms: i64,
+    ) -> Result<bool> {
+        let (id, renewal_id, csr_pem) = (id.to_owned(), renewal_id.to_owned(), csr_pem.to_owned());
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let rows = tx.execute(
+                "UPDATE tunnels SET renewal_id = ?1, renewal_started_at = ?2
+                 WHERE id = ?3 AND deleted_at IS NULL AND cert_state = 'ready' AND csr_pem = ?4
+                   AND (renewal_id IS NULL OR renewal_started_at IS NULL OR renewal_started_at <= ?5)
+                   AND (renewal_next_at IS NULL OR renewal_next_at <= ?2)",
+                params![renewal_id, now_ms, id, csr_pem, now_ms - lease_ms],
+            )?;
+            if rows == 1 {
+                record_issuance(&tx, &id, "renewal", now_ms)?;
+            }
+            tx.commit()?;
+            Ok(rows == 1)
+        })
+        .await
+    }
+
+    /// Swaps in the renewed certificate. Only the holder of the current lease
+    /// for the same CSR may do so; anything else is a superseded attempt.
+    pub async fn complete_renewal(
+        &self,
+        id: &str,
+        renewal_id: &str,
+        csr_pem: &str,
+        cert_pem: &str,
+        chain_pem: &str,
+        expiry: &str,
+    ) -> Result<bool> {
+        let (id, renewal_id, csr_pem) = (id.to_owned(), renewal_id.to_owned(), csr_pem.to_owned());
+        let (cert_pem, chain_pem, expiry) =
+            (cert_pem.to_owned(), chain_pem.to_owned(), expiry.to_owned());
+        self.run(move |conn| {
+            let rows = conn.execute(
+                "UPDATE tunnels SET cert_pem = ?1, chain_pem = ?2, cert_expiry = ?3,
+                     renewal_id = NULL, renewal_started_at = NULL, renewal_attempts = 0,
+                     renewal_next_at = NULL, renewal_error = NULL
+                 WHERE id = ?4 AND renewal_id = ?5 AND csr_pem = ?6 AND cert_state = 'ready' AND deleted_at IS NULL",
+                params![cert_pem, chain_pem, expiry, id, renewal_id, csr_pem],
+            )?;
+            Ok(rows == 1)
+        })
+        .await
+    }
+
+    /// Releases a failed renewal's lease and schedules the next attempt.
+    /// Returns the time of that attempt, or `None` if the lease was not held.
+    /// The active certificate is untouched.
+    pub async fn fail_renewal(
+        &self,
+        id: &str,
+        renewal_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<Option<i64>> {
+        let (id, renewal_id, reason) = (id.to_owned(), renewal_id.to_owned(), reason.to_owned());
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let attempts: Option<i64> = tx
+                .query_row(
+                    "SELECT renewal_attempts FROM tunnels WHERE id = ?1 AND renewal_id = ?2",
+                    params![id, renewal_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(attempts) = attempts else {
+                return Ok(None);
+            };
+            let attempts = u32::try_from(attempts.saturating_add(1)).unwrap_or(u32::MAX);
+            let next_at = now_ms + renewal_backoff_ms(attempts);
+            tx.execute(
+                "UPDATE tunnels SET renewal_id = NULL, renewal_started_at = NULL,
+                     renewal_attempts = ?1, renewal_next_at = ?2, renewal_error = ?3
+                 WHERE id = ?4 AND renewal_id = ?5",
+                params![i64::from(attempts), next_at, reason, id, renewal_id],
+            )?;
+            tx.commit()?;
+            Ok(Some(next_at))
+        })
+        .await
+    }
+
+    pub async fn delete_tunnel(&self, id: &str, now: &str) -> Result<bool> {
+        let (id, now) = (id.to_owned(), now.to_owned());
+        self.run(move |conn| {
+            let rows = conn.execute(
+                "UPDATE tunnels SET deleted_at = ?1, state = 'offline', renewal_id = NULL, renewal_started_at = NULL
+                 WHERE id = ?2 AND deleted_at IS NULL",
+                params![now, id],
+            )?;
+            Ok(rows == 1)
+        })
+        .await
+    }
+
+    pub async fn prune_issuances(&self, before_ms: i64) -> Result<()> {
+        self.run(move |conn| {
+            conn.execute(
+                "DELETE FROM issuances WHERE created_at < ?1",
+                params![before_ms],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_owned();
+        self.run(move |conn| {
+            let value = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(value)
+        })
+        .await
+    }
+
+    /// Returns the stored value for `key`, storing `candidate` first if the
+    /// key is absent. Used for the ACME account key, which must be created once
+    /// even when several issuances start together.
+    pub async fn get_or_insert_meta(&self, key: &str, candidate: String) -> Result<String> {
+        let key = key.to_owned();
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+                params![key, candidate],
+            )?;
+            let value = conn.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )?;
+            Ok(value)
+        })
+        .await
+    }
+}
+
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let current: usize = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    for (index, sql) in MIGRATIONS.iter().enumerate().skip(current) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.execute_batch(&format!("PRAGMA user_version = {}", index + 1))?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn load_record(conn: &Connection, id: &str) -> Result<Option<TunnelRecord>> {
+    let record = conn
+        .query_row(
+            &format!("SELECT {RECORD_COLUMNS} FROM tunnels WHERE id = ?1"),
+            params![id],
             row_to_record,
         )
-        .optional()
-        .map_err(Error::from)
-    }
+        .optional()?;
+    Ok(record)
+}
 
-    /// Tunnels whose certificate expires within `within_secs` and that were
-    /// connected in the last `active_within_secs` (or are online now).
-    pub fn renewal_candidates(
-        &self,
-        within_secs: i64,
-        active_within_secs: i64,
-        now_secs: i64,
-    ) -> Result<Vec<TunnelRecord>> {
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
-                    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
-                    fail_reason, csr_pem, created_at, last_connected_at
-             FROM tunnels
-             WHERE deleted_at IS NULL
-               AND cert_state IN ('ready', 'failed')
-               AND cert_pem IS NOT NULL
-               AND cert_expiry IS NOT NULL
-               AND csr_pem IS NOT NULL",
-        )?;
-        let rows = stmt.query_map([], row_to_record)?;
-        let mut out = Vec::new();
-        for row in rows {
-            let record = row?;
-            let expiry_secs = record
-                .cert_expiry
-                .as_deref()
-                .and_then(parse_rfc3339_secs)
-                .unwrap_or(i64::MAX);
-            if expiry_secs - now_secs > within_secs {
-                continue;
-            }
-            let active = record.state == "online"
-                || record
-                    .last_connected_at
-                    .as_deref()
-                    .and_then(parse_rfc3339_secs)
-                    .map(|t| now_secs - t < active_within_secs)
-                    .unwrap_or(false);
-            if active {
-                out.push(record);
-            }
-        }
-        Ok(out)
-    }
+fn record_issuance(
+    conn: &Connection,
+    tunnel_id: &str,
+    kind: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO issuances (tunnel_id, kind, created_at) VALUES (?1, ?2, ?3)",
+        params![tunnel_id, kind, now_ms],
+    )?;
+    Ok(())
+}
 
-    pub fn delete_tunnel(&self, id: &str, now: &str) -> Result<bool> {
-        let conn = self.lock()?;
-        let rows = conn.execute(
-            "UPDATE tunnels SET deleted_at = ?1, state = 'offline' WHERE id = ?2 AND deleted_at IS NULL",
-            params![now, id],
-        )?;
-        Ok(rows == 1)
-    }
-
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Error::from)
-    }
-
-    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
-    }
+fn issuances_since(conn: &Transaction<'_>, since_ms: i64) -> rusqlite::Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM issuances WHERE created_at > ?1",
+        params![since_ms],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<TunnelRecord> {
@@ -359,33 +655,61 @@ fn secure_database_file(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn parse_rfc3339_secs(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.timestamp())
+#[cfg(test)]
+pub(crate) fn temp_db_path(name: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "ot-relay-{name}-{}-{nonce}.sqlite",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_path() -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("ot-relay-db-{}-{nonce}.sqlite", std::process::id()))
+    const NOW: i64 = 1_800_000_000_000;
+    const LEASE: i64 = 30 * 60 * 1000;
+    const STALE: i64 = 20 * 60 * 1000;
+
+    async fn open_with_tunnel(name: &str, tunnel: &str) -> (Db, std::path::PathBuf) {
+        let path = temp_db_path(name);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.create_tunnel(tunnel, &format!("{tunnel}.relay.test"), "hash", "now", 0)
+                .await
+                .unwrap(),
+            CreateOutcome::Created
+        );
+        (db, path)
     }
 
-    #[test]
-    fn issuance_claim_is_atomic_and_database_is_private() {
-        let path = test_path();
-        let db = Db::open(&path).unwrap();
-        assert!(db
-            .create_tunnel("t1", "t1.example.test", "hash", "now")
-            .unwrap());
-        assert!(db.try_begin_issuance("t1", "cert1", "csr").unwrap());
-        assert!(!db.try_begin_issuance("t1", "cert2", "csr").unwrap());
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["-wal", "-shm"] {
+            let name = format!("{}{suffix}", path.file_name().unwrap().to_string_lossy());
+            let _ = std::fs::remove_file(path.with_file_name(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn issuance_claim_is_atomic_and_database_is_private() {
+        let (db, path) = open_with_tunnel("claim", "t1").await;
+        assert_eq!(
+            db.claim_issuance("t1", "cert1", "csr", NOW, STALE, 0)
+                .await
+                .unwrap(),
+            Claim::Claimed
+        );
+        assert_eq!(
+            db.claim_issuance("t1", "cert2", "csr", NOW, STALE, 0)
+                .await
+                .unwrap(),
+            Claim::Busy
+        );
 
         #[cfg(unix)]
         {
@@ -396,51 +720,245 @@ mod tests {
             );
         }
         drop(db);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_file_name(format!(
-            "{}-wal",
-            path.file_name().unwrap().to_string_lossy()
-        )));
-        let _ = std::fs::remove_file(path.with_file_name(format!(
-            "{}-shm",
-            path.file_name().unwrap().to_string_lossy()
-        )));
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn stale_issuance_can_be_taken_over() {
+        let (db, path) = open_with_tunnel("stale", "t1").await;
+        db.claim_issuance("t1", "cert1", "csr", NOW, STALE, 0)
+            .await
+            .unwrap();
+        let later = NOW + STALE + 1;
+        assert_eq!(
+            db.claim_issuance("t1", "cert2", "csr2", later, STALE, 0)
+                .await
+                .unwrap(),
+            Claim::Claimed
+        );
+        assert_eq!(
+            db.get_tunnel("t1")
+                .await
+                .unwrap()
+                .unwrap()
+                .cert_id
+                .as_deref(),
+            Some("cert2")
+        );
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn daily_budget_refuses_new_orders_but_renewals_still_run() {
+        let (db, path) = open_with_tunnel("budget", "t1").await;
+        assert_eq!(
+            db.create_tunnel("t2", "t2.relay.test", "hash", "now", 0)
+                .await
+                .unwrap(),
+            CreateOutcome::Created
+        );
+        assert_eq!(
+            db.claim_issuance("t1", "cert1", "csr1", NOW, STALE, 1)
+                .await
+                .unwrap(),
+            Claim::Claimed
+        );
+        assert!(matches!(
+            db.claim_issuance("t2", "cert2", "csr2", NOW, STALE, 1).await.unwrap(),
+            Claim::DailyLimit { retry_after_ms } if retry_after_ms == ISSUANCE_WINDOW_MS
+        ));
+        db.set_ready("cert1", "PEM", "CHAIN", "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(db
+            .claim_renewal("t1", "renew1", "csr1", NOW, LEASE)
+            .await
+            .unwrap());
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn renewal_lease_blocks_second_claim_until_it_expires() {
+        let (db, path) = open_with_tunnel("lease", "t1").await;
+        db.claim_issuance("t1", "cert1", "csr1", NOW, STALE, 0)
+            .await
+            .unwrap();
+        db.set_ready("cert1", "PEM", "CHAIN", "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+
+        assert!(db
+            .claim_renewal("t1", "renew1", "csr1", NOW, LEASE)
+            .await
+            .unwrap());
+        assert!(!db
+            .claim_renewal("t1", "renew2", "csr1", NOW + 1, LEASE)
+            .await
+            .unwrap());
+        assert!(db
+            .claim_renewal("t1", "renew2", "csr1", NOW + LEASE + 1, LEASE)
+            .await
+            .unwrap());
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn failed_renewal_keeps_active_certificate_and_backs_off() {
+        let (db, path) = open_with_tunnel("backoff", "t1").await;
+        db.claim_issuance("t1", "cert1", "csr1", NOW, STALE, 0)
+            .await
+            .unwrap();
+        db.set_ready("cert1", "ACTIVE", "CHAIN", "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        db.claim_renewal("t1", "renew1", "csr1", NOW, LEASE)
+            .await
+            .unwrap();
+
+        let next = db
+            .fail_renewal("t1", "renew1", "acme down", NOW + 5)
+            .await
+            .unwrap()
+            .expect("lease was held");
+        assert_eq!(next, NOW + 5 + HOUR_MS);
+
+        let record = db.get_tunnel("t1").await.unwrap().unwrap();
+        assert_eq!(record.cert_state, CertState::Ready);
+        assert_eq!(record.cert_pem.as_deref(), Some("ACTIVE"));
+
+        assert!(db
+            .renewal_candidates(NOW + 6, LEASE)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.renewal_candidates(next, LEASE).await.unwrap().len(), 1);
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn superseded_renewal_cannot_overwrite_certificate() {
+        let (db, path) = open_with_tunnel("supersede", "t1").await;
+        db.claim_issuance("t1", "cert1", "csr1", NOW, STALE, 0)
+            .await
+            .unwrap();
+        db.set_ready("cert1", "ACTIVE", "CHAIN", "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        db.claim_renewal("t1", "renew1", "csr1", NOW, LEASE)
+            .await
+            .unwrap();
+
+        assert!(!db
+            .complete_renewal("t1", "stale", "csr1", "OLD", "", "2100-01-01T00:00:00Z")
+            .await
+            .unwrap());
+        assert!(db
+            .complete_renewal(
+                "t1",
+                "renew1",
+                "csr1",
+                "NEW",
+                "CHAIN",
+                "2100-01-01T00:00:00Z"
+            )
+            .await
+            .unwrap());
+        let record = db.get_tunnel("t1").await.unwrap().unwrap();
+        assert_eq!(record.cert_pem.as_deref(), Some("NEW"));
+        assert_eq!(record.cert_expiry.as_deref(), Some("2100-01-01T00:00:00Z"));
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn requeue_resumes_interrupted_issuance_and_drops_leases() {
+        let (db, path) = open_with_tunnel("requeue", "t1").await;
+        db.claim_issuance("t1", "cert1", "csr1", NOW, STALE, 0)
+            .await
+            .unwrap();
+        let resumed = db.requeue_interrupted(NOW + 1).await.unwrap();
+        assert_eq!(resumed, vec![("t1".to_string(), "cert1".to_string())]);
+        assert_eq!(
+            db.get_tunnel("t1").await.unwrap().unwrap().cert_state,
+            CertState::Issuing
+        );
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn tunnel_cap_is_enforced_by_the_insert() {
+        let path = temp_db_path("cap");
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.create_tunnel("a", "a.relay.test", "h", "now", 1)
+                .await
+                .unwrap(),
+            CreateOutcome::Created
+        );
+        assert_eq!(
+            db.create_tunnel("b", "b.relay.test", "h", "now", 1)
+                .await
+                .unwrap(),
+            CreateOutcome::LimitReached
+        );
+        drop(db);
+        cleanup(&path);
     }
 
     #[test]
-    fn failed_renewal_is_scanned_and_stale_online_state_is_cleared_on_reopen() {
-        let path = test_path();
-        let db = Db::open(&path).unwrap();
-        let now = chrono::Utc::now();
-        let now_text = now.to_rfc3339();
-        let expiry = (now + chrono::Duration::days(10)).to_rfc3339();
-        db.create_tunnel("t1", "t1.example.test", "hash", &now_text)
-            .unwrap();
-        db.begin_issuance("t1", "cert1", "same-csr").unwrap();
-        db.set_ready("cert1", "CERT", "CHAIN", &expiry).unwrap();
-        db.set_online("t1", true, &now_text).unwrap();
-        db.set_failed("cert1", "temporary CA outage").unwrap();
+    fn renewal_backoff_doubles_and_caps_at_twelve_hours() {
+        assert_eq!(renewal_backoff_ms(1), HOUR_MS);
+        assert_eq!(renewal_backoff_ms(2), 2 * HOUR_MS);
+        assert_eq!(renewal_backoff_ms(4), 8 * HOUR_MS);
+        assert_eq!(renewal_backoff_ms(5), 12 * HOUR_MS);
+        assert_eq!(renewal_backoff_ms(500), 12 * HOUR_MS);
+    }
 
-        let candidates = db
-            .renewal_candidates(30 * 24 * 3600, 90 * 24 * 3600, now.timestamp())
+    #[tokio::test]
+    async fn database_created_before_versioning_is_migrated() {
+        let path = temp_db_path("legacy");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tunnels (
+                     id TEXT PRIMARY KEY, hostname TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL,
+                     state TEXT NOT NULL DEFAULT 'offline', deleted_at TEXT, cert_id TEXT,
+                     cert_state TEXT NOT NULL DEFAULT 'none', cert_pem TEXT, chain_pem TEXT,
+                     cert_expiry TEXT, challenge_token TEXT, challenge_key TEXT, fail_reason TEXT,
+                     csr_pem TEXT, created_at TEXT NOT NULL, last_connected_at TEXT
+                 );
+                 INSERT INTO tunnels (id, hostname, token_hash, created_at)
+                     VALUES ('old', 'old.relay.test', 'h', 'then');",
+            )
             .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].cert_state, CertState::Failed);
-        assert!(db.try_begin_issuance("t1", "cert2", "same-csr").unwrap());
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.get_tunnel("old").await.unwrap().unwrap().hostname,
+            "old.relay.test"
+        );
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn reopening_clears_online_state_left_by_a_previous_process() {
+        let (db, path) = open_with_tunnel("reopen", "t1").await;
+        db.set_online("t1", true, "now").await.unwrap();
+        assert_eq!(db.get_tunnel("t1").await.unwrap().unwrap().state, "online");
         drop(db);
 
         let reopened = Db::open(&path).unwrap();
-        assert_eq!(reopened.get_tunnel("t1").unwrap().unwrap().state, "offline");
-
+        assert_eq!(
+            reopened.get_tunnel("t1").await.unwrap().unwrap().state,
+            "offline"
+        );
         drop(reopened);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_file_name(format!(
-            "{}-wal",
-            path.file_name().unwrap().to_string_lossy()
-        )));
-        let _ = std::fs::remove_file(path.with_file_name(format!(
-            "{}-shm",
-            path.file_name().unwrap().to_string_lossy()
-        )));
+        cleanup(&path);
     }
 }

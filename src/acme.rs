@@ -20,8 +20,8 @@ use serde_json::{json, Value};
 
 use crate::bridge::random_session_id;
 use crate::config::Config;
-use crate::db::{CertState, Db};
-use crate::state::AppState;
+use crate::db::{CertState, Db, TunnelRecord, ISSUANCE_WINDOW_MS};
+use crate::state::{now_millis, AppState};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 const JOSE_JSON_CONTENT_TYPE: &str = "application/jose+json";
@@ -65,8 +65,8 @@ pub struct Issued {
 // Account key (P-256), persisted so the ACME account is stable across restarts.
 // ---------------------------------------------------------------------------
 
-fn ensure_account_key(db: &Db) -> Result<Vec<u8>> {
-    if let Some(stored) = db.get_meta("acme_account_key")? {
+async fn ensure_account_key(db: &Db) -> Result<Vec<u8>> {
+    if let Some(stored) = db.get_meta("acme_account_key").await? {
         return b64d(&stored);
     }
     let rng = ring::rand::SystemRandom::new();
@@ -75,9 +75,10 @@ fn ensure_account_key(db: &Db) -> Result<Vec<u8>> {
         &rng,
     )
     .map_err(|_| anyhow!("ECDSA key generation failed"))?;
-    let der = pkcs8.as_ref().to_vec();
-    db.set_meta("acme_account_key", &b64(&der))?;
-    Ok(der)
+    let candidate = b64(pkcs8.as_ref());
+    // Concurrent first issuances must all end up with the same account key.
+    let stored = db.get_or_insert_meta("acme_account_key", candidate).await?;
+    b64d(&stored)
 }
 
 /// Returns (x_base64url, y_base64url) of the account public key.
@@ -234,7 +235,7 @@ impl Acme {
             .json()
             .await
             .context("parsing ACME directory")?;
-        let key_pkcs8 = ensure_account_key(db)?;
+        let key_pkcs8 = ensure_account_key(db).await?;
         let (x, y) = public_jwk_coords(&key_pkcs8)?;
         Ok(Self {
             http,
@@ -355,14 +356,18 @@ struct DnsChallenge {
 /// Issues a certificate for `identifiers` using `csr_pem` (PEM).
 /// Calls `on_challenge(token, key)` once DNS-01 challenges are placed, so the
 /// caller can expose the `challenge` state while issuance runs.
-pub async fn issue(
+pub async fn issue<F, Fut>(
     http: &Client,
     db: &Db,
     cfg: &AcmeConfig,
     identifiers: &[String],
     csr_pem: &str,
-    on_challenge: impl Fn(&str, &str),
-) -> Result<Issued> {
+    on_challenge: F,
+) -> Result<Issued>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let mut acme = Acme::new(
         http.clone(),
         db,
@@ -449,7 +454,7 @@ pub async fn issue(
         });
     }
     if let Some(first) = challenges.first() {
-        on_challenge(&first.token, &first.key);
+        on_challenge(first.token.clone(), first.key.clone()).await;
     }
 
     // --- place TXT records ---
@@ -632,53 +637,49 @@ pub fn spawn_issuance(state: Arc<AppState>, tunnel_id: String, cert_id: String) 
     });
 }
 
+/// Runs the first issuance for a certificate id claimed in the database. The
+/// record is re-read first, so an issuance that was superseded or whose tunnel
+/// was deleted does nothing.
 async fn issue_for_tunnel(state: &AppState, tunnel_id: &str, cert_id: &str) -> Result<()> {
-    let fail = |reason: &str| {
-        let _ = state.db.set_failed(cert_id, reason);
-    };
     let record = state
         .db
-        .get_tunnel(tunnel_id)?
+        .get_tunnel(tunnel_id)
+        .await?
         .filter(|r| r.deleted_at.is_none())
         .ok_or_else(|| anyhow!("tunnel gone"))?;
     if record.cert_id.as_deref() != Some(cert_id) {
-        return Ok(()); // superseded by a newer issuance
+        return Ok(());
     }
-    let issuance = async {
-        let csr_pem = record
-            .csr_pem
-            .clone()
-            .ok_or_else(|| anyhow!("no CSR stored"))?;
-        let identifiers = identifiers_from_csr(&csr_pem)?;
-        let cfg = AcmeConfig::from_config(&state.config);
-        issue(
-            &state.http,
-            &state.db,
-            &cfg,
-            &identifiers,
-            &csr_pem,
-            |token, key| {
-                let _ = state.db.set_challenge(cert_id, token, key);
-            },
-        )
-        .await
-    }
-    .await;
-    let issued = match issuance {
+    let issued = match record.csr_pem.as_deref() {
+        Some(csr_pem) => order_certificate(state, csr_pem, cert_id).await,
+        None => Err(anyhow!("no CSR stored")),
+    };
+    let issued = match issued {
         Ok(issued) => issued,
         Err(e) => {
-            fail(&e.to_string());
+            let _ = state.db.set_failed(cert_id, &e.to_string()).await;
             return Err(e);
         }
     };
-    if let Err(e) = state.db.set_ready(
-        cert_id,
-        &issued.certificate_pem,
-        &issued.chain_pem,
-        &issued.expiry_rfc3339,
-    ) {
-        fail(&e.to_string());
-        return Err(e.into());
+    match state
+        .db
+        .set_ready(
+            cert_id,
+            &issued.certificate_pem,
+            &issued.chain_pem,
+            &issued.expiry_rfc3339,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(tunnel = %tunnel_id, cert = %cert_id, "issued certificate superseded; discarded");
+            return Ok(());
+        }
+        Err(e) => {
+            let _ = state.db.set_failed(cert_id, &e.to_string()).await;
+            return Err(e.into());
+        }
     }
     if let Some(session) = state.sessions.get_or_load(&state.db, tunnel_id).await? {
         session
@@ -688,52 +689,182 @@ async fn issue_for_tunnel(state: &AppState, tunnel_id: &str, cert_id: &str) -> R
     Ok(())
 }
 
-/// Hourly scan: renew certificates expiring within 30 days for tunnels that
-/// were connected in the last 90 days. The stored CSR is reused, so the key
-/// never changes and the server never sees it.
+async fn order_certificate(state: &AppState, csr_pem: &str, cert_id: &str) -> Result<Issued> {
+    let identifiers = identifiers_from_csr(csr_pem)?;
+    let cfg = AcmeConfig::from_config(&state.config);
+    let db = state.db.clone();
+    let challenge_cert = cert_id.to_string();
+    issue(
+        &state.http,
+        &state.db,
+        &cfg,
+        &identifiers,
+        csr_pem,
+        move |token, key| async move {
+            let _ = db.set_challenge(&challenge_cert, &token, &key).await;
+        },
+    )
+    .await
+}
+
+/// Renew a certificate once it is this close to expiry.
+const RENEW_BEFORE_SECS: i64 = 30 * 24 * 3600;
+/// A tunnel that has not connected for this long is not renewed proactively.
+const ACTIVE_WINDOW_SECS: i64 = 90 * 24 * 3600;
+
+/// Hourly scan. Lease and backoff live in the database, so a scan never starts
+/// a second attempt for a tunnel that already has one in flight or in backoff.
 pub async fn renewal_loop(state: Arc<AppState>) {
-    const RENEW_BEFORE_SECS: i64 = 30 * 24 * 3600;
-    const ACTIVE_WINDOW_SECS: i64 = 90 * 24 * 3600;
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
-        let now = chrono::Utc::now().timestamp();
-        let candidates =
-            match state
-                .db
-                .renewal_candidates(RENEW_BEFORE_SECS, ACTIVE_WINDOW_SECS, now)
-            {
-                Ok(list) => list,
-                Err(e) => {
-                    tracing::error!(error = %e, "renewal scan failed");
-                    continue;
-                }
-            };
-        for record in candidates {
-            // Skip if an issuance is already in flight.
-            let fresh = match state.db.get_tunnel(&record.id) {
-                Ok(Some(r))
-                    if matches!(r.cert_state, CertState::Ready | CertState::Failed)
-                        && r.cert_pem.is_some() =>
-                {
-                    r
-                }
-                _ => continue,
-            };
-            let csr = match fresh.csr_pem {
-                Some(csr) => csr,
-                None => continue,
-            };
-            let cert_id = format!("cert_{}", random_session_id());
-            if state
-                .db
-                .try_begin_issuance(&record.id, &cert_id, &csr)
-                .unwrap_or(false)
-            {
-                tracing::info!(tunnel = %record.id, "starting certificate renewal");
-                spawn_issuance(state.clone(), record.id.clone(), cert_id);
+        if let Err(e) = scan_for_renewals(&state).await {
+            tracing::error!(error = %e, "renewal scan failed");
+        }
+    }
+}
+
+async fn scan_for_renewals(state: &Arc<AppState>) -> Result<()> {
+    let now_ms = now_millis();
+    let now_secs = now_ms / 1000;
+    let lease_ms = lease_millis(state);
+    for record in state.db.renewal_candidates(now_ms, lease_ms).await? {
+        let active = record.state == "online"
+            || record
+                .last_connected_at
+                .as_deref()
+                .and_then(rfc3339_secs)
+                .is_some_and(|connected| now_secs - connected < ACTIVE_WINDOW_SECS);
+        if active && expires_within(&record, now_secs, RENEW_BEFORE_SECS) {
+            if let Some(csr_pem) = record.csr_pem.as_deref() {
+                start_renewal(state, &record.id, csr_pem).await;
             }
         }
     }
+    state
+        .db
+        .prune_issuances(now_ms - ISSUANCE_WINDOW_MS)
+        .await?;
+    Ok(())
+}
+
+/// Leases a renewal and starts it in the background. The active certificate
+/// keeps being served; only `complete_renewal` replaces it.
+async fn start_renewal(state: &Arc<AppState>, tunnel_id: &str, csr_pem: &str) -> bool {
+    let renewal_id = format!("renew_{}", random_session_id());
+    match state
+        .db
+        .claim_renewal(
+            tunnel_id,
+            &renewal_id,
+            csr_pem,
+            now_millis(),
+            lease_millis(state),
+        )
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(tunnel = %tunnel_id, "starting certificate renewal");
+            tokio::spawn(renew_for_tunnel(
+                state.clone(),
+                tunnel_id.to_string(),
+                renewal_id,
+                csr_pem.to_string(),
+            ));
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::error!(tunnel = %tunnel_id, error = %e, "could not claim certificate renewal");
+            false
+        }
+    }
+}
+
+async fn renew_for_tunnel(
+    state: Arc<AppState>,
+    tunnel_id: String,
+    renewal_id: String,
+    csr_pem: String,
+) {
+    let outcome = match identifiers_from_csr(&csr_pem) {
+        Ok(identifiers) => {
+            let cfg = AcmeConfig::from_config(&state.config);
+            issue(
+                &state.http,
+                &state.db,
+                &cfg,
+                &identifiers,
+                &csr_pem,
+                |_, _| async {},
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Ok(issued) => {
+            match state
+                .db
+                .complete_renewal(
+                    &tunnel_id,
+                    &renewal_id,
+                    &csr_pem,
+                    &issued.certificate_pem,
+                    &issued.chain_pem,
+                    &issued.expiry_rfc3339,
+                )
+                .await
+            {
+                Ok(true) => tracing::info!(tunnel = %tunnel_id, "certificate renewed"),
+                Ok(false) => {
+                    tracing::info!(tunnel = %tunnel_id, "renewal superseded; new certificate discarded")
+                }
+                Err(e) => {
+                    tracing::error!(tunnel = %tunnel_id, error = %e, "could not store renewed certificate")
+                }
+            }
+        }
+        Err(e) => {
+            match state
+                .db
+                .fail_renewal(&tunnel_id, &renewal_id, &e.to_string(), now_millis())
+                .await
+            {
+                Ok(Some(retry_at_ms)) => tracing::warn!(
+                    tunnel = %tunnel_id,
+                    error = %e,
+                    retry_at_ms,
+                    "certificate renewal failed; still serving the active certificate"
+                ),
+                Ok(None) => tracing::warn!(
+                    tunnel = %tunnel_id,
+                    error = %e,
+                    "certificate renewal failed after its lease was taken over"
+                ),
+                Err(db_error) => {
+                    tracing::error!(tunnel = %tunnel_id, error = %db_error, "could not record renewal failure")
+                }
+            }
+        }
+    }
+}
+
+fn lease_millis(state: &AppState) -> i64 {
+    i64::try_from(state.config.timeouts.lease().as_millis()).unwrap_or(i64::MAX)
+}
+
+fn rfc3339_secs(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+fn expires_within(record: &TunnelRecord, now_secs: i64, window_secs: i64) -> bool {
+    record
+        .cert_expiry
+        .as_deref()
+        .and_then(rfc3339_secs)
+        .is_some_and(|expiry| expiry - now_secs <= window_secs)
 }
 
 /// Ensures the API domain has a TLS certificate, issuing one via ACME DNS-01
@@ -789,7 +920,7 @@ pub async fn ensure_api_cert(
         &cfg,
         std::slice::from_ref(&config.domain),
         &csr_pem,
-        |_, _| {},
+        |_, _| async {},
     )
     .await?;
     let fullchain = if issued.chain_pem.is_empty() {
@@ -864,40 +995,19 @@ fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::Serv
     Ok(Arc::new(config))
 }
 
-/// Called when a bridge attaches: renew now if the certificate is within 30
-/// days of expiry (covers tunnels that went idle and came back).
+/// Called when a bridge attaches: renews now if the certificate is inside the
+/// renewal window. Covers tunnels that sat idle until near expiry. The current
+/// certificate keeps being served while the renewal runs.
 pub async fn maybe_renew_on_attach(state: Arc<AppState>, tunnel_id: &str) {
-    let record = match state.db.get_tunnel(tunnel_id) {
-        Ok(Some(r))
-            if r.deleted_at.is_none()
-                && matches!(r.cert_state, CertState::Ready | CertState::Failed)
-                && r.cert_pem.is_some() =>
-        {
-            r
-        }
+    let record = match state.db.get_tunnel(tunnel_id).await {
+        Ok(Some(r)) if r.deleted_at.is_none() && r.cert_state == CertState::Ready => r,
         _ => return,
     };
-    let expiring = record
-        .cert_expiry
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.timestamp() - chrono::Utc::now().timestamp() < 30 * 24 * 3600)
-        .unwrap_or(false);
-    if !expiring {
+    if !expires_within(&record, now_millis() / 1000, RENEW_BEFORE_SECS) {
         return;
     }
-    let csr = match record.csr_pem {
-        Some(csr) => csr,
-        None => return,
-    };
-    let cert_id = format!("cert_{}", random_session_id());
-    if state
-        .db
-        .try_begin_issuance(tunnel_id, &cert_id, &csr)
-        .unwrap_or(false)
-    {
-        tracing::info!(tunnel = %tunnel_id, "renewing certificate on attach");
-        spawn_issuance(state, tunnel_id.to_string(), cert_id);
+    if let Some(csr_pem) = record.csr_pem.as_deref() {
+        start_renewal(&state, tunnel_id, csr_pem).await;
     }
 }
 

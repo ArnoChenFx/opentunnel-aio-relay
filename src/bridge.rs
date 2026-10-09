@@ -78,19 +78,11 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Returns the in-memory session, loading it from the DB on first use.
+    /// Deletion goes through `remove`, so a cached session is authoritative
+    /// and lookups on the SNI path never touch the database.
     pub async fn get_or_load(&self, db: &Db, id: &str) -> Result<Option<Arc<Session>>> {
-        let existing = { self.inner.read().await.get(id).cloned() };
-        if let Some(session) = existing {
-            if session.is_closed() {
-                return Ok(None);
-            }
-            match db.get_tunnel(id)? {
-                Some(record) if record.deleted_at.is_none() => return Ok(Some(session)),
-                _ => {
-                    session.signal_shutdown();
-                    return Ok(None);
-                }
-            }
+        if let Some(session) = self.inner.read().await.get(id).cloned() {
+            return Ok((!session.is_closed()).then_some(session));
         }
         let mut sessions = self.inner.write().await;
         if let Some(session) = sessions.get(id) {
@@ -98,7 +90,7 @@ impl SessionManager {
         }
         // Recheck under the insertion lock: deletion persists its tombstone
         // before SessionManager::remove takes this lock.
-        let record = match db.get_tunnel(id)? {
+        let record = match db.get_tunnel(id).await? {
             Some(record) if record.deleted_at.is_none() => record,
             _ => return Ok(None),
         };
@@ -409,7 +401,7 @@ async fn register_bridge(db: &Db, session: &Session, bridge: BridgeHandle) -> Re
 
     // Persist membership transitions while holding the same lock used by
     // detach, so a delayed offline write cannot overwrite a newer attach.
-    db.set_online(&session.id, true, &now_rfc3339())?;
+    db.set_online(&session.id, true, &now_rfc3339()).await?;
     bridges.push(bridge);
     Ok(true)
 }
@@ -420,7 +412,7 @@ async fn detach_bridge(db: &Db, session: &Session, bridge_id: &str) {
         bridges.retain(|b| b.id != bridge_id);
         if bridges.is_empty() {
             // Serialize the persisted online state with later bridge attaches.
-            let _ = db.set_online(&session.id, false, &now_rfc3339());
+            let _ = db.set_online(&session.id, false, &now_rfc3339()).await;
         }
 
         // Route removal and channel cleanup are ordered against
@@ -672,7 +664,7 @@ mod tests {
         })
     }
 
-    fn test_db() -> (Arc<Db>, std::path::PathBuf) {
+    async fn test_db() -> (Arc<Db>, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
             "ot-relay-bridge-{}-{}.sqlite",
             std::process::id(),
@@ -682,7 +674,8 @@ mod tests {
                 .as_nanos()
         ));
         let db = Arc::new(Db::open(&path).unwrap());
-        db.create_tunnel("test", "test.relay.test", "hash", "now")
+        db.create_tunnel("test", "test.relay.test", "hash", "now", 0)
+            .await
             .unwrap();
         (db, path)
     }
@@ -698,7 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_detach_race_keeps_online_state_in_sync_with_membership() {
-        let (db, path) = test_db();
+        let (db, path) = test_db().await;
         let session = test_session("test");
         assert!(register_bridge(&db, &session, bridge("old", "@"))
             .await
@@ -714,10 +707,16 @@ mod tests {
         );
         assert!(attached.unwrap());
         assert_eq!(session.bridges.lock().await.len(), 1);
-        assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "online");
+        assert_eq!(
+            db.get_tunnel("test").await.unwrap().unwrap().state,
+            "online"
+        );
 
         detach_bridge(&db, &session, "new").await;
-        assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "offline");
+        assert_eq!(
+            db.get_tunnel("test").await.unwrap().unwrap().state,
+            "offline"
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -726,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_open_racing_bridge_detach_cannot_leave_an_orphan_channel() {
-        let (db, path) = test_db();
+        let (db, path) = test_db().await;
         let session = test_session("test");
         assert!(register_bridge(&db, &session, bridge("only", "@"))
             .await
@@ -777,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_detach_does_not_wait_for_a_full_channel_queue() {
-        let (db, path) = test_db();
+        let (db, path) = test_db().await;
         let session = test_session("test");
         assert!(register_bridge(&db, &session, bridge("bridge", "@"))
             .await
@@ -807,7 +806,10 @@ mod tests {
             Some("bridge_disconnected")
         );
         assert!(session.channels.lock().await.is_empty());
-        assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "offline");
+        assert_eq!(
+            db.get_tunnel("test").await.unwrap().unwrap().state,
+            "offline"
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
