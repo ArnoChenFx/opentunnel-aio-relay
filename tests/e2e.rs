@@ -1117,6 +1117,54 @@ async fn traffic_in_either_direction_keeps_a_stream_open() {
 }
 
 #[tokio::test]
+async fn stream_whose_bridge_never_answers_is_reset_before_the_idle_limit() {
+    let srv =
+        start_server_with(|c| c.timeouts.tls_first_response = Duration::from_millis(300)).await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    // The idle limit is an hour in this test, so only the first-response
+    // budget can end the stream.
+    expect_reset(&mut ws, conn, "connection_terminated").await;
+    let mut drained = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), visitor.read_to_end(&mut drained))
+        .await
+        .expect("visitor socket was not closed after the reset")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn quiet_stream_that_has_answered_is_not_cut_by_the_first_response_budget() {
+    use futures_util::SinkExt;
+    use opentunnel_relay::proto::bridge::encode_data_frame;
+
+    let srv =
+        start_server_with(|c| c.timeouts.tls_first_response = Duration::from_millis(300)).await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        encode_data_frame(conn, b"hello").into(),
+    ))
+    .await
+    .unwrap();
+    let mut got = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(2), visitor.read_exact(&mut got))
+        .await
+        .expect("visitor stalled")
+        .unwrap();
+    assert_eq!(&got, b"hello");
+
+    // Quiet for three times the first-response budget.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    visitor.write_all(b"still open").await.unwrap();
+    expect_data(&mut ws, conn, b"still open").await;
+}
+
+#[tokio::test]
 async fn stalled_api_request_is_closed_by_the_header_timeout() {
     let srv = start_server_with(|c| c.timeouts.client_hello = Duration::from_millis(300)).await;
     let mut tls = tls_connect(srv.port, &srv.cert_pem).await;

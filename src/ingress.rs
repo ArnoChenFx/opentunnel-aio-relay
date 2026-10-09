@@ -393,11 +393,24 @@ async fn serve_tunnel(
     // Bridge -> public socket. A cancel drops this future through the select
     // below, so a write blocked on a slow visitor is abandoned as well.
     let stall = state.config.timeouts.bridge_stall;
+    let first_response = state.config.timeouts.tls_first_response;
+    let first_response_by = tokio::time::Instant::now() + first_response;
     let activity_down = activity.clone();
     let pump_down = async move {
+        let mut answered = false;
         loop {
-            match inbound.recv().await {
+            let next = if answered {
+                inbound.recv().await
+            } else {
+                tokio::time::timeout_at(first_response_by, inbound.recv())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("no response from bridge within {first_response:?}")
+                    })?
+            };
+            match next {
                 Some(ChannelMsg::Data(data)) => {
+                    answered = true;
                     write_within_stall(&mut writer, &data, stall, &activity_down).await?;
                 }
                 Some(ChannelMsg::End) => {

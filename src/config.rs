@@ -165,6 +165,11 @@ pub struct Timeouts {
     /// before that one connection is reset. The bridge reader never waits on a
     /// visitor, so this only bounds how long a stalled connection holds its buffer.
     pub bridge_stall: Duration,
+    /// How long a forwarded connection may wait for the first byte from its
+    /// bridge after the ClientHello is forwarded. A TLS server answers at once,
+    /// so silence this long means the local service is not there. Once a byte
+    /// has arrived, only `OT_STREAM_IDLE_SECS` applies.
+    pub tls_first_response: Duration,
     /// Upper bound for one ACME order, including DNS propagation. A timed-out
     /// order is marked failed and its TXT records are removed. An issuance
     /// still marked in flight after twice this long is taken over.
@@ -185,6 +190,7 @@ impl Default for Timeouts {
         Self {
             client_hello: Duration::from_secs(10),
             bridge_stall: Duration::from_secs(10),
+            tls_first_response: Duration::from_secs(15),
             issuance: Duration::from_secs(600),
         }
     }
