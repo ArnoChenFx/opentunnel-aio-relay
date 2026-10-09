@@ -20,7 +20,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
 
@@ -36,7 +36,7 @@ jobs:
           - target: x86_64-unknown-linux-musl
           - target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -113,7 +113,7 @@ jobs:
         run: (cd dist && sha256sum *.tar.gz > sha256sums.txt && cat sha256sums.txt)
 
       # Keep the floating `latest` tag on the commit that produced it.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: github.ref_type != 'tag'
         with:
           fetch-depth: 0
@@ -164,7 +164,7 @@ jobs:
       OFFICIAL_CLIENT_RELEASE: latest
       CI_CF_TOKEN: ${{ secrets.CI_CF_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/download-artifact@v4
         with:
