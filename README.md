@@ -1,5 +1,7 @@
 # opentunnel-aio-relay
 
+[English](README.md) | [中文](README-zh.md)
+
 Single-binary, self-hosted relay server for the [OpenTunnel](https://github.com/anomalyco/opentunnel)
 protocol ("blind TLS tunnels", a privacy-focused ngrok alternative).
 
