@@ -121,9 +121,9 @@ told in the same step.
 The protocol has no per-stream flow control, so the relay cannot pause one
 connection without pausing all of them. A visitor that reads more slowly than
 the bridge sends, for longer than its buffer holds, is reset. Raise
-`OT_STREAM_BUFFER_BYTES` for bulk transfers to slow clients. Memory use can
-reach that value for each open connection, so keep the product within the
-relay's RAM.
+`OT_STREAM_BUFFER_BYTES` for bulk transfers to slow clients. Worst-case buffer
+memory is `OT_MAX_CONNECTIONS` times `OT_STREAM_BUFFER_BYTES`, which is 2 GiB at
+the defaults. Size the two together for the host's RAM.
 
 ### Connection limits
 
