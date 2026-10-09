@@ -1,0 +1,300 @@
+//! SQLite persistence. Replaces the Durable Object storage of the
+//! Cloudflare deployment: one row per tunnel holds the metadata the DO kept
+//! in `ctx.storage` (identity, token hash, certificate state, CSR).
+
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::Path;
+use std::sync::Mutex;
+
+use crate::error::{Error, Result};
+
+/// Certificate lifecycle state, mirroring the protocol's CertificateState.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertState {
+    None,
+    Challenge,
+    Issuing,
+    Ready,
+    Failed,
+}
+
+impl CertState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CertState::None => "none",
+            CertState::Challenge => "challenge",
+            CertState::Issuing => "issuing",
+            CertState::Ready => "ready",
+            CertState::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "challenge" => CertState::Challenge,
+            "issuing" => CertState::Issuing,
+            "ready" => CertState::Ready,
+            "failed" => CertState::Failed,
+            _ => CertState::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TunnelRecord {
+    pub id: String,
+    pub hostname: String,
+    pub token_hash: String,
+    pub state: String, // "offline" | "online"
+    pub deleted_at: Option<String>,
+    pub cert_id: Option<String>,
+    pub cert_state: CertState,
+    pub cert_pem: Option<String>,
+    pub chain_pem: Option<String>,
+    pub cert_expiry: Option<String>, // RFC3339
+    pub challenge_token: Option<String>,
+    pub challenge_key: Option<String>,
+    pub fail_reason: Option<String>,
+    pub csr_pem: Option<String>,
+    pub created_at: String,
+    pub last_connected_at: Option<String>,
+}
+
+pub struct Db {
+    conn: Mutex<Connection>,
+}
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS tunnels (
+                 id TEXT PRIMARY KEY,
+                 hostname TEXT NOT NULL UNIQUE,
+                 token_hash TEXT NOT NULL,
+                 state TEXT NOT NULL DEFAULT 'offline',
+                 deleted_at TEXT,
+                 cert_id TEXT,
+                 cert_state TEXT NOT NULL DEFAULT 'none',
+                 cert_pem TEXT,
+                 chain_pem TEXT,
+                 cert_expiry TEXT,
+                 challenge_token TEXT,
+                 challenge_key TEXT,
+                 fail_reason TEXT,
+                 csr_pem TEXT,
+                 created_at TEXT NOT NULL,
+                 last_connected_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|e| Error::Internal(e.to_string()))
+    }
+
+    pub fn create_tunnel(&self, id: &str, hostname: &str, token_hash: &str, now: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO tunnels (id, hostname, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, hostname, token_hash, now],
+        )?;
+        Ok(rows == 1)
+    }
+
+    pub fn get_tunnel(&self, id: &str) -> Result<Option<TunnelRecord>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
+                    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
+                    fail_reason, csr_pem, created_at, last_connected_at
+             FROM tunnels WHERE id = ?1",
+            params![id],
+            row_to_record,
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
+    pub fn set_online(&self, id: &str, online: bool, now: &str) -> Result<()> {
+        let conn = self.lock()?;
+        if online {
+            conn.execute(
+                "UPDATE tunnels SET state = 'online', last_connected_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        } else {
+            conn.execute("UPDATE tunnels SET state = 'offline' WHERE id = ?1", params![id])?;
+        }
+        Ok(())
+    }
+
+    pub fn touch_connected(&self, id: &str, now: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE tunnels SET last_connected_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Starts (or restarts) issuance for the given CSR. Returns the cert id.
+    pub fn begin_issuance(&self, id: &str, cert_id: &str, csr_pem: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE tunnels SET cert_id = ?1, cert_state = 'issuing', csr_pem = ?2,
+                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL
+             WHERE id = ?3",
+            params![cert_id, csr_pem, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_challenge(&self, cert_id: &str, token: &str, key: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE tunnels SET cert_state = 'challenge', challenge_token = ?1, challenge_key = ?2
+             WHERE cert_id = ?3",
+            params![token, key, cert_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_ready(&self, cert_id: &str, cert_pem: &str, chain_pem: &str, expiry: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE tunnels SET cert_state = 'ready', cert_pem = ?1, chain_pem = ?2,
+                 cert_expiry = ?3, fail_reason = NULL WHERE cert_id = ?4",
+            params![cert_pem, chain_pem, expiry, cert_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_failed(&self, cert_id: &str, reason: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE tunnels SET cert_state = 'failed', fail_reason = ?1 WHERE cert_id = ?2",
+            params![reason, cert_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_by_cert_id(&self, cert_id: &str) -> Result<Option<TunnelRecord>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
+                    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
+                    fail_reason, csr_pem, created_at, last_connected_at
+             FROM tunnels WHERE cert_id = ?1",
+            params![cert_id],
+            row_to_record,
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
+    /// Tunnels whose certificate expires within `within_secs` and that were
+    /// connected in the last `active_within_secs` (or are online now).
+    pub fn renewal_candidates(&self, within_secs: i64, active_within_secs: i64, now_secs: i64) -> Result<Vec<TunnelRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
+                    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
+                    fail_reason, csr_pem, created_at, last_connected_at
+             FROM tunnels
+             WHERE deleted_at IS NULL
+               AND cert_state = 'ready'
+               AND cert_expiry IS NOT NULL
+               AND csr_pem IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], row_to_record)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let record = row?;
+            let expiry_secs = record
+                .cert_expiry
+                .as_deref()
+                .and_then(parse_rfc3339_secs)
+                .unwrap_or(i64::MAX);
+            if expiry_secs - now_secs > within_secs {
+                continue;
+            }
+            let active = record.state == "online"
+                || record
+                    .last_connected_at
+                    .as_deref()
+                    .and_then(parse_rfc3339_secs)
+                    .map(|t| now_secs - t < active_within_secs)
+                    .unwrap_or(false);
+            if active {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn delete_tunnel(&self, id: &str, now: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let rows = conn.execute(
+            "UPDATE tunnels SET deleted_at = ?1, state = 'offline' WHERE id = ?2 AND deleted_at IS NULL",
+            params![now, id],
+        )?;
+        Ok(rows == 1)
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(Error::from)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+}
+
+fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<TunnelRecord> {
+    let cert_state: String = row.get(6)?;
+    Ok(TunnelRecord {
+        id: row.get(0)?,
+        hostname: row.get(1)?,
+        token_hash: row.get(2)?,
+        state: row.get(3)?,
+        deleted_at: row.get(4)?,
+        cert_id: row.get(5)?,
+        cert_state: CertState::parse(&cert_state),
+        cert_pem: row.get(7)?,
+        chain_pem: row.get(8)?,
+        cert_expiry: row.get(9)?,
+        challenge_token: row.get(10)?,
+        challenge_key: row.get(11)?,
+        fail_reason: row.get(12)?,
+        csr_pem: row.get(13)?,
+        created_at: row.get(14)?,
+        last_connected_at: row.get(15)?,
+    })
+}
+
+fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
+}

@@ -1,0 +1,59 @@
+[package]
+name = "opentunnel-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Single-binary self-hosted relay server for the OpenTunnel protocol (blind TLS tunnels)"
+license = "MIT"
+
+[[bin]]
+name = "opentunnel-relay"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime / http
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+hyper = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# TLS: ring provider everywhere (keeps static musl builds simple)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+
+# storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# protocol
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# crypto / identity
+rand = "0.9"
+ring = "0.17"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+x509-parser = { version = "0.17", features = ["verify"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+
+# HTTPS client (Cloudflare DNS API, ACME, DNS-over-HTTPS).
+# Verified: with these features the tree uses ring, no aws-lc-rs.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# misc
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+strip = true
+opt-level = 3
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
