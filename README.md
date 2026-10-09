@@ -90,6 +90,50 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | — (empty) | Only for CAs that require EAB (e.g. ZeroSSL) |
 | `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
 | `OT_ACME_EMAIL` | `acme@localhost` | ACME account contact |
+| `OT_MAX_CONNECTIONS` | `1024` | Connections open at once on the listener (API, bridge, and visitor sockets). Extra connections are refused at accept. `0` disables |
+| `OT_MAX_TUNNELS` | `1000` | Live tunnels (not deleted). Creating one past the cap returns `503`. `0` disables |
+| `OT_MAX_CERTS_PER_DAY` | `7` | New certificate orders per rolling 24 hours across all tunnels. Renewals are never refused. `0` disables |
+| `OT_RATE_LIMIT_PER_HOUR` | `30` | Requests per hour from one source address to tunnel creation and certificate binding. IPv6 sources are counted per /64. `0` disables |
+| `OT_CREATE_ALLOW_CIDRS` | — (empty: any source) | Comma-separated IPv4/IPv6 addresses or CIDR ranges allowed to create tunnels and bind certificates |
+| `OT_CREATE_TOKEN` | — (unset: open) | Bearer token required on `POST /api/tunnel`. The official client does not send one |
+
+Fixed limits that are not configurable: the ClientHello and TLS handshake must
+finish within 10 s, and each request's headers must arrive within 10 s. A bridge
+queue that stays full for 10 s resets only that stream. A forwarded stream with
+no traffic for 5 min is closed. An ACME order may run for 10 min. Calls to ACME
+and Cloudflare time out after 10 s to connect and 30 s in total.
+
+## Abuse controls
+
+`POST /api/tunnel` needs no credentials, and every tunnel it creates can then
+order certificates. An open relay can therefore be used to create tunnels and
+order certificates in bulk. The checks below run in this order. Each one is
+optional.
+
+1. **Source allowlist** (`OT_CREATE_ALLOW_CIDRS`): other addresses get `403`.
+2. **Rate limit** (`OT_RATE_LIMIT_PER_HOUR`): per source address, in fixed
+   one-hour windows. Over the limit, the relay answers `429` with `Retry-After`.
+   Requests that then fail the token check still count.
+3. **Create token** (`OT_CREATE_TOKEN`): `POST /api/tunnel` requires
+   `Authorization: Bearer <token>`, otherwise `401`.
+4. **Tunnel cap** (`OT_MAX_TUNNELS`): only `DELETE /api/tunnel/{id}` frees a
+   slot. Idle tunnels are not reaped automatically.
+5. **Certificate budget** (`OT_MAX_CERTS_PER_DAY`): new orders across all
+   tunnels in a rolling 24 hours. Renewals always proceed. The default of 7 a
+   day keeps a relay under Let's Encrypt's limit of 50 certificates per
+   registered domain per week.
+
+Trade-offs to know before turning these on:
+
+- The official client sends no credentials on `POST /api/tunnel`, so
+  `OT_CREATE_TOKEN` stops it from provisioning. Set the token only for clients
+  that send the header.
+- The allowlist and the rate limit use the TCP peer address. The relay does not
+  read `X-Forwarded-For` or similar headers. Behind a NAT or a load balancer,
+  all clients share one source address and therefore one budget.
+- Rate-limit counters live in memory and reset on restart. The table tracks at
+  most 65,536 sources. When it is full, new sources get `429` until old windows
+  expire.
 
 ## systemd example
 
@@ -107,6 +151,10 @@ ExecStart=/opt/opentunnel-relay/opentunnel-relay
 Restart=on-failure
 # Keep newly created database, WAL, and key files private.
 UMask=0077
+# One file descriptor per open connection. Keep the limit above
+# OT_MAX_CONNECTIONS (default 1024) with headroom; systemd's default soft
+# limit can be as low as 1024.
+LimitNOFILE=65536
 # 443 needs a privileged port:
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
@@ -126,8 +174,16 @@ relay also restricts the SQLite database and API private key to mode 600.
 - **Renewal**: a background task renews certificates expiring within 30 days
   for tunnels seen in the last 90 days, reusing the stored CSR (the key never
   changes). Attaching with a near-expiry certificate also triggers renewal.
-- **API certificate**: issued at first startup, reused afterwards, and renewed
-  in the background before expiry; new TLS handshakes use the renewed cert.
+- **Failed renewals do not replace the active certificate.** The tunnel keeps
+  serving its current certificate until it expires. Failed attempts are retried
+  with exponential backoff: 1 h, 2 h, 4 h, 8 h, then every 12 h.
+- **Time limit per order**: an ACME order must finish within 10 minutes,
+  including DNS propagation. Its DNS TXT records are removed on failure. Orders
+  interrupted by a restart are requeued at startup.
+- **API certificate**: issued at first startup and reused afterwards, as long
+  as it is still valid and covers `OT_DOMAIN`. It is renewed in the background
+  before expiry, and new TLS handshakes use the renewed certificate. If renewal
+  fails, the still-valid certificate stays in service and a warning is logged.
 
 ## Building
 
@@ -150,15 +206,18 @@ cargo build --release --target x86_64-unknown-linux-musl
 cargo test
 ```
 
-- `tests/vectors.rs` — the official spec vectors from
-  `anomalyco/opentunnel` (`spec/vectors`): route validation, SNI routing,
-  data-frame encoding, control-message round-trips. If these pass, this server
-  speaks the exact wire protocol of the official clients.
+- `tests/vectors.rs` — checks route validation, SNI routing, data-frame
+  encoding, and control-message round-trips against the spec vectors copied
+  from `anomalyco/opentunnel` (`spec/vectors`). Passing them shows agreement on
+  those vectors only. It is not a conformance suite.
 - `tests/e2e.rs` — full loop over real sockets: TCP ingress → SNI routing →
   API TLS → REST provisioning → bridge WebSocket attach → proxied `open`,
   including half-close response delivery, multiple-bridge isolation, and
-  immediate connection shutdown after tunnel deletion.
-- Unit tests: ClientHello parser, CSR validation (incl. tampered signatures).
+  immediate connection shutdown after tunnel deletion. It also covers the
+  provisioning controls, the tunnel and connection caps, header and idle
+  timeouts, and bridge stall and overflow handling.
+- Unit tests: ClientHello parser, CSR validation (incl. tampered signatures),
+  CIDR parsing and rate limiting, and the database and bridge state machines.
 - `.github/scripts/test-fetch-official-client.sh` — offline checks for the CI
   download script: a verified digest succeeds, while a mismatched or missing
   digest fails closed without extracting anything.
@@ -201,7 +260,9 @@ account keys do not end up in the Actions cache.
 
 Same as the official service: the relay only ever sees ciphertext. It does
 observe metadata (SNI hostnames, client IPs, byte counts). Self-hosting removes
-the need to trust a third-party operator at all.
+the need to trust a third-party operator at all. Tunnel creation is open by
+default, so read [Abuse controls](#abuse-controls) before exposing a relay
+publicly.
 
 ## License
 
