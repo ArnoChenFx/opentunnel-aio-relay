@@ -5,6 +5,9 @@ on:
     branches: [master]
     tags: ['v*']
   workflow_dispatch:
+  schedule:
+    # Daily: unit tests + release builds + the official-client E2E below.
+    - cron: '17 3 * * *'
 
 permissions:
   contents: write
@@ -83,6 +86,8 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    # No point republishing `latest` on the daily schedule with no new code.
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -114,3 +119,52 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/sha256sums.txt
+
+  integration:
+    name: Integration (official client E2E)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Serialized: two runs would fight over the same DNS-01 TXT record.
+    concurrency:
+      group: opentunnel-integration
+      cancel-in-progress: false
+    # Real Let's Encrypt issuance happens here (2 certs per run on CI_DOMAIN:
+    # one for the API domain, one for the tunnel). Let's Encrypt allows 50
+    # certs per registered domain per week, so this runs on tags, the daily
+    # schedule, and manual dispatch -- not on every push. Skipped entirely
+    # when the Cloudflare secret is not configured (e.g. forks).
+    if: >-
+      ${{ secrets.CI_CF_TOKEN != '' &&
+          (github.ref_type == 'tag' ||
+           github.event_name == 'schedule' ||
+           github.event_name == 'workflow_dispatch') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: relay-dist
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build official client (pinned upstream commit)
+        run: |
+          git init -q /tmp/upstream
+          cd /tmp/upstream
+          git remote add origin https://github.com/anomalyco/opentunnel.git
+          git fetch --depth 1 origin 91c2767a0a6de838fd4d8a3be9ec8ca41bd775d3
+          git checkout -q FETCH_HEAD
+          cargo build --release --locked -p opentunnel-cli
+
+      - name: Official client <-> our relay, end to end
+        env:
+          CI_DOMAIN: ${{ secrets.CI_DOMAIN }}
+          CI_CF_TOKEN: ${{ secrets.CI_CF_TOKEN }}
+          CI_CF_ZONE_ID: ${{ secrets.CI_CF_ZONE_ID }}
+        run: |
+          tar -xzf relay-dist/opentunnel-relay-x86_64-unknown-linux-gnu.tar.gz -C /tmp
+          RELAY_BIN=/tmp/opentunnel-relay-x86_64-unknown-linux-gnu/opentunnel-relay \
+          CLIENT_BIN=/tmp/upstream/target/release/opentunnel \
+          bash .github/scripts/integration-test.sh

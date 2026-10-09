@@ -153,6 +153,27 @@ cargo test
   API TLS → REST provisioning → bridge WebSocket attach → proxied `open`.
 - Unit tests: ClientHello parser, CSR validation (incl. tampered signatures).
 
+### End-to-end with the official client (CI)
+
+The `integration` job builds the official `opentunnel` CLI from a pinned
+upstream commit, starts this relay, and runs a real tunnel: provision via the
+HTTP API → attach the bridge WebSocket → fetch a page through the SNI-routed
+TLS connection that the client terminates. It needs real Let's Encrypt
+certificates (the official client only trusts the bundled Mozilla roots), so
+it performs live ACME DNS-01 issuance — 2 certificates per run.
+
+One-time setup (repo Settings → Secrets → Actions):
+
+| Secret | Purpose |
+|---|---|
+| `CI_DOMAIN` | e.g. `ci-relay.example.com` — DNS hosted on Cloudflare; no A record needed |
+| `CI_CF_TOKEN` | Cloudflare API token, DNS-edit on that zone |
+| `CI_CF_ZONE_ID` | Cloudflare zone ID of the domain |
+
+Without these secrets the job skips itself (forks stay green). To respect
+Let's Encrypt's rate limit (50 certs per registered domain per week) it runs
+on tag pushes, a daily schedule, and manual dispatch — not on every push.
+
 ## Security model
 
 Same as the official service: the relay only ever sees ciphertext. It does
