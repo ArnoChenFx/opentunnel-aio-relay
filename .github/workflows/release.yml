@@ -132,18 +132,22 @@ jobs:
     # Real Let's Encrypt issuance happens here (2 certs per run on CI_DOMAIN:
     # one for the API domain, one for the tunnel). Let's Encrypt allows 50
     # certs per registered domain per week, so this runs on tags, the daily
-    # schedule, and manual dispatch -- not on every push. Skipped entirely
-    # when the Cloudflare secret is not configured (e.g. forks).
+    # schedule, and manual dispatch -- not on every push.
+    #
+    # NOTE: `secrets` cannot appear in a job-level `if:` (GitHub rejects the
+    # whole file with "Unrecognized named-value: 'secrets'"). The secret is
+    # mapped to env below and the E2E step is gated on the env var instead;
+    # without the secret the job succeeds with that step skipped.
     if: >-
-      ${{ secrets.CI_CF_TOKEN != '' &&
-          (github.ref_type == 'tag' ||
-           github.event_name == 'schedule' ||
-           github.event_name == 'workflow_dispatch') }}
+      ${{ github.ref_type == 'tag' ||
+          github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch' }}
     env:
       # Which official client release to test against. "latest" tracks
       # upstream's newest release so incompatibilities surface fast; pin a
       # version like "v0.4.0" for reproducible runs.
       OFFICIAL_CLIENT_RELEASE: latest
+      CI_CF_TOKEN: ${{ secrets.CI_CF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -153,6 +157,7 @@ jobs:
           path: relay-dist
 
       - name: Download official client release
+        if: env.CI_CF_TOKEN != ''
         run: |
           if [ "${OFFICIAL_CLIENT_RELEASE}" = "latest" ]; then
             URL="https://github.com/anomalyco/opentunnel/releases/latest/download/opentunnel-linux-x64.tar.gz"
@@ -164,6 +169,7 @@ jobs:
           /tmp/official-client/opentunnel --version
 
       - name: Official client <-> our relay, end to end
+        if: env.CI_CF_TOKEN != ''
         env:
           CI_DOMAIN: ${{ secrets.CI_DOMAIN }}
           CI_CF_TOKEN: ${{ secrets.CI_CF_TOKEN }}
