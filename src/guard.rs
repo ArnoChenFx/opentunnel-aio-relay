@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Upper bound on tracked rate-limit buckets. Beyond it, expired buckets are
@@ -163,6 +163,70 @@ impl RateLimiter {
     }
 }
 
+type OpenCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// Open connections per source address. Like the rate limiter, IPv6 sources
+/// are grouped by /64, so one host cannot multiply its share by rotating
+/// addresses within its subnet.
+#[derive(Clone)]
+pub struct SourceLimiter {
+    limit: usize,
+    open: OpenCounts,
+}
+
+/// One connection's place in its source's share. Dropping it frees the place.
+pub struct SourcePermit {
+    tracked: Option<(IpAddr, OpenCounts)>,
+}
+
+impl SourceLimiter {
+    /// `limit` open connections per source; zero disables limiting.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            open: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Claims a place for a new connection from `ip`, or returns `None` if
+    /// that source already holds its limit.
+    pub fn acquire(&self, ip: IpAddr) -> Option<SourcePermit> {
+        if self.limit == 0 {
+            return Some(SourcePermit { tracked: None });
+        }
+        let key = bucket_key(ip);
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = open.entry(key).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(SourcePermit {
+            tracked: Some((key, self.open.clone())),
+        })
+    }
+}
+
+impl Drop for SourcePermit {
+    fn drop(&mut self) {
+        let Some((key, shared)) = self.tracked.take() else {
+            return;
+        };
+        let mut open = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = open.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&key);
+            }
+        }
+    }
+}
+
 fn bucket_key(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(addr) => {
@@ -260,5 +324,47 @@ mod tests {
         for _ in 0..1000 {
             assert!(limiter.check(ip("192.0.2.1"), now).is_ok());
         }
+    }
+
+    #[test]
+    fn source_limiter_caps_each_address_and_frees_places_on_drop() {
+        let limiter = SourceLimiter::new(2);
+        let source = ip("192.0.2.1");
+        let first = limiter.acquire(source).expect("first place");
+        let second = limiter.acquire(source).expect("second place");
+        assert!(limiter.acquire(source).is_none());
+        assert!(limiter.acquire(ip("192.0.2.2")).is_some());
+
+        drop(first);
+        assert!(limiter.acquire(source).is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn source_limiter_forgets_addresses_with_no_open_connections() {
+        let limiter = SourceLimiter::new(4);
+        let held = limiter.acquire(ip("2001:db8:1:1::5")).unwrap();
+        assert_eq!(limiter.open.lock().unwrap().len(), 1);
+        drop(held);
+        assert!(limiter.open.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_limiter_groups_ipv6_by_slash_64() {
+        let limiter = SourceLimiter::new(1);
+        let held = limiter.acquire(ip("2001:db8:1:1::5")).unwrap();
+        assert!(limiter.acquire(ip("2001:db8:1:1::6")).is_none());
+        assert!(limiter.acquire(ip("2001:db8:1:2::5")).is_some());
+        drop(held);
+    }
+
+    #[test]
+    fn zero_source_limit_disables_tracking() {
+        let limiter = SourceLimiter::new(0);
+        let held: Vec<_> = (0..1000)
+            .map(|_| limiter.acquire(ip("192.0.2.1")).unwrap())
+            .collect();
+        assert!(limiter.open.lock().unwrap().is_empty());
+        drop(held);
     }
 }
