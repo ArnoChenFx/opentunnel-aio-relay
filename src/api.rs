@@ -1,20 +1,21 @@
 //! HTTP API: provisioning, certificates, and the bridge WebSocket.
 //! Paths and shapes follow `docs/protocol.md` so existing clients work unchanged.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 
-use std::time::Duration;
-
 use crate::bridge::{self, hash_token, random_token, random_tunnel_id, token_matches};
+use crate::config::Config;
 use crate::db::{CertState, Claim, CreateOutcome, Db, TunnelRecord};
 use crate::error::{Error, Result};
 use crate::proto::api::{
@@ -106,7 +107,43 @@ fn certificate_info(record: &TunnelRecord) -> Result<CertificateInfo> {
     Ok(CertificateInfo { id, state })
 }
 
-async fn create_tunnel(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse> {
+/// Source allowlist, then the per-source rate limit. Both run before any
+/// database work, so refused requests cost little, and failed create-token
+/// attempts still count against the limit.
+fn admit_provisioning(state: &AppState, peer: SocketAddr) -> Result<()> {
+    if !state.config.create_allow_cidrs.admits(peer.ip()) {
+        return Err(Error::Forbidden(
+            "this address may not provision tunnels".into(),
+        ));
+    }
+    state
+        .limiter
+        .check(peer.ip(), Instant::now())
+        .map_err(|retry_after| Error::RateLimited {
+            message: "too many provisioning requests from this address; retry later".into(),
+            retry_after,
+        })
+}
+
+fn check_create_token(config: &Config, headers: &HeaderMap) -> Result<()> {
+    let Some(expected) = config.create_token.as_deref() else {
+        return Ok(());
+    };
+    match bearer_token(headers) {
+        Some(presented) if token_matches(&presented, &hash_token(expected)) => Ok(()),
+        _ => Err(Error::Unauthorized(
+            "missing or invalid create token".into(),
+        )),
+    }
+}
+
+async fn create_tunnel(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse> {
+    admit_provisioning(&state, peer)?;
+    check_create_token(&state.config, &headers)?;
     // Retry on the (unlikely) id collision.
     for _ in 0..5 {
         let id = random_tunnel_id();
@@ -165,10 +202,12 @@ async fn get_certificate(
 
 async fn bind_certificate(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<BindCertificateRequest>,
 ) -> Result<impl IntoResponse> {
+    admit_provisioning(&state, peer)?;
     let record = authed_record(&state.db, &id, &headers).await?;
     let (request_hostname, identifiers) = validate_csr(&body.csr, &record.hostname)?;
 

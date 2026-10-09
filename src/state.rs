@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::bridge::SessionManager;
 use crate::config::Config;
 use crate::db::Db;
+use crate::guard::RateLimiter;
 
 pub struct AppState {
     pub config: Config,
@@ -14,6 +15,7 @@ pub struct AppState {
     /// Swapped after background certificate renewal for new handshakes.
     pub api_tls: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>>,
     pub http: reqwest::Client,
+    pub limiter: RateLimiter,
 }
 
 pub fn now_rfc3339() -> String {

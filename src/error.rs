@@ -26,6 +26,8 @@ pub enum Error {
     BadRequest(String),
     #[error("{0}")]
     Unauthorized(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error("tunnel not found")]
     TunnelNotFound { tunnel_id: String },
     #[error("no certificate")]
@@ -65,6 +67,7 @@ impl IntoResponse for Error {
                 "UnauthorizedError",
                 message.clone(),
             ),
+            Error::Forbidden(message) => (StatusCode::FORBIDDEN, "ForbiddenError", message.clone()),
             Error::TunnelNotFound { .. } => (
                 StatusCode::NOT_FOUND,
                 "TunnelNotFoundError",

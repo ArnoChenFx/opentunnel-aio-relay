@@ -1488,6 +1488,7 @@ mod tests {
                 build_server_config(&cert_pem, &key_pem).unwrap(),
             )),
             http: Client::new(),
+            limiter: crate::guard::RateLimiter::new(0),
         });
 
         assert_eq!(resume_interrupted_issuances(&state).await.unwrap(), 1);

@@ -13,6 +13,7 @@ use opentunnel_relay::{
     bridge::SessionManager,
     config::{Config, Timeouts},
     db::{Claim, Db},
+    guard::{CidrList, RateLimiter},
     ingress,
     state::{now_millis, AppState},
 };
@@ -41,6 +42,9 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         max_tunnels: 0,
         max_certs_per_day: 0,
         max_connections: 1024,
+        create_token: None,
+        create_allow_cidrs: CidrList::default(),
+        rate_limit_per_hour: 0,
         timeouts: Timeouts {
             bridge_stall: Duration::from_millis(500),
             ..Timeouts::default()
@@ -102,12 +106,14 @@ async fn start_server_with(tweak: impl FnOnce(&mut Config)) -> TestServer {
         );
     }
 
+    let rate_limit = config.rate_limit_per_hour;
     let state = Arc::new(AppState {
         config,
         db,
         sessions: SessionManager::default(),
         api_tls: Arc::new(tokio::sync::RwLock::new(api_tls)),
         http,
+        limiter: RateLimiter::new(rate_limit),
     });
     let router = api::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -156,6 +162,18 @@ async fn http_request(
     token: Option<&str>,
     body: &str,
 ) -> (u16, String) {
+    let (status, _, body) = http_exchange(srv, method, path, token, body).await;
+    (status, body)
+}
+
+/// Like `http_request`, but also returns the raw response header block.
+async fn http_exchange(
+    srv: &TestServer,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &str,
+) -> (u16, String, String) {
     let mut tls = tls_connect(srv.port, &srv.cert_pem).await;
     let auth = token
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
@@ -178,7 +196,7 @@ async fn http_request(
         .unwrap()
         .parse()
         .unwrap();
-    (status, body.to_string())
+    (status, head.to_string(), body.to_string())
 }
 
 /// Builds a minimal well-formed ClientHello carrying `sni`
@@ -1003,4 +1021,79 @@ async fn connection_limit_refuses_excess_and_recovers() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (status, _) = http_request(&srv, "GET", "/health", None, "").await;
     assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn allowlist_refuses_sources_outside_it() {
+    let srv = start_server_with(|c| {
+        c.create_allow_cidrs = "10.0.0.0/8".parse::<CidrList>().unwrap();
+    })
+    .await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("ForbiddenError"), "{body}");
+
+    let srv = start_server_with(|c| {
+        c.create_allow_cidrs = "127.0.0.1".parse::<CidrList>().unwrap();
+    })
+    .await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+}
+
+#[tokio::test]
+async fn create_token_is_required_for_tunnel_creation() {
+    let srv = start_server_with(|c| c.create_token = Some("s3cret".into())).await;
+
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some("wrong"), "{}").await;
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some("s3cret"), "{}").await;
+    assert_eq!(status, 201, "{body}");
+}
+
+#[tokio::test]
+async fn rate_limit_answers_429_with_retry_after_and_leaves_reads_alone() {
+    let srv = start_server_with(|c| c.rate_limit_per_hour = 2).await;
+
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["tunnel"]["id"].as_str().unwrap().to_string();
+    let token = created["token"].as_str().unwrap().to_string();
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+
+    let (status, headers, body) = http_exchange(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 429, "{body}");
+    assert!(body.contains("RateLimitedError"), "{body}");
+    assert!(
+        headers.lines().any(|line| {
+            line.to_ascii_lowercase().starts_with("retry-after:")
+                && line
+                    .split(':')
+                    .nth(1)
+                    .unwrap()
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap()
+                    >= 1
+        }),
+        "{headers}"
+    );
+
+    let (status, body) =
+        http_request(&srv, "GET", &format!("/api/tunnel/{id}"), Some(&token), "").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn tunnel_cap_answers_503() {
+    let srv = start_server_with(|c| c.max_tunnels = 1).await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("ServiceUnavailableError"), "{body}");
 }

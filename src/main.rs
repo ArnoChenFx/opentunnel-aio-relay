@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use opentunnel_relay::{
-    acme, api, bridge::SessionManager, config::Config, db::Db, ingress, state::AppState,
+    acme, api, bridge::SessionManager, config::Config, db::Db, guard::RateLimiter, ingress,
+    state::AppState,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -58,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         sessions: SessionManager::default(),
         api_tls,
         http,
+        limiter: RateLimiter::new(config.rate_limit_per_hour),
     });
     let router = api::router(state.clone());
 
