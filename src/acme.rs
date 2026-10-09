@@ -301,6 +301,14 @@ impl Acme {
         res.json().await.context("parsing ACME response")
     }
 
+    /// Tells the server the DNS record is in place (RFC 8555 section 7.5.1).
+    /// The payload must be the JSON object `{}`; an empty payload is
+    /// POST-as-GET, which reads the challenge without starting validation.
+    async fn signal_challenge_ready(&self, challenge_url: &str) -> Result<()> {
+        self.post_jws(challenge_url, true, b"{}").await?;
+        Ok(())
+    }
+
     async fn new_account(&mut self) -> Result<()> {
         let mut payload = json!({
             "contact": [format!("mailto:{}", self.cfg.email)],
@@ -472,7 +480,7 @@ pub async fn issue(
             crate::dns::wait_for_txt(http, &name, &expected, Duration::from_secs(60)).await?;
         }
         for ch in &challenges {
-            acme.post_jws(&ch.url, true, b"").await?;
+            acme.signal_challenge_ready(&ch.url).await?;
         }
         for auth_url in &auth_urls {
             let mut auth: Value = acme.post_as_get(auth_url).await?;
@@ -911,6 +919,66 @@ mod tests {
     fn post_as_get_jws_payload_is_empty() {
         let body = jws_body(&test_key(), &json!({"alg": "ES256"}), b"").unwrap();
         assert_eq!(body["payload"], "");
+    }
+
+    #[tokio::test]
+    async fn challenge_ready_signal_posts_json_object_not_post_as_get() {
+        use axum::{extract::State, routing::get, routing::post, Router};
+
+        #[derive(Clone, Default)]
+        struct Seen(Arc<std::sync::Mutex<Vec<String>>>);
+
+        async fn nonce() -> ([(&'static str, &'static str); 1], &'static str) {
+            ([("replay-nonce", "test-nonce")], "")
+        }
+        async fn record(State(seen): State<Seen>, body: String) -> axum::Json<Value> {
+            seen.0.lock().unwrap().push(body);
+            axum::Json(json!({"type": "dns-01", "status": "pending"}))
+        }
+
+        let seen = Seen::default();
+        let app = Router::new()
+            .route("/nonce", get(nonce))
+            .route("/challenge", post(record))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let acme = Acme {
+            http: Client::new(),
+            dir: Directory {
+                new_nonce: format!("{base}/nonce"),
+                new_account: format!("{base}/new-account"),
+                new_order: format!("{base}/new-order"),
+            },
+            cfg: AcmeConfig {
+                directory_url: String::new(),
+                email: String::new(),
+                eab_kid: String::new(),
+                eab_hmac: String::new(),
+                cf_token: String::new(),
+                cf_zone_id: String::new(),
+            },
+            key_pkcs8: test_key(),
+            account_jwk: json!({}),
+            account_url: Some(format!("{base}/account/1")),
+        };
+        let challenge = format!("{base}/challenge");
+        acme.signal_challenge_ready(&challenge).await.unwrap();
+        acme.post_as_get(&challenge).await.unwrap();
+
+        let payloads: Vec<Vec<u8>> = seen
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| {
+                let envelope: Value = serde_json::from_str(raw).unwrap();
+                b64d(envelope["payload"].as_str().unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(payloads, vec![b"{}".to_vec(), Vec::new()]);
     }
 
     #[test]
