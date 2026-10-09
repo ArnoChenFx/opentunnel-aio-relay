@@ -58,6 +58,14 @@ async fn main() -> anyhow::Result<()> {
     });
     let router = api::router(state.clone());
 
+    let resumed = acme::resume_interrupted_issuances(&state).await?;
+    if resumed > 0 {
+        tracing::info!(
+            resumed,
+            "resumed certificate issuances interrupted by the previous run"
+        );
+    }
+
     // Background certificate renewals.
     tokio::spawn(acme::renewal_loop(state.clone()));
     tokio::spawn(acme::api_certificate_renewal_loop(state.clone()));

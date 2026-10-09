@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::bridge::random_session_id;
 use crate::config::Config;
-use crate::db::{CertState, Db, TunnelRecord, ISSUANCE_WINDOW_MS};
+use crate::db::{renewal_backoff_ms, CertState, Db, TunnelRecord, ISSUANCE_WINDOW_MS};
 use crate::state::{now_millis, AppState};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -33,6 +33,7 @@ fn b64d(s: &str) -> Result<Vec<u8>> {
     Ok(B64.decode(s)?)
 }
 
+#[derive(Clone)]
 pub struct AcmeConfig {
     pub directory_url: String,
     pub email: String,
@@ -40,6 +41,8 @@ pub struct AcmeConfig {
     pub eab_hmac: String,
     pub cf_token: String,
     pub cf_zone_id: String,
+    /// Upper bound for one order, from the first request to the download.
+    pub issuance_timeout: Duration,
 }
 
 impl AcmeConfig {
@@ -51,6 +54,7 @@ impl AcmeConfig {
             eab_hmac: config.acme_eab_hmac.clone(),
             cf_token: config.cf_token.clone(),
             cf_zone_id: config.cf_zone_id.clone(),
+            issuance_timeout: config.timeouts.issuance,
         }
     }
 }
@@ -355,7 +359,9 @@ struct DnsChallenge {
 
 /// Issues a certificate for `identifiers` using `csr_pem` (PEM).
 /// Calls `on_challenge(token, key)` once DNS-01 challenges are placed, so the
-/// caller can expose the `challenge` state while issuance runs.
+/// caller can expose the `challenge` state while issuance runs. The order is
+/// bounded by `cfg.issuance_timeout`, and every TXT record it placed is removed
+/// whatever the outcome.
 pub async fn issue<F, Fut>(
     http: &Client,
     db: &Db,
@@ -368,19 +374,45 @@ where
     F: FnOnce(String, String) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let mut acme = Acme::new(
-        http.clone(),
-        db,
-        AcmeConfig {
-            directory_url: cfg.directory_url.clone(),
-            email: cfg.email.clone(),
-            eab_kid: cfg.eab_kid.clone(),
-            eab_hmac: cfg.eab_hmac.clone(),
-            cf_token: cfg.cf_token.clone(),
-            cf_zone_id: cfg.cf_zone_id.clone(),
-        },
+    let mut placed = Vec::new();
+    let outcome = tokio::time::timeout(
+        cfg.issuance_timeout,
+        run_order(
+            http,
+            db,
+            cfg,
+            identifiers,
+            csr_pem,
+            on_challenge,
+            &mut placed,
+        ),
     )
-    .await?;
+    .await;
+    for record_id in &placed {
+        let _ = crate::dns::delete_txt(http, &cfg.cf_zone_id, &cfg.cf_token, record_id).await;
+    }
+    outcome.map_err(|_| {
+        anyhow!(
+            "ACME order did not finish within {}s",
+            cfg.issuance_timeout.as_secs()
+        )
+    })?
+}
+
+async fn run_order<F, Fut>(
+    http: &Client,
+    db: &Db,
+    cfg: &AcmeConfig,
+    identifiers: &[String],
+    csr_pem: &str,
+    on_challenge: F,
+    placed: &mut Vec<String>,
+) -> Result<Issued>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut acme = Acme::new(http.clone(), db, cfg.clone()).await?;
     acme.new_account().await?;
 
     // --- newOrder ---
@@ -457,82 +489,58 @@ where
         on_challenge(first.token.clone(), first.key.clone()).await;
     }
 
-    // --- place TXT records ---
-    let mut record_ids: Vec<String> = Vec::new();
-    let place = async {
-        for ch in &challenges {
-            let name = format!("_acme-challenge.{}", ch.base);
-            let id = crate::dns::create_txt(http, &cfg.cf_zone_id, &cfg.cf_token, &name, &ch.key)
-                .await?;
-            record_ids.push(id);
-        }
-        anyhow::Ok(())
-    };
-    let place_result = place.await;
-    let cleanup = async {
-        for id in &record_ids {
-            let _ = crate::dns::delete_txt(http, &cfg.cf_zone_id, &cfg.cf_token, id).await;
-        }
-    };
+    for ch in &challenges {
+        let name = format!("_acme-challenge.{}", ch.base);
+        let id =
+            crate::dns::create_txt(http, &cfg.cf_zone_id, &cfg.cf_token, &name, &ch.key).await?;
+        placed.push(id);
+    }
 
-    let run = async {
-        place_result?;
-        // --- wait for propagation, then trigger validation ---
-        for ch in &challenges {
-            let name = format!("_acme-challenge.{}", ch.base);
-            let mut expected = HashSet::new();
-            expected.insert(ch.key.clone());
-            crate::dns::wait_for_txt(http, &name, &expected, Duration::from_secs(60)).await?;
-        }
-        for ch in &challenges {
-            acme.signal_challenge_ready(&ch.url).await?;
-        }
-        for auth_url in &auth_urls {
-            let mut auth: Value = acme.post_as_get(auth_url).await?;
-            for _ in 0..30 {
-                if auth.get("status").and_then(|s| s.as_str()) != Some("pending") {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                auth = acme.post_as_get(auth_url).await?;
-            }
-            if auth.get("status").and_then(|s| s.as_str()) != Some("valid") {
-                bail!("ACME authorization ended in {:?}", auth.get("status"));
-            }
-        }
-
-        // --- finalize with the CSR ---
-        let csr_der = pem_to_der(csr_pem, "CERTIFICATE REQUEST")?;
-        let finalize_payload = serde_json::to_vec(&json!({"csr": b64(&csr_der)}))?;
-        let res = acme
-            .post_jws(&finalize_url, true, &finalize_payload)
-            .await?;
-        let mut order: Value = res.json().await?;
+    // --- wait for propagation, then trigger validation ---
+    for ch in &challenges {
+        let name = format!("_acme-challenge.{}", ch.base);
+        let mut expected = HashSet::new();
+        expected.insert(ch.key.clone());
+        crate::dns::wait_for_txt(http, &name, &expected, Duration::from_secs(60)).await?;
+    }
+    for ch in &challenges {
+        acme.signal_challenge_ready(&ch.url).await?;
+    }
+    for auth_url in &auth_urls {
+        let mut auth: Value = acme.post_as_get(auth_url).await?;
         for _ in 0..30 {
-            if order.get("status").and_then(|s| s.as_str()) != Some("processing") {
+            if auth.get("status").and_then(|s| s.as_str()) != Some("pending") {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            order = acme.post_as_get(&order_url).await?;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            auth = acme.post_as_get(auth_url).await?;
         }
-        let cert_url = order
-            .get("certificate")
-            .and_then(|c| c.as_str())
-            .filter(|_| order.get("status").and_then(|s| s.as_str()) == Some("valid"))
-            .ok_or_else(|| anyhow!("ACME order ended in {:?}", order.get("status")))?;
-        let res = acme.post_jws(cert_url, true, b"").await?;
-        let chain_pem = res.text().await.context("downloading certificate")?;
-        anyhow::Ok(chain_pem)
-    };
+        if auth.get("status").and_then(|s| s.as_str()) != Some("valid") {
+            bail!("ACME authorization ended in {:?}", auth.get("status"));
+        }
+    }
 
-    let chain_pem = match run.await {
-        Ok(pem) => pem,
-        Err(e) => {
-            cleanup.await;
-            return Err(e);
+    // --- finalize with the CSR ---
+    let csr_der = pem_to_der(csr_pem, "CERTIFICATE REQUEST")?;
+    let finalize_payload = serde_json::to_vec(&json!({"csr": b64(&csr_der)}))?;
+    let res = acme
+        .post_jws(&finalize_url, true, &finalize_payload)
+        .await?;
+    let mut order: Value = res.json().await?;
+    for _ in 0..30 {
+        if order.get("status").and_then(|s| s.as_str()) != Some("processing") {
+            break;
         }
-    };
-    cleanup.await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        order = acme.post_as_get(&order_url).await?;
+    }
+    let cert_url = order
+        .get("certificate")
+        .and_then(|c| c.as_str())
+        .filter(|_| order.get("status").and_then(|s| s.as_str()) == Some("valid"))
+        .ok_or_else(|| anyhow!("ACME order ended in {:?}", order.get("status")))?;
+    let res = acme.post_jws(cert_url, true, b"").await?;
+    let chain_pem = res.text().await.context("downloading certificate")?;
 
     let blocks = split_pem_chain(&chain_pem);
     let certificate_pem = blocks.first().cloned().unwrap_or_default();
@@ -575,15 +583,37 @@ fn split_pem_chain(chain: &str) -> Vec<String> {
 }
 
 pub fn cert_expiry_pem(cert_pem: &str) -> Result<String> {
+    let (expiry, _) = leaf_summary(cert_pem)?;
+    chrono::DateTime::from_timestamp(expiry, 0)
+        .map(|dt| dt.to_rfc3339())
+        .ok_or_else(|| anyhow!("invalid certificate expiry"))
+}
+
+/// Expiry (unix seconds) and DNS names of the first certificate in `cert_pem`.
+fn leaf_summary(cert_pem: &str) -> Result<(i64, Vec<String>)> {
     use x509_parser::prelude::*;
     let (_rem, pem) =
         parse_x509_pem(cert_pem.as_bytes()).map_err(|_| anyhow!("invalid certificate PEM"))?;
     let (_, cert) =
         X509Certificate::from_der(&pem.contents).map_err(|_| anyhow!("invalid certificate DER"))?;
-    let ts = cert.validity().not_after.timestamp();
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.to_rfc3339())
-        .ok_or_else(|| anyhow!("invalid certificate expiry"))
+    let san = cert
+        .subject_alternative_name()
+        .map_err(|_| anyhow!("invalid subjectAltName extension"))?;
+    let mut names = Vec::new();
+    if let Some(san) = san {
+        for name in &san.value.general_names {
+            if let GeneralName::DNSName(dns) = name {
+                names.push(dns.to_string());
+            }
+        }
+    }
+    Ok((cert.validity().not_after.timestamp(), names))
+}
+
+/// Whether the first certificate in `cert_pem` names `domain` in a DNS SAN.
+fn cert_covers_domain(cert_pem: &str, domain: &str) -> bool {
+    leaf_summary(cert_pem)
+        .is_ok_and(|(_, names)| names.iter().any(|name| name.eq_ignore_ascii_case(domain)))
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +665,17 @@ pub fn spawn_issuance(state: Arc<AppState>, tunnel_id: String, cert_id: String) 
             }
         }
     });
+}
+
+/// Restarts the issuances that a previous process left in flight, from their
+/// stored CSRs. Called once at startup, before the listener accepts traffic.
+pub async fn resume_interrupted_issuances(state: &Arc<AppState>) -> Result<usize> {
+    let pending = state.db.requeue_interrupted(now_millis()).await?;
+    let count = pending.len();
+    for (tunnel_id, cert_id) in pending {
+        spawn_issuance(state.clone(), tunnel_id, cert_id);
+    }
+    Ok(count)
 }
 
 /// Runs the first issuance for a certificate id claimed in the database. The
@@ -867,38 +908,72 @@ fn expires_within(record: &TunnelRecord, now_secs: i64, window_secs: i64) -> boo
         .is_some_and(|expiry| expiry - now_secs <= window_secs)
 }
 
-/// Ensures the API domain has a TLS certificate, issuing one via ACME DNS-01
-/// on first run (or when it expires within 30 days). Stored as PEM files next
-/// to the database.
+/// Time between API certificate checks while the stored certificate is healthy.
+const API_CERT_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// The API certificate stored in the data directory, once it has been
+/// confirmed usable: it parses, names `config.domain`, and has not expired.
+struct StoredApiCert {
+    server: Arc<rustls::ServerConfig>,
+    expires_at: i64,
+}
+
+fn stored_api_cert(config: &Config) -> Option<StoredApiCert> {
+    let cert_path = config.data_dir.join("api-cert.pem");
+    let key_path = config.data_dir.join("api-key.pem");
+    let cert_pem = std::fs::read_to_string(&cert_path).ok()?;
+    restrict_private_file(&key_path).ok()?;
+    let key_pem = std::fs::read_to_string(&key_path).ok()?;
+    let (expires_at, names) = leaf_summary(&cert_pem).ok()?;
+    let covers_domain = names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&config.domain));
+    if !covers_domain || expires_at <= now_millis() / 1000 {
+        return None;
+    }
+    let server = build_server_config(&cert_pem, &key_pem).ok()?;
+    Some(StoredApiCert { server, expires_at })
+}
+
+/// Returns the TLS configuration for the API domain at startup. A stored
+/// certificate that is still valid is served at once, even inside the renewal
+/// window: `api_certificate_renewal_loop` renews it in the background and
+/// keeps this one in service if that fails. A new certificate is issued only
+/// when no stored one is usable.
 pub async fn ensure_api_cert(
     config: &Config,
     db: &Db,
     http: &Client,
 ) -> Result<Arc<rustls::ServerConfig>> {
-    let dir = &config.data_dir;
-    let cert_path = dir.join("api-cert.pem");
-    let key_path = dir.join("api-key.pem");
+    if let Some(stored) = stored_api_cert(config) {
+        tracing::info!("using stored API certificate");
+        return Ok(stored.server);
+    }
+    issue_api_cert(config, db, http).await
+}
 
-    let load = || -> Result<Arc<rustls::ServerConfig>> {
-        let cert_pem = std::fs::read_to_string(&cert_path)?;
-        restrict_private_file(&key_path)?;
-        let key_pem = std::fs::read_to_string(&key_path)?;
-        build_server_config(&cert_pem, &key_pem)
-    };
-
-    if let Ok(cfg) = load() {
-        if let Ok(cert_pem) = std::fs::read_to_string(&cert_path) {
-            if let Ok(expiry) = cert_expiry_pem(&cert_pem) {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&expiry) {
-                    if dt.timestamp() - chrono::Utc::now().timestamp() > 30 * 24 * 3600 {
-                        tracing::info!("using existing API certificate");
-                        return Ok(cfg);
-                    }
-                }
-            }
+/// Issues a new API certificate when the stored one is inside the renewal
+/// window or unusable. Returns `None` when nothing is due.
+async fn renew_api_cert_if_due(
+    config: &Config,
+    db: &Db,
+    http: &Client,
+) -> Result<Option<Arc<rustls::ServerConfig>>> {
+    if let Some(stored) = stored_api_cert(config) {
+        if stored.expires_at - now_millis() / 1000 > RENEW_BEFORE_SECS {
+            return Ok(None);
         }
     }
+    issue_api_cert(config, db, http).await.map(Some)
+}
 
+async fn issue_api_cert(
+    config: &Config,
+    db: &Db,
+    http: &Client,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let cert_path = config.data_dir.join("api-cert.pem");
+    let key_path = config.data_dir.join("api-key.pem");
     tracing::info!(domain = %config.domain, "issuing API certificate via ACME DNS-01");
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| anyhow!("key generation failed: {e}"))?;
@@ -923,6 +998,9 @@ pub async fn ensure_api_cert(
         |_, _| async {},
     )
     .await?;
+    if !cert_covers_domain(&issued.certificate_pem, &config.domain) {
+        bail!("issued certificate does not name {}", config.domain);
+    }
     let fullchain = if issued.chain_pem.is_empty() {
         issued.certificate_pem.clone()
     } else {
@@ -934,20 +1012,43 @@ pub async fn ensure_api_cert(
     build_server_config(&fullchain, &key_pem)
 }
 
-/// Periodically rechecks the API certificate and renews it within 30 days of
-/// expiry. The replacement config is swapped only after issuance succeeds, so
-/// existing connections remain intact and new handshakes use the new cert.
+/// Checks the API certificate at startup and then every six hours, renewing it
+/// inside the 30-day window. The replacement is swapped in only after issuance
+/// succeeds, so existing connections are untouched. A failed attempt keeps the
+/// current certificate in service and retries with the tunnel renewal backoff.
 pub async fn api_certificate_renewal_loop(state: Arc<AppState>) {
+    let mut failures: u32 = 0;
     loop {
-        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-        match ensure_api_cert(&state.config, &state.db, &state.http).await {
-            Ok(config) => {
-                *state.api_tls.write().await = config;
+        let wait = match renew_api_cert_if_due(&state.config, &state.db, &state.http).await {
+            Ok(renewed) => {
+                failures = 0;
+                if let Some(config) = renewed {
+                    *state.api_tls.write().await = config;
+                    tracing::info!("API certificate renewed");
+                }
+                API_CERT_CHECK_INTERVAL
             }
             Err(error) => {
-                tracing::error!(error = %error, "API certificate renewal check failed");
+                failures = failures.saturating_add(1);
+                let retry_in =
+                    Duration::from_millis(u64::try_from(renewal_backoff_ms(failures)).unwrap_or(0));
+                if stored_api_cert(&state.config).is_some() {
+                    tracing::warn!(
+                        error = %error,
+                        retry_in_secs = retry_in.as_secs(),
+                        "API certificate renewal failed; still serving the current certificate"
+                    );
+                } else {
+                    tracing::error!(
+                        error = %error,
+                        retry_in_secs = retry_in.as_secs(),
+                        "API certificate renewal failed and no valid certificate is stored"
+                    );
+                }
+                retry_in
             }
-        }
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -1069,6 +1170,7 @@ mod tests {
                 eab_hmac: String::new(),
                 cf_token: String::new(),
                 cf_zone_id: String::new(),
+                issuance_timeout: Duration::from_secs(600),
             },
             key_pkcs8: test_key(),
             account_jwk: json!({}),
@@ -1187,6 +1289,7 @@ mod tests {
                 eab_hmac: String::new(),
                 cf_token: String::new(),
                 cf_zone_id: String::new(),
+                issuance_timeout: Duration::from_secs(600),
             },
             key_pkcs8,
             account_jwk: public_jwk(&x, &y),
@@ -1229,5 +1332,174 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("non-DNS SAN"));
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ot-relay-acme-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_config(dir: &std::path::Path, acme_url: &str) -> Config {
+        use clap::Parser;
+        Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--cf-token",
+            "token",
+            "--cf-zone-id",
+            "zone",
+            "--acme-url",
+            acme_url,
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// A self-signed certificate for `domain` that expires `valid_days` from now.
+    fn self_signed_pem(domain: &str, valid_days: i64) -> (String, String) {
+        use chrono::Datelike;
+        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]).unwrap();
+        let end = chrono::Utc::now() + chrono::Duration::days(valid_days);
+        params.not_after = rcgen::date_time_ymd(end.year(), end.month() as u8, end.day() as u8);
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    fn csr_for(hostname: &str) -> String {
+        let mut params = rcgen::CertificateParams::new(vec![hostname.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, hostname);
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        params.serialize_request(&key).unwrap().pem().unwrap()
+    }
+
+    #[tokio::test]
+    async fn issuance_gives_up_at_the_timeout_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let dir = test_dir("timeout");
+        let db = Db::open(&dir.join("relay.db")).unwrap();
+        let cfg = AcmeConfig {
+            directory_url: format!("http://{addr}/directory"),
+            email: "test@example.invalid".into(),
+            eab_kid: String::new(),
+            eab_hmac: String::new(),
+            cf_token: String::new(),
+            cf_zone_id: String::new(),
+            issuance_timeout: Duration::from_millis(300),
+        };
+
+        let started = std::time::Instant::now();
+        let error = issue(
+            &Client::new(),
+            &db,
+            &cfg,
+            &["relay.test".to_string()],
+            "",
+            |_, _| async {},
+        )
+        .await
+        .err()
+        .expect("a stalled order must not succeed");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            error.to_string().contains("did not finish within"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn stored_certificate_must_name_the_configured_domain() {
+        let (cert_pem, _) = self_signed_pem("relay.test", 90);
+        assert!(cert_covers_domain(&cert_pem, "relay.test"));
+        assert!(cert_covers_domain(&cert_pem, "RELAY.test"));
+        assert!(!cert_covers_domain(&cert_pem, "other.test"));
+        assert!(!cert_covers_domain("not a certificate", "relay.test"));
+    }
+
+    #[tokio::test]
+    async fn startup_serves_stored_certificate_inside_renewal_window_without_acme() {
+        let dir = test_dir("startup");
+        let (cert_pem, key_pem) = self_signed_pem("relay.test", 10);
+        std::fs::write(dir.join("api-cert.pem"), &cert_pem).unwrap();
+        std::fs::write(dir.join("api-key.pem"), &key_pem).unwrap();
+        let config = test_config(&dir, "http://127.0.0.1:1/directory");
+        let db = Db::open(&dir.join("relay.db")).unwrap();
+
+        ensure_api_cert(&config, &db, &Client::new()).await.unwrap();
+        assert!(stored_api_cert(&config).is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_api_renewal_keeps_the_stored_certificate() {
+        let dir = test_dir("renew-fail");
+        let (cert_pem, key_pem) = self_signed_pem("relay.test", 10);
+        std::fs::write(dir.join("api-cert.pem"), &cert_pem).unwrap();
+        std::fs::write(dir.join("api-key.pem"), &key_pem).unwrap();
+        let config = test_config(&dir, "http://127.0.0.1:1/directory");
+        let db = Db::open(&dir.join("relay.db")).unwrap();
+
+        assert!(renew_api_cert_if_due(&config, &db, &Client::new())
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("api-cert.pem")).unwrap(),
+            cert_pem
+        );
+        assert!(stored_api_cert(&config).is_some());
+    }
+
+    #[tokio::test]
+    async fn interrupted_issuance_is_resumed_and_does_not_stay_stuck() {
+        let dir = test_dir("resume");
+        let db = Arc::new(Db::open(&dir.join("relay.db")).unwrap());
+        db.create_tunnel("t1", "t1.relay.test", "hash", "now", 0)
+            .await
+            .unwrap();
+        let csr = csr_for("t1.relay.test");
+        db.claim_issuance("t1", "cert1", &csr, now_millis(), 20 * 60 * 1000, 0)
+            .await
+            .unwrap();
+
+        let (cert_pem, key_pem) = self_signed_pem("relay.test", 90);
+        let state = Arc::new(AppState {
+            config: test_config(&dir, "http://127.0.0.1:1/directory"),
+            db: db.clone(),
+            sessions: crate::bridge::SessionManager::default(),
+            api_tls: Arc::new(tokio::sync::RwLock::new(
+                build_server_config(&cert_pem, &key_pem).unwrap(),
+            )),
+            http: Client::new(),
+        });
+
+        assert_eq!(resume_interrupted_issuances(&state).await.unwrap(), 1);
+        let mut record = db.get_tunnel("t1").await.unwrap().unwrap();
+        for _ in 0..200 {
+            if record.cert_state != CertState::Issuing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            record = db.get_tunnel("t1").await.unwrap().unwrap();
+        }
+        assert_eq!(record.cert_state, CertState::Failed);
+        assert!(record.fail_reason.is_some());
     }
 }
