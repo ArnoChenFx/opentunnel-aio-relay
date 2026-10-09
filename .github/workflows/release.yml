@@ -98,7 +98,7 @@ jobs:
           cp README.md "$STAGE/"
           tar -czf "dist/opentunnel-relay-${{ matrix.target }}.tar.gz" -C dist "opentunnel-relay-${{ matrix.target }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/*.tar.gz
@@ -128,7 +128,7 @@ jobs:
           git tag -f latest ${{ github.sha }}
           git push -f origin latest
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -149,7 +149,7 @@ jobs:
           fi
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
           name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
@@ -203,7 +203,7 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: x86_64-unknown-linux-gnu
           path: relay-dist
