@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update -qq
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              sudo apt-get install -y -qq musl-tools
+              ;;
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+              ;;
+          esac
+
+      - name: Sync version from tag
+        if: github.ref_type == 'tag'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = /s//version = \"$VERSION\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          STAGE="dist/opentunnel-relay-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/opentunnel-relay" "$STAGE/"
+          cp README.md "$STAGE/"
+          tar -czf "dist/opentunnel-relay-${{ matrix.target }}.tar.gz" -C dist "opentunnel-relay-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: (cd dist && sha256sum *.tar.gz > sha256sums.txt && cat sha256sums.txt)
+
+      # Keep the floating `latest` tag on the commit that produced it.
+      - uses: actions/checkout@v4
+        if: github.ref_type != 'tag'
+        with:
+          fetch-depth: 0
+      - name: Move latest tag
+        if: github.ref_type != 'tag'
+        run: |
+          git tag -f latest ${{ github.sha }}
+          git push -f origin latest
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          generate_release_notes: ${{ github.ref_type == 'tag' }}
+          make_latest: ${{ github.ref_type == 'tag' && 'true' || 'false' }}
+          files: |
+            dist/*.tar.gz
+            dist/sha256sums.txt
