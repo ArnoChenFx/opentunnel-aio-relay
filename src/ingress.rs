@@ -7,12 +7,14 @@
 //! never sees plaintext.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use axum::extract::ConnectInfo;
 use axum::Router;
 use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -25,8 +27,8 @@ use crate::sni::{parse_client_hello, Parse};
 use crate::state::AppState;
 
 const CLIENT_HELLO_LIMIT: usize = 64 * 1024;
-const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_CONCURRENT_HANDSHAKES: usize = 256;
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 pub async fn run(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&state.config.listen).await?;
@@ -34,15 +36,39 @@ pub async fn run(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     run_on(listener, state, router).await
 }
 
+/// Accepts connections until the process stops. An accept error (for example
+/// file-descriptor exhaustion) is logged and retried with backoff; it never
+/// ends the loop.
 pub async fn run_on(
     listener: TcpListener,
     state: Arc<AppState>,
     router: Router,
 ) -> anyhow::Result<()> {
-    let handshake_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    let limit = match state.config.max_connections {
+        0 => Semaphore::MAX_PERMITS,
+        n => n,
+    };
+    let connections = Arc::new(Semaphore::new(limit));
+    let mut backoff = Duration::ZERO;
     loop {
-        let (socket, peer) = listener.accept().await?;
-        let Some(permit) = try_acquire_handshake(&handshake_permits) else {
+        let (socket, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                backoff = Duration::ZERO;
+                accepted
+            }
+            Err(error) => {
+                backoff = next_accept_backoff(backoff);
+                tracing::error!(
+                    error = %error,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "accept failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+        };
+        let Some(permit) = try_acquire_connection(&connections) else {
+            tracing::warn!(%peer, "connection limit reached; refusing connection");
             drop(socket);
             continue;
         };
@@ -56,8 +82,16 @@ pub async fn run_on(
     }
 }
 
-fn try_acquire_handshake(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
-    Arc::clone(permits).try_acquire_owned().ok()
+fn next_accept_backoff(previous: Duration) -> Duration {
+    if previous.is_zero() {
+        ACCEPT_BACKOFF_MIN
+    } else {
+        (previous * 2).min(ACCEPT_BACKOFF_MAX)
+    }
+}
+
+fn try_acquire_connection(connections: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(connections).try_acquire_owned().ok()
 }
 
 async fn handle_connection(
@@ -67,15 +101,23 @@ async fn handle_connection(
     router: Router,
     permit: OwnedSemaphorePermit,
 ) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + CLIENT_HELLO_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + state.config.timeouts.client_hello;
     let (buf, hello) = read_client_hello_until(&mut socket, deadline).await?;
 
     let domain = state.config.domain.to_lowercase();
     if hello.server_name == domain {
-        return serve_api(socket, buf, state, router, deadline, permit).await;
+        return serve_api(socket, buf, state, router, deadline, peer, permit).await;
     }
-    drop(permit);
-    serve_tunnel(socket, peer, buf, hello.server_name, hello.alpn, state).await
+    serve_tunnel(
+        socket,
+        peer,
+        buf,
+        hello.server_name,
+        hello.alpn,
+        state,
+        permit,
+    )
+    .await
 }
 
 async fn read_client_hello_until(
@@ -158,14 +200,16 @@ impl<R: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prepended<R> {
     }
 }
 
-/// Terminates TLS for the API domain and serves the axum router over it.
+/// Terminates TLS for the API domain and serves the axum router over it. The
+/// connection permit is held until the connection closes.
 async fn serve_api(
     socket: TcpStream,
     initial: Vec<u8>,
     state: Arc<AppState>,
     router: Router,
     deadline: tokio::time::Instant,
-    permit: OwnedSemaphorePermit,
+    peer: SocketAddr,
+    _permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let tls_config = state.api_tls.read().await.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -174,11 +218,11 @@ async fn serve_api(
         inner: socket,
     };
     let tls = accept_tls_until(&acceptor, stream, deadline).await?;
-    drop(permit);
     let io = TokioIo::new(tls);
     let svc = hyper_util::service::TowerToHyperService::new(tower::service_fn(
-        move |req: hyper::Request<hyper::body::Incoming>| {
+        move |mut req: hyper::Request<hyper::body::Incoming>| {
             let router = router.clone();
+            req.extensions_mut().insert(ConnectInfo(peer));
             async move {
                 match router.oneshot(req.map(axum::body::Body::new)).await {
                     Ok(res) => Ok(res),
@@ -191,6 +235,8 @@ async fn serve_api(
     // server-side upgrade future with an error and the bridge WebSocket
     // handshake silently dies after the 101 is sent.
     http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(state.config.timeouts.client_hello)
         .serve_connection(io, svc)
         .with_upgrades()
         .await
@@ -221,6 +267,7 @@ async fn serve_tunnel(
     sni: String,
     alpn: String,
     state: Arc<AppState>,
+    _permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let domain = state.config.domain.to_lowercase();
     let suffix = format!(".{domain}");
@@ -271,10 +318,12 @@ async fn serve_tunnel(
     }
 
     let (mut reader, mut writer) = socket.into_split();
+    let activity = Arc::new(Activity::new());
 
     // Public socket -> bridge.
     let bridge_up = bridge_tx.clone();
     let session_up = session.clone();
+    let activity_up = activity.clone();
     let pump_up = async move {
         let mut chunk = [0u8; 32 * 1024];
         loop {
@@ -287,6 +336,7 @@ async fn serve_tunnel(
                     .await;
                 break;
             }
+            activity_up.touch();
             if !session_up.send_data(&bridge_up, conn, &chunk[..n]).await {
                 break;
             }
@@ -296,10 +346,14 @@ async fn serve_tunnel(
 
     // Bridge -> public socket. A cancel drops this future through the select
     // below, so a write blocked on a slow visitor is abandoned as well.
+    let activity_down = activity.clone();
     let pump_down = async move {
         loop {
             match chan_rx.recv().await {
-                Some(ChannelMsg::Data(data)) => writer.write_all(&data).await?,
+                Some(ChannelMsg::Data(data)) => {
+                    writer.write_all(&data).await?;
+                    activity_down.touch();
+                }
                 Some(ChannelMsg::End) => {
                     writer.shutdown().await?;
                     return Ok::<(), anyhow::Error>(());
@@ -309,12 +363,14 @@ async fn serve_tunnel(
         }
     };
 
+    let idle_limit = state.config.timeouts.tunnel_idle;
     // `biased` makes a bridge-side cancel win over the pumps. A cancel is set
     // before the channel is dropped, so `None` above can only follow a cancel.
     let result = tokio::select! {
         biased;
         _ = shutdown_rx.changed() => Err(anyhow::anyhow!("tunnel was deleted")),
         reason = cancelled(&mut channel_shutdown) => Err(anyhow::anyhow!("cancelled by bridge: {reason}")),
+        _ = activity.idle(idle_limit) => Err(anyhow::anyhow!("idle for {idle_limit:?}")),
         result = async { tokio::try_join!(pump_up, pump_down).map(|_| ()) } => result,
     };
     // Read before `close_channel`, which sets its own cancel reason.
@@ -339,6 +395,40 @@ async fn serve_tunnel(
         }
     }
     Ok(())
+}
+
+/// When bytes last moved on a forwarded stream, in either direction. The idle
+/// limit is measured from the latest movement, so a stream that is busy in one
+/// direction stays open.
+struct Activity {
+    origin: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let now = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(now, Ordering::Relaxed);
+    }
+
+    /// Resolves once nothing has moved for `limit`.
+    async fn idle(&self, limit: Duration) {
+        loop {
+            let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+            let quiet_for = self.origin.elapsed().saturating_sub(last);
+            if quiet_for >= limit {
+                return;
+            }
+            tokio::time::sleep(limit - quiet_for).await;
+        }
+    }
 }
 
 /// Resolves with the reason once the bridge cancels this connection.
@@ -428,16 +518,28 @@ mod tests {
         client.abort();
     }
 
-    #[tokio::test]
-    async fn concurrent_handshake_limit_rejects_excess_and_releases_capacity() {
+    #[test]
+    fn connection_limit_rejects_excess_and_releases_capacity() {
         let permits = Arc::new(Semaphore::new(2));
-        let first = try_acquire_handshake(&permits).expect("first permit");
-        let second = try_acquire_handshake(&permits).expect("second permit");
-        assert!(try_acquire_handshake(&permits).is_none());
+        let first = try_acquire_connection(&permits).expect("first permit");
+        let second = try_acquire_connection(&permits).expect("second permit");
+        assert!(try_acquire_connection(&permits).is_none());
 
         drop(first);
-        assert!(try_acquire_handshake(&permits).is_some());
+        assert!(try_acquire_connection(&permits).is_some());
         drop(second);
+    }
+
+    #[test]
+    fn accept_backoff_doubles_and_is_capped() {
+        let mut backoff = Duration::ZERO;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            backoff = next_accept_backoff(backoff);
+            seen.push(backoff.as_millis());
+        }
+        assert_eq!(&seen[..4], &[10, 20, 40, 80]);
+        assert_eq!(*seen.last().unwrap(), 1000);
     }
 
     struct StallClientReads(TcpStream);

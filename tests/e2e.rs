@@ -40,6 +40,7 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         acme_email: "test@example.invalid".to_string(),
         max_tunnels: 0,
         max_certs_per_day: 0,
+        max_connections: 1024,
         timeouts: Timeouts {
             bridge_stall: Duration::from_millis(500),
             ..Timeouts::default()
@@ -57,6 +58,10 @@ fn init_log() {
 }
 
 async fn start_server() -> TestServer {
+    start_server_with(|_| {}).await
+}
+
+async fn start_server_with(tweak: impl FnOnce(&mut Config)) -> TestServer {
     init_log();
     let data_dir = std::env::temp_dir().join(format!(
         "ot-relay-e2e-{}-{}",
@@ -79,7 +84,8 @@ async fn start_server() -> TestServer {
     )
     .unwrap();
 
-    let config = test_config(&data_dir);
+    let mut config = test_config(&data_dir);
+    tweak(&mut config);
     let db = Arc::new(Db::open(&data_dir.join("relay.db")).unwrap());
     let http = reqwest::Client::builder().build().unwrap();
     let api_tls = acme::ensure_api_cert(&config, &db, &http).await.unwrap();
@@ -919,4 +925,82 @@ async fn simultaneous_attach_to_same_route_has_one_winner() {
         &response2
     };
     assert_eq!(error["code"], "route_conflict");
+}
+
+#[tokio::test]
+async fn idle_stream_is_closed_and_the_bridge_is_told() {
+    let srv = start_server_with(|c| c.timeouts.tunnel_idle = Duration::from_millis(300)).await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    expect_reset(&mut ws, conn, "connection_terminated").await;
+    let mut drained = Vec::new();
+    let closed =
+        tokio::time::timeout(Duration::from_secs(3), visitor.read_to_end(&mut drained)).await;
+    assert!(closed.is_ok(), "idle visitor socket was not closed");
+}
+
+#[tokio::test]
+async fn traffic_in_either_direction_keeps_a_stream_open() {
+    use futures_util::SinkExt;
+    use opentunnel_relay::proto::bridge::encode_data_frame;
+
+    let srv = start_server_with(|c| c.timeouts.tunnel_idle = Duration::from_millis(400)).await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    // Six round trips span well over the idle limit; each gap is far below it.
+    for beat in 0..6u8 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            encode_data_frame(conn, &[beat]).into(),
+        ))
+        .await
+        .unwrap();
+        let mut got = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), visitor.read_exact(&mut got))
+            .await
+            .expect("visitor stalled")
+            .unwrap();
+        assert_eq!(got[0], beat);
+
+        visitor.write_all(&[beat]).await.unwrap();
+        expect_data(&mut ws, conn, &[beat]).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    expect_reset(&mut ws, conn, "connection_terminated").await;
+}
+
+#[tokio::test]
+async fn stalled_api_request_is_closed_by_the_header_timeout() {
+    let srv = start_server_with(|c| c.timeouts.client_hello = Duration::from_millis(300)).await;
+    let mut tls = tls_connect(srv.port, &srv.cert_pem).await;
+    tls.write_all(b"GET /health HTTP/1.1\r\nHost: relay.test\r\n")
+        .await
+        .unwrap();
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut rest)).await;
+    assert!(closed.is_ok(), "stalled API request was not closed");
+}
+
+#[tokio::test]
+async fn connection_limit_refuses_excess_and_recovers() {
+    let srv = start_server_with(|c| c.max_connections = 1).await;
+
+    let holder = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut refused = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut buf))
+        .await
+        .expect("refused connection was left open")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "excess connection must be closed without service");
+
+    drop(holder);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (status, _) = http_request(&srv, "GET", "/health", None, "").await;
+    assert_eq!(status, 200);
 }

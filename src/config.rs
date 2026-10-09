@@ -64,6 +64,12 @@ pub struct Config {
     #[arg(long, env = "OT_MAX_CERTS_PER_DAY", default_value_t = 7)]
     pub max_certs_per_day: u64,
 
+    /// Maximum connections open at once on the listener: API requests, bridge
+    /// sockets, and visitor sockets together. Excess connections are refused
+    /// at accept. 0 disables the limit.
+    #[arg(long, env = "OT_MAX_CONNECTIONS", default_value_t = 1024)]
+    pub max_connections: usize,
+
     #[arg(skip)]
     pub timeouts: Timeouts,
 }
@@ -87,6 +93,9 @@ pub fn normalize_domain(raw: &str) -> String {
 /// Internal time budgets. Not exposed as flags: they only need to change in tests.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
+    /// Time a client gets to send its ClientHello, finish the TLS handshake, and
+    /// send the headers of each API request.
+    pub client_hello: Duration,
     /// How long a full per-connection queue may block the bridge reader before
     /// that one connection is reset. The official client uses the same policy
     /// with a 30 s budget; this relay uses a shorter one because the reader is
@@ -96,6 +105,9 @@ pub struct Timeouts {
     /// order is marked failed and its TXT records are removed. An issuance
     /// still marked in flight after twice this long is taken over.
     pub issuance: Duration,
+    /// A forwarded stream that moves no bytes in either direction for this long
+    /// is closed, and its bridge connection is reset.
+    pub tunnel_idle: Duration,
 }
 
 impl Timeouts {
@@ -110,8 +122,10 @@ impl Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
+            client_hello: Duration::from_secs(10),
             bridge_stall: Duration::from_secs(10),
             issuance: Duration::from_secs(600),
+            tunnel_idle: Duration::from_secs(300),
         }
     }
 }

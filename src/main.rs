@@ -14,6 +14,7 @@
 //! server with `OPENTUNNEL_API=https://<domain>`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use opentunnel_relay::{
@@ -41,6 +42,8 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Db::open(&config.data_dir.join("relay.db"))?);
     let http = reqwest::Client::builder()
         .user_agent("opentunnel-relay/0.1.0")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()?;
 
     // The API certificate must exist before we can serve anything on 443.
