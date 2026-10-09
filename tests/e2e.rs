@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const DOMAIN: &str = "relay.test";
+const ADMIN_TOKEN: &str = "test-admin-token-for-e2e-only-at-least-32-bytes";
 
 struct TestServer {
     port: u16,
@@ -27,6 +28,7 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         domain: DOMAIN.to_string(),
         listen: "127.0.0.1:0".to_string(),
         data_dir: data_dir.to_path_buf(),
+        admin_token: ADMIN_TOKEN.to_string(),
         cf_token: "test".to_string(),
         cf_zone_id: "test".to_string(),
         acme_eab_kid: "test".to_string(),
@@ -71,7 +73,9 @@ async fn start_server() -> TestServer {
     let config = test_config(&data_dir);
     let db = Arc::new(Db::open(&data_dir.join("relay.db")).unwrap());
     let http = reqwest::Client::builder().build().unwrap();
-    let api_tls = acme::ensure_api_cert(&config, &db, &http).await.unwrap();
+    let api_tls = acme::ensure_api_cert(&config, db.clone(), &http)
+        .await
+        .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -303,7 +307,19 @@ async fn api_provisioning_flow() {
     assert_eq!(status, 200);
     assert!(body.contains("\"ok\":true"), "{body}");
 
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    let (status, _) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 401);
+    let (status, _) = http_request(
+        &srv,
+        "POST",
+        "/api/tunnel",
+        Some("incorrect-admin-token"),
+        "{}",
+    )
+    .await;
+    assert_eq!(status, 401);
+
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -333,9 +349,28 @@ async fn api_provisioning_flow() {
 }
 
 #[tokio::test]
+async fn ordinary_api_response_closes_http_keep_alive_connection() {
+    let srv = start_server().await;
+    let mut tls = tls_connect(srv.port, &srv.cert_pem).await;
+    tls.write_all(format!("GET /health HTTP/1.1\r\nHost: {DOMAIN}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), tls.read_to_end(&mut response))
+        .await
+        .expect("server left an ordinary keep-alive connection open")
+        .unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.to_ascii_lowercase().contains("connection: close"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
 async fn retrying_same_csr_does_not_restart_active_issuance() {
     let srv = start_server().await;
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -376,9 +411,9 @@ async fn retrying_same_csr_does_not_restart_active_issuance() {
 }
 
 #[tokio::test]
-async fn retrying_same_csr_restarts_failed_issuance() {
+async fn failed_issuance_obeys_backoff_but_new_csr_can_restart() {
     let srv = start_server().await;
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -409,10 +444,30 @@ async fn retrying_same_csr_restarts_failed_issuance() {
         &body,
     )
     .await;
+    assert_eq!(status, 409, "{response}");
+    let record = srv.state.db.get_tunnel(&id).unwrap().unwrap();
+    assert_eq!(record.cert_id.as_deref(), Some("cert_failed"));
+    assert_eq!(record.cert_state, opentunnel_relay::db::CertState::Failed);
+
+    let replacement_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let replacement_csr = params
+        .serialize_request(&replacement_key)
+        .unwrap()
+        .pem()
+        .unwrap();
+    let body = serde_json::json!({"csr": replacement_csr.clone()}).to_string();
+    let (status, response) = http_request(
+        &srv,
+        "POST",
+        &format!("/api/tunnel/{id}/certificate"),
+        Some(&token),
+        &body,
+    )
+    .await;
     assert_eq!(status, 202, "{response}");
     let record = srv.state.db.get_tunnel(&id).unwrap().unwrap();
     assert_ne!(record.cert_id.as_deref(), Some("cert_failed"));
-    assert_eq!(record.csr_pem.as_deref(), Some(csr.as_str()));
+    assert_eq!(record.csr_pem.as_deref(), Some(replacement_csr.as_str()));
 }
 
 #[tokio::test]
@@ -424,7 +479,7 @@ async fn bridge_attach_and_sni_routing() {
 
     // Provision a tunnel, then fake a ready certificate (ACME is out of scope
     // for this test; issuance itself is exercised against staging CAs).
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -612,7 +667,7 @@ async fn simultaneous_attach_to_same_route_has_one_winner() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let srv = start_server().await;
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();

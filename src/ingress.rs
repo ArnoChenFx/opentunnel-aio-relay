@@ -26,6 +26,8 @@ use crate::state::AppState;
 
 const CLIENT_HELLO_LIMIT: usize = 64 * 1024;
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const API_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+const TUNNEL_TLS_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONCURRENT_HANDSHAKES: usize = 256;
 
 pub async fn run(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
@@ -41,7 +43,14 @@ pub async fn run_on(
 ) -> anyhow::Result<()> {
     let handshake_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let (socket, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::error!(error = %error, "TCP accept failed; retrying");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
         let Some(permit) = try_acquire_handshake(&handshake_permits) else {
             drop(socket);
             continue;
@@ -180,8 +189,21 @@ async fn serve_api(
         move |req: hyper::Request<hyper::body::Incoming>| {
             let router = router.clone();
             async move {
+                let websocket_upgrade = req
+                    .headers()
+                    .get(hyper::header::UPGRADE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
                 match router.oneshot(req.map(axum::body::Body::new)).await {
-                    Ok(res) => Ok(res),
+                    Ok(mut res) => {
+                        if !websocket_upgrade {
+                            res.headers_mut().insert(
+                                hyper::header::CONNECTION,
+                                hyper::header::HeaderValue::from_static("close"),
+                            );
+                        }
+                        Ok(res)
+                    }
                     Err(never) => Err(std::io::Error::other(format!("router error: {never:?}"))),
                 }
             }
@@ -190,8 +212,11 @@ async fn serve_api(
     // NOTE: `.with_upgrades()` is required: without it hyper completes the
     // server-side upgrade future with an error and the bridge WebSocket
     // handshake silently dies after the 101 is sent.
-    http1::Builder::new()
-        .serve_connection(io, svc)
+    let mut http = http1::Builder::new();
+    http.timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(API_HEADER_TIMEOUT)
+        .keep_alive(true);
+    http.serve_connection(io, svc)
         .with_upgrades()
         .await
         .map_err(|e| Error::Internal(format!("API connection error: {e}")))?;
@@ -235,7 +260,7 @@ async fn serve_tunnel(
 
     let session = state
         .sessions
-        .get_or_load(&state.db, tunnel_id)
+        .get_or_load(state.db.clone(), tunnel_id)
         .await?
         .ok_or_else(|| Error::Internal("unknown tunnel".into()))?;
     let mut shutdown_rx = session.subscribe_shutdown();
@@ -296,16 +321,26 @@ async fn serve_tunnel(
 
     // Bridge -> public socket.
     let pump_down = async move {
+        let mut waiting_for_tls_first_response = true;
         loop {
             let message = tokio::select! {
                 changed = channel_shutdown.changed() => {
                     let _ = changed;
                     return Err(anyhow::anyhow!("bridge channel cancelled: {}", channel_cancel_reason(&channel_shutdown)));
                 }
-                message = chan_rx.recv() => message,
+                message = async {
+                    if waiting_for_tls_first_response {
+                        tokio::time::timeout(TUNNEL_TLS_FIRST_RESPONSE_TIMEOUT, chan_rx.recv())
+                            .await
+                            .map_err(|_| anyhow::anyhow!("tunnel TLS first-response timeout"))
+                    } else {
+                        Ok(chan_rx.recv().await)
+                    }
+                } => message?,
             };
             match message {
                 Some(ChannelMsg::Data(data)) => {
+                    waiting_for_tls_first_response = false;
                     tokio::select! {
                         result = writer.write_all(&data) => result?,
                         changed = channel_shutdown.changed() => {

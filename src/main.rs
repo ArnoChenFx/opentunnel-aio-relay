@@ -10,8 +10,8 @@
 //! - Tunnels, token hashes, CSRs and certificates persist in SQLite.
 //! - Certificates are issued/renewed via ACME DNS-01 (Let's Encrypt by default).
 //!
-//! Existing clients (the Rust CLI/SDK) work unchanged: point them at this
-//! server with `OPENTUNNEL_API=https://<domain>`.
+//! Clients point at this server with `OPENTUNNEL_API=https://<domain>` and
+//! must send the server admin bearer token when creating a tunnel.
 
 use std::sync::Arc;
 
@@ -28,6 +28,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    if config.admin_token.len() < 32 || !config.admin_token.is_ascii() {
+        anyhow::bail!("OT_ADMIN_TOKEN must contain at least 32 ASCII bytes");
+    }
     // rustls uses the process-wide default provider; make it ring explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -40,12 +43,14 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Db::open(&config.data_dir.join("relay.db"))?);
     let http = reqwest::Client::builder()
         .user_agent("opentunnel-relay/0.1.0")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     // The API certificate must exist before we can serve anything on 443.
     // Issued via ACME DNS-01 on first run; reused afterwards.
     let api_tls = Arc::new(tokio::sync::RwLock::new(
-        acme::ensure_api_cert(&config, &db, &http).await?,
+        acme::ensure_api_cert(&config, db.clone(), &http).await?,
     ));
 
     let state = Arc::new(AppState {
@@ -56,6 +61,8 @@ async fn main() -> anyhow::Result<()> {
         http,
     });
     let router = api::router(state.clone());
+
+    acme::resume_issuances(state.clone()).await?;
 
     // Background certificate renewals.
     tokio::spawn(acme::renewal_loop(state.clone()));

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 /// - SNI == `domain`            -> terminates TLS locally, serves the HTTP API
 /// - SNI == `*.<domain>`        -> blind TCP passthrough to the tunnel's bridge
 ///   (TLS is terminated by the client; this server never sees plaintext)
-#[derive(Debug, Parser, Clone)]
+#[derive(Parser, Clone)]
 #[command(name = "opentunnel-relay", version)]
 pub struct Config {
     /// Public domain served by this relay, e.g. tunnel.example.com.
@@ -22,6 +22,10 @@ pub struct Config {
     /// Directory for the SQLite database and the API TLS certificate/key.
     #[arg(long, env = "OT_DATA_DIR", default_value = "./data")]
     pub data_dir: PathBuf,
+
+    /// Server-wide bearer token required to create new tunnels.
+    #[arg(skip = std::env::var("OT_ADMIN_TOKEN").unwrap_or_default())]
+    pub admin_token: String,
 
     /// Cloudflare API token with DNS edit access to the zone of OT_DOMAIN.
     /// Used for ACME DNS-01 challenges.

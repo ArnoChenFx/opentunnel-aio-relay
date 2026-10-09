@@ -25,6 +25,7 @@ use crate::proto::names;
 use crate::state::{now_rfc3339, AppState};
 
 const MAX_INBOUND_WS_BINARY_SIZE: usize = bridge::CONN_ID_SIZE + bridge::MAX_PAYLOAD_SIZE;
+const CHANNEL_DATA_QUEUE_CAPACITY: usize = 256;
 
 /// Outgoing frames queued for one bridge WebSocket.
 #[derive(Debug)]
@@ -73,13 +74,14 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Returns the in-memory session, loading it from the DB on first use.
-    pub async fn get_or_load(&self, db: &Db, id: &str) -> Result<Option<Arc<Session>>> {
+    pub async fn get_or_load(&self, db: Arc<Db>, id: &str) -> Result<Option<Arc<Session>>> {
         let existing = { self.inner.read().await.get(id).cloned() };
         if let Some(session) = existing {
             if session.is_closed() {
                 return Ok(None);
             }
-            match db.get_tunnel(id)? {
+            let lookup_id = id.to_string();
+            match Db::call(db.clone(), move |db| db.get_tunnel(&lookup_id)).await? {
                 Some(record) if record.deleted_at.is_none() => return Ok(Some(session)),
                 _ => {
                     session.signal_shutdown();
@@ -93,7 +95,8 @@ impl SessionManager {
         }
         // Recheck under the insertion lock: deletion persists its tombstone
         // before SessionManager::remove takes this lock.
-        let record = match db.get_tunnel(id)? {
+        let lookup_id = id.to_string();
+        let record = match Db::call(db, move |db| db.get_tunnel(&lookup_id)).await? {
             Some(record) if record.deleted_at.is_none() => record,
             _ => return Ok(None),
         };
@@ -187,7 +190,11 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         }
     };
 
-    let session = match state.sessions.get_or_load(&state.db, tunnel_id).await? {
+    let session = match state
+        .sessions
+        .get_or_load(state.db.clone(), tunnel_id)
+        .await?
+    {
         Some(s) => s,
         None => {
             send_text(
@@ -255,7 +262,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
     let bridge_id = format!("sess_{}", random_session_id());
     let (tx, mut rx) = mpsc::channel::<OutMsg>(512);
     let conflict = !register_bridge(
-        &state.db,
+        state.db.clone(),
         &session,
         BridgeHandle {
             id: bridge_id.clone(),
@@ -290,7 +297,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
     {
         // Registration happened before the reply so route ownership is
         // consistent; if the peer has already gone, release it immediately.
-        detach_bridge(&state.db, &session, &bridge_id).await;
+        detach_bridge(state.db.clone(), &session, &bridge_id).await;
         return Err(error);
     }
 
@@ -352,7 +359,12 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                                     .map(|channel| channel.tx.clone())
                             };
                             if let Some(tx) = tx {
-                                if tx.try_send(ChannelMsg::Data(payload.to_vec())).is_err() {
+                                // Keep one slot unavailable to data so an End or
+                                // Reset control frame can still follow a full
+                                // data backlog without blocking this bridge.
+                                if tx.capacity() <= 1
+                                    || tx.try_send(ChannelMsg::Data(payload.to_vec())).is_err()
+                                {
                                     // A slow public socket must not stall this
                                     // bridge's reader and every other channel.
                                     session.close_channel(conn).await;
@@ -370,12 +382,12 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         }
     }
 
-    detach_bridge(&state.db, &session, &bridge_id).await;
+    detach_bridge(state.db.clone(), &session, &bridge_id).await;
     let _ = socket.close().await;
     Ok(())
 }
 
-async fn register_bridge(db: &Db, session: &Session, bridge: BridgeHandle) -> Result<bool> {
+async fn register_bridge(db: Arc<Db>, session: &Session, bridge: BridgeHandle) -> Result<bool> {
     let mut bridges = session.bridges.lock().await;
     if session.is_closed() {
         return Err(Error::Internal("tunnel was deleted".into()));
@@ -391,18 +403,25 @@ async fn register_bridge(db: &Db, session: &Session, bridge: BridgeHandle) -> Re
 
     // Persist membership transitions while holding the same lock used by
     // detach, so a delayed offline write cannot overwrite a newer attach.
-    db.set_online(&session.id, true, &now_rfc3339())?;
+    let session_id = session.id.clone();
+    let now = now_rfc3339();
+    Db::call(db, move |db| db.set_online(&session_id, true, &now)).await?;
     bridges.push(bridge);
     Ok(true)
 }
 
-async fn detach_bridge(db: &Db, session: &Session, bridge_id: &str) {
+async fn detach_bridge(db: Arc<Db>, session: &Session, bridge_id: &str) {
     let owned_channels = {
         let mut bridges = session.bridges.lock().await;
         bridges.retain(|b| b.id != bridge_id);
         if bridges.is_empty() {
             // Serialize the persisted online state with later bridge attaches.
-            let _ = db.set_online(&session.id, false, &now_rfc3339());
+            let session_id = session.id.clone();
+            let now = now_rfc3339();
+            let _ = Db::call(db.clone(), move |db| {
+                db.set_online(&session_id, false, &now)
+            })
+            .await;
         }
 
         // Route removal and channel cleanup are ordered against
@@ -533,7 +552,7 @@ impl Session {
         while conn == 0 || channels.contains_key(&conn) {
             conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
         }
-        let (tx, rx) = mpsc::channel::<ChannelMsg>(256);
+        let (tx, rx) = mpsc::channel::<ChannelMsg>(CHANNEL_DATA_QUEUE_CAPACITY + 1);
         let (cancel, cancel_rx) = watch::channel(None);
         channels.insert(
             conn,
@@ -549,7 +568,7 @@ impl Session {
     /// Registers a new proxied connection; returns its connection id.
     pub async fn open_channel(&self, bridge_id: &str) -> (ConnId, mpsc::Receiver<ChannelMsg>) {
         let mut conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel::<ChannelMsg>(256);
+        let (tx, rx) = mpsc::channel::<ChannelMsg>(CHANNEL_DATA_QUEUE_CAPACITY + 1);
         let mut channels = self.channels.lock().await;
         while conn == 0 || channels.contains_key(&conn) {
             conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
@@ -673,7 +692,7 @@ mod tests {
     async fn attach_detach_race_keeps_online_state_in_sync_with_membership() {
         let (db, path) = test_db();
         let session = test_session("test");
-        assert!(register_bridge(&db, &session, bridge("old", "@"))
+        assert!(register_bridge(db.clone(), &session, bridge("old", "@"))
             .await
             .unwrap());
 
@@ -682,14 +701,14 @@ mod tests {
         let db_attach = db.clone();
         let session_attach = session.clone();
         let ((), attached) = tokio::join!(
-            detach_bridge(&db_detach, &session_detach, "old"),
-            register_bridge(&db_attach, &session_attach, bridge("new", "api")),
+            detach_bridge(db_detach, &session_detach, "old"),
+            register_bridge(db_attach, &session_attach, bridge("new", "api")),
         );
         assert!(attached.unwrap());
         assert_eq!(session.bridges.lock().await.len(), 1);
         assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "online");
 
-        detach_bridge(&db, &session, "new").await;
+        detach_bridge(db.clone(), &session, "new").await;
         assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "offline");
         drop(db);
         let _ = std::fs::remove_file(&path);
@@ -701,13 +720,13 @@ mod tests {
     async fn route_open_racing_bridge_detach_cannot_leave_an_orphan_channel() {
         let (db, path) = test_db();
         let session = test_session("test");
-        assert!(register_bridge(&db, &session, bridge("only", "@"))
+        assert!(register_bridge(db.clone(), &session, bridge("only", "@"))
             .await
             .unwrap());
 
         let (opened, ()) = tokio::join!(
             session.open_channel_for_route("@"),
-            detach_bridge(&db, &session, "only"),
+            detach_bridge(db.clone(), &session, "only"),
         );
         drop(opened);
         assert!(session.channels.lock().await.is_empty());
@@ -752,7 +771,7 @@ mod tests {
     async fn bridge_detach_does_not_wait_for_a_full_channel_queue() {
         let (db, path) = test_db();
         let session = test_session("test");
-        assert!(register_bridge(&db, &session, bridge("bridge", "@"))
+        assert!(register_bridge(db.clone(), &session, bridge("bridge", "@"))
             .await
             .unwrap());
         let (tx, _rx) = mpsc::channel(256);
@@ -771,7 +790,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            detach_bridge(&db, &session, "bridge"),
+            detach_bridge(db.clone(), &session, "bridge"),
         )
         .await
         .expect("bridge detach blocked on a full per-channel queue");
@@ -785,5 +804,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn end_control_frame_fits_after_full_data_queue() {
+        let session = test_session("test");
+        let (tx, mut rx) = mpsc::channel(CHANNEL_DATA_QUEUE_CAPACITY + 1);
+        for _ in 0..CHANNEL_DATA_QUEUE_CAPACITY {
+            tx.try_send(ChannelMsg::Data(vec![1])).unwrap();
+        }
+        let (cancel, _) = watch::channel(None);
+        session.channels.lock().await.insert(
+            1,
+            ChannelHandle {
+                bridge_id: "bridge".into(),
+                tx,
+                cancel,
+            },
+        );
+
+        assert!(
+            handle_control(&session, "bridge", ClientMessage::End { conn: 1 })
+                .await
+                .is_none()
+        );
+
+        for _ in 0..CHANNEL_DATA_QUEUE_CAPACITY {
+            assert!(matches!(rx.recv().await, Some(ChannelMsg::Data(_))));
+        }
+        assert!(matches!(rx.recv().await, Some(ChannelMsg::End)));
+        assert!(session.channels.lock().await.contains_key(&1));
     }
 }

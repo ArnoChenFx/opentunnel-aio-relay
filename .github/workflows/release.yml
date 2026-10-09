@@ -162,10 +162,9 @@ jobs:
     concurrency:
       group: opentunnel-integration
       cancel-in-progress: false
-    # Real Let's Encrypt issuance happens here (2 certs per run on CI_DOMAIN:
-    # one for the API domain, one for the tunnel). Let's Encrypt allows 50
-    # certs per registered domain per week, so this runs on tags, the daily
-    # schedule, and manual dispatch -- not on every push.
+    # Real Let's Encrypt issuance happens here (2 certs per run). The script
+    # derives a unique API hostname from the run ID to avoid repeating the same
+    # identifier set and hitting Let's Encrypt's 5-per-week exact-set limit.
     #
     if: >-
       ${{ github.ref_type == 'tag' ||
@@ -201,11 +200,20 @@ jobs:
         if: steps.integration-secrets.outputs.available == 'true'
         run: |
           if [ "${OFFICIAL_CLIENT_RELEASE}" = "latest" ]; then
-            URL="https://github.com/anomalyco/opentunnel/releases/latest/download/opentunnel-linux-x64.tar.gz"
+            RELEASE_API="https://api.github.com/repos/anomalyco/opentunnel/releases/latest"
           else
-            URL="https://github.com/anomalyco/opentunnel/releases/download/${OFFICIAL_CLIENT_RELEASE}/opentunnel-linux-x64.tar.gz"
+            RELEASE_API="https://api.github.com/repos/anomalyco/opentunnel/releases/tags/${OFFICIAL_CLIENT_RELEASE}"
+          fi
+          curl -fsSL -H 'Accept: application/vnd.github+json' -o /tmp/official-release.json "$RELEASE_API"
+          ASSET=$(jq -cer '.assets[] | select(.name == "opentunnel-linux-x64.tar.gz") | {url: .browser_download_url, digest: .digest}' /tmp/official-release.json)
+          URL=$(jq -r '.url' <<<"$ASSET")
+          DIGEST=$(jq -r '.digest // empty' <<<"$ASSET")
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "GitHub release metadata did not provide a valid SHA-256 asset digest" >&2
+            exit 1
           fi
           curl -fsSL -o /tmp/official-client.tgz "$URL"
+          printf '%s  %s\n' "${DIGEST#sha256:}" /tmp/official-client.tgz | sha256sum --check
           mkdir -p /tmp/official-client && tar -xzf /tmp/official-client.tgz -C /tmp/official-client
           /tmp/official-client/opentunnel --version
 

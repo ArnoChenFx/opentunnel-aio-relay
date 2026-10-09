@@ -5,7 +5,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 
@@ -56,6 +56,8 @@ pub struct TunnelRecord {
     pub challenge_token: Option<String>,
     pub challenge_key: Option<String>,
     pub fail_reason: Option<String>,
+    pub cert_retry_count: u32,
+    pub cert_retry_after: Option<i64>,
     pub csr_pem: Option<String>,
     pub created_at: String,
     pub last_connected_at: Option<String>,
@@ -66,6 +68,17 @@ pub struct Db {
 }
 
 impl Db {
+    /// Runs a synchronous SQLite operation on Tokio's blocking pool.
+    pub async fn call<T, F>(db: Arc<Self>, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || operation(&db))
+            .await
+            .map_err(|error| Error::Internal(format!("database worker failed: {error}")))?
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         // SQLite otherwise creates databases according to the process umask.
         // The database also contains the ACME account key and tunnel metadata.
@@ -88,6 +101,8 @@ impl Db {
                  challenge_token TEXT,
                  challenge_key TEXT,
                  fail_reason TEXT,
+                 cert_retry_count INTEGER NOT NULL DEFAULT 0,
+                 cert_retry_after INTEGER,
                  csr_pem TEXT,
                  created_at TEXT NOT NULL,
                  last_connected_at TEXT
@@ -97,10 +112,22 @@ impl Db {
                  value TEXT NOT NULL
              );",
         )?;
+        ensure_column(
+            &conn,
+            "cert_retry_count",
+            "cert_retry_count INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "cert_retry_after", "cert_retry_after INTEGER")?;
         // No bridge survives a process restart; do not expose stale online
         // status from the previous process lifetime.
         conn.execute(
             "UPDATE tunnels SET state = 'offline' WHERE state != 'offline'",
+            [],
+        )?;
+        // Challenge work is process-local; requeue it from the persisted CSR.
+        conn.execute(
+            "UPDATE tunnels SET cert_state = 'issuing', challenge_token = NULL,
+                 challenge_key = NULL WHERE cert_state = 'challenge'",
             [],
         )?;
         secure_database_file(path)?;
@@ -133,7 +160,7 @@ impl Db {
         conn.query_row(
             "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
                     cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
-                    fail_reason, csr_pem, created_at, last_connected_at
+                    fail_reason, cert_retry_count, cert_retry_after, csr_pem, created_at, last_connected_at
              FROM tunnels WHERE id = ?1",
             params![id],
             row_to_record,
@@ -172,7 +199,9 @@ impl Db {
         let conn = self.lock()?;
         conn.execute(
             "UPDATE tunnels SET cert_id = ?1, cert_state = 'issuing', csr_pem = ?2,
-                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL
+                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL,
+                 cert_retry_count = CASE WHEN csr_pem IS NOT ?2 THEN 0 ELSE cert_retry_count END,
+                 cert_retry_after = CASE WHEN csr_pem IS NOT ?2 THEN NULL ELSE cert_retry_after END
              WHERE id = ?3",
             params![cert_id, csr_pem, id],
         )?;
@@ -186,9 +215,12 @@ impl Db {
         let conn = self.lock()?;
         let rows = conn.execute(
             "UPDATE tunnels SET cert_id = ?1, cert_state = 'issuing', csr_pem = ?2,
-                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL
+                 challenge_token = NULL, challenge_key = NULL, fail_reason = NULL,
+                 cert_retry_count = CASE WHEN csr_pem IS NOT ?2 THEN 0 ELSE cert_retry_count END,
+                 cert_retry_after = CASE WHEN csr_pem IS NOT ?2 THEN NULL ELSE cert_retry_after END
              WHERE id = ?3 AND deleted_at IS NULL
-               AND cert_state NOT IN ('challenge', 'issuing')",
+               AND cert_state NOT IN ('challenge', 'issuing')
+               AND (csr_pem IS NOT ?2 OR cert_retry_after IS NULL OR cert_retry_after <= unixepoch())",
             params![cert_id, csr_pem, id],
         )?;
         Ok(rows == 1)
@@ -214,7 +246,8 @@ impl Db {
         let conn = self.lock()?;
         conn.execute(
             "UPDATE tunnels SET cert_state = 'ready', cert_pem = ?1, chain_pem = ?2,
-                 cert_expiry = ?3, fail_reason = NULL WHERE cert_id = ?4",
+                 cert_expiry = ?3, fail_reason = NULL, cert_retry_count = 0,
+                 cert_retry_after = NULL WHERE cert_id = ?4",
             params![cert_pem, chain_pem, expiry, cert_id],
         )?;
         Ok(())
@@ -222,9 +255,24 @@ impl Db {
 
     pub fn set_failed(&self, cert_id: &str, reason: &str) -> Result<()> {
         let conn = self.lock()?;
+        let previous_count: Option<i64> = conn
+            .query_row(
+                "SELECT cert_retry_count FROM tunnels WHERE cert_id = ?1",
+                params![cert_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(previous_count) = previous_count else {
+            return Ok(());
+        };
+        let retry_count = previous_count.saturating_add(1).max(1);
+        let exponent = (retry_count - 1).min(11) as u32;
+        let backoff_secs = (60_i64 * (1_i64 << exponent)).min(24 * 60 * 60);
+        let retry_after = chrono::Utc::now().timestamp().saturating_add(backoff_secs);
         conn.execute(
-            "UPDATE tunnels SET cert_state = 'failed', fail_reason = ?1 WHERE cert_id = ?2",
-            params![reason, cert_id],
+            "UPDATE tunnels SET cert_state = 'failed', fail_reason = ?1,
+                 cert_retry_count = ?2, cert_retry_after = ?3 WHERE cert_id = ?4",
+            params![reason, retry_count, retry_after, cert_id],
         )?;
         Ok(())
     }
@@ -234,13 +282,29 @@ impl Db {
         conn.query_row(
             "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
                     cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
-                    fail_reason, csr_pem, created_at, last_connected_at
+                    fail_reason, cert_retry_count, cert_retry_after, csr_pem, created_at, last_connected_at
              FROM tunnels WHERE cert_id = ?1",
             params![cert_id],
             row_to_record,
         )
         .optional()
         .map_err(Error::from)
+    }
+
+    /// Returns non-deleted certificate requests that were active at shutdown.
+    pub fn pending_issuances(&self) -> Result<Vec<TunnelRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
+                    cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
+                    fail_reason, cert_retry_count, cert_retry_after, csr_pem, created_at, last_connected_at
+             FROM tunnels
+             WHERE deleted_at IS NULL AND cert_state IN ('challenge', 'issuing')
+               AND cert_id IS NOT NULL AND csr_pem IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], row_to_record)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::from)
     }
 
     /// Tunnels whose certificate expires within `within_secs` and that were
@@ -255,15 +319,16 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, hostname, token_hash, state, deleted_at, cert_id, cert_state,
                     cert_pem, chain_pem, cert_expiry, challenge_token, challenge_key,
-                    fail_reason, csr_pem, created_at, last_connected_at
+                    fail_reason, cert_retry_count, cert_retry_after, csr_pem, created_at, last_connected_at
              FROM tunnels
              WHERE deleted_at IS NULL
                AND cert_state IN ('ready', 'failed')
                AND cert_pem IS NOT NULL
                AND cert_expiry IS NOT NULL
-               AND csr_pem IS NOT NULL",
+               AND csr_pem IS NOT NULL
+               AND (cert_retry_after IS NULL OR cert_retry_after <= ?1)",
         )?;
-        let rows = stmt.query_map([], row_to_record)?;
+        let rows = stmt.query_map(params![now_secs], row_to_record)?;
         let mut out = Vec::new();
         for row in rows {
             let record = row?;
@@ -320,6 +385,17 @@ impl Db {
     }
 }
 
+fn ensure_column(conn: &Connection, name: &str, declaration: &str) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(tunnels)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == name) {
+        conn.execute_batch(&format!("ALTER TABLE tunnels ADD COLUMN {declaration}"))?;
+    }
+    Ok(())
+}
+
 fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<TunnelRecord> {
     let cert_state: String = row.get(6)?;
     Ok(TunnelRecord {
@@ -336,9 +412,11 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<TunnelRecord> {
         challenge_token: row.get(10)?,
         challenge_key: row.get(11)?,
         fail_reason: row.get(12)?,
-        csr_pem: row.get(13)?,
-        created_at: row.get(14)?,
-        last_connected_at: row.get(15)?,
+        cert_retry_count: row.get::<_, i64>(13)?.max(0) as u32,
+        cert_retry_after: row.get(14)?,
+        csr_pem: row.get(15)?,
+        created_at: row.get(16)?,
+        last_connected_at: row.get(17)?,
     })
 }
 
@@ -421,17 +499,63 @@ mod tests {
         db.set_online("t1", true, &now_text).unwrap();
         db.set_failed("cert1", "temporary CA outage").unwrap();
 
+        let failed = db.get_tunnel("t1").unwrap().unwrap();
+        assert_eq!(failed.cert_retry_count, 1);
+        assert!(failed.cert_retry_after.unwrap() > now.timestamp());
+        assert!(!db.try_begin_issuance("t1", "cert2", "same-csr").unwrap());
+        assert!(db
+            .renewal_candidates(30 * 24 * 3600, 90 * 24 * 3600, now.timestamp())
+            .unwrap()
+            .is_empty());
+
+        // Simulate the backoff expiring, then verify renewal scanning resumes.
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE tunnels SET cert_retry_after = ?1 WHERE id = 't1'",
+                params![now.timestamp() - 1],
+            )
+            .unwrap();
         let candidates = db
             .renewal_candidates(30 * 24 * 3600, 90 * 24 * 3600, now.timestamp())
             .unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].cert_state, CertState::Failed);
-        assert!(db.try_begin_issuance("t1", "cert2", "same-csr").unwrap());
+        assert!(db.try_begin_issuance("t1", "cert2", "new-csr").unwrap());
         drop(db);
 
         let reopened = Db::open(&path).unwrap();
         assert_eq!(reopened.get_tunnel("t1").unwrap().unwrap().state, "offline");
 
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name(format!(
+            "{}-wal",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+        let _ = std::fs::remove_file(path.with_file_name(format!(
+            "{}-shm",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+    }
+
+    #[test]
+    fn interrupted_challenge_is_requeued_after_restart() {
+        let path = test_path();
+        let db = Db::open(&path).unwrap();
+        db.create_tunnel("t1", "t1.example.test", "hash", "now")
+            .unwrap();
+        db.begin_issuance("t1", "cert1", "stored-csr").unwrap();
+        db.set_challenge("cert1", "old-token", "old-key").unwrap();
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        let pending = reopened.pending_issuances().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].cert_state, CertState::Issuing);
+        assert_eq!(pending[0].cert_id.as_deref(), Some("cert1"));
+        assert_eq!(pending[0].csr_pem.as_deref(), Some("stored-csr"));
+        assert!(pending[0].challenge_token.is_none());
         drop(reopened);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_file_name(format!(
