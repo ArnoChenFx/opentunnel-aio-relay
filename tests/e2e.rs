@@ -1424,7 +1424,9 @@ async fn memory_probe_reports_rss_per_stage() {
         for _ in 0..48 {
             assert!(
                 matches!(
-                    session.enqueue_data(bridge_id, channel.conn, &payload).await,
+                    session
+                        .enqueue_data(bridge_id, channel.conn, &payload)
+                        .await,
                     Enqueue::Accepted
                 ),
                 "buffer unexpectedly full"
@@ -1441,10 +1443,7 @@ async fn memory_probe_reports_rss_per_stage() {
         b as f64 / 1024.0 / 1024.0
     }
     println!("\n==== relay memory probe (RSS of this process) ====");
-    println!(
-        "idle (server up, no tunnels):       {:>7.1} MiB",
-        mib(idle)
-    );
+    println!("idle (server up, no tunnels):       {:>7.1} MiB", mib(idle));
     println!(
         "+ 50 tunnels w/ attached bridges:   {:>7.1} MiB  ({:.0} KiB per tunnel+bridge)",
         mib(with_bridges),
