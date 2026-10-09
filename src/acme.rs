@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use crate::bridge::random_session_id;
 use crate::config::Config;
 use crate::db::{renewal_backoff_ms, CertState, Db, TunnelRecord, ISSUANCE_WINDOW_MS};
+use crate::dns::DnsProvider;
 use crate::state::{now_millis, AppState};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -39,23 +40,22 @@ pub struct AcmeConfig {
     pub email: String,
     pub eab_kid: String,
     pub eab_hmac: String,
-    pub cf_token: String,
-    pub cf_zone_id: String,
+    /// Publishes the DNS-01 TXT records of each order.
+    pub dns: Arc<dyn DnsProvider>,
     /// Upper bound for one order, from the first request to the download.
     pub issuance_timeout: Duration,
 }
 
 impl AcmeConfig {
-    pub fn from_config(config: &Config) -> Self {
-        Self {
+    pub fn from_config(config: &Config, http: &Client) -> Result<Self> {
+        Ok(Self {
             directory_url: config.acme_url.clone(),
             email: config.acme_email.clone(),
             eab_kid: config.acme_eab_kid.clone(),
             eab_hmac: config.acme_eab_hmac.clone(),
-            cf_token: config.cf_token.clone(),
-            cf_zone_id: config.cf_zone_id.clone(),
+            dns: crate::dns::from_config(config, http.clone())?,
             issuance_timeout: config.timeouts.issuance,
-        }
+        })
     }
 }
 
@@ -389,9 +389,7 @@ where
     )
     .await;
     for record_id in &placed {
-        if let Err(error) =
-            crate::dns::delete_txt(http, &cfg.cf_zone_id, &cfg.cf_token, record_id).await
-        {
+        if let Err(error) = cfg.dns.delete_txt(record_id).await {
             tracing::warn!(
                 record = %record_id,
                 error = %error,
@@ -499,8 +497,7 @@ where
 
     for ch in &challenges {
         let name = format!("_acme-challenge.{}", ch.base);
-        let id =
-            crate::dns::create_txt(http, &cfg.cf_zone_id, &cfg.cf_token, &name, &ch.key).await?;
+        let id = cfg.dns.create_txt(&name, &ch.key).await?;
         placed.push(id);
     }
 
@@ -740,7 +737,7 @@ async fn issue_for_tunnel(state: &AppState, tunnel_id: &str, cert_id: &str) -> R
 
 async fn order_certificate(state: &AppState, csr_pem: &str, cert_id: &str) -> Result<Issued> {
     let identifiers = identifiers_from_csr(csr_pem)?;
-    let cfg = AcmeConfig::from_config(&state.config);
+    let cfg = AcmeConfig::from_config(&state.config, &state.http)?;
     let db = state.db.clone();
     let challenge_cert = cert_id.to_string();
     issue(
@@ -836,18 +833,20 @@ async fn renew_for_tunnel(
     csr_pem: String,
 ) {
     let outcome = match identifiers_from_csr(&csr_pem) {
-        Ok(identifiers) => {
-            let cfg = AcmeConfig::from_config(&state.config);
-            issue(
-                &state.http,
-                &state.db,
-                &cfg,
-                &identifiers,
-                &csr_pem,
-                |_, _| async {},
-            )
-            .await
-        }
+        Ok(identifiers) => match AcmeConfig::from_config(&state.config, &state.http) {
+            Ok(cfg) => {
+                issue(
+                    &state.http,
+                    &state.db,
+                    &cfg,
+                    &identifiers,
+                    &csr_pem,
+                    |_, _| async {},
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     match outcome {
@@ -996,7 +995,7 @@ async fn issue_api_cert(
     let csr_pem = csr.pem().map_err(|e| anyhow!("CSR PEM failed: {e}"))?;
     let key_pem = key_pair.serialize_pem();
 
-    let cfg = AcmeConfig::from_config(config);
+    let cfg = AcmeConfig::from_config(config, http)?;
     let issued = issue(
         http,
         db,
@@ -1123,6 +1122,7 @@ pub async fn maybe_renew_on_attach(state: Arc<AppState>, tunnel_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::test_support::NoDns;
 
     fn test_key() -> Vec<u8> {
         ring::signature::EcdsaKeyPair::generate_pkcs8(
@@ -1176,8 +1176,7 @@ mod tests {
                 email: String::new(),
                 eab_kid: String::new(),
                 eab_hmac: String::new(),
-                cf_token: String::new(),
-                cf_zone_id: String::new(),
+                dns: Arc::new(NoDns),
                 issuance_timeout: Duration::from_secs(600),
             },
             key_pkcs8: test_key(),
@@ -1295,8 +1294,7 @@ mod tests {
                 email: "test@example.invalid".into(),
                 eab_kid: String::new(),
                 eab_hmac: String::new(),
-                cf_token: String::new(),
-                cf_zone_id: String::new(),
+                dns: Arc::new(NoDns),
                 issuance_timeout: Duration::from_secs(600),
             },
             key_pkcs8,
@@ -1410,8 +1408,7 @@ mod tests {
             email: "test@example.invalid".into(),
             eab_kid: String::new(),
             eab_hmac: String::new(),
-            cf_token: String::new(),
-            cf_zone_id: String::new(),
+            dns: Arc::new(NoDns),
             issuance_timeout: Duration::from_millis(300),
         };
 
