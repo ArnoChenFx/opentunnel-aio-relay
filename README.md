@@ -260,6 +260,10 @@ cargo test
 - `.github/scripts/test-fetch-official-client.sh` — offline checks for the CI
   download script: a verified digest succeeds, while a mismatched or missing
   digest fails closed without extracting anything.
+- `memory_probe_reports_rss_per_stage` (`#[ignore]`d) — runtime memory probe:
+  starts the relay in-process, applies load in stages (tunnels, connections,
+  stream buffers) and prints RSS at each stage.
+  `cargo test --test e2e memory_probe -- --ignored --nocapture`
 
 ### End-to-end with the official client (CI)
 

@@ -185,6 +185,8 @@ cargo test
 - `tests/e2e.rs` —— 真 socket 全链路：TCP 接入 → SNI 路由 → API TLS → REST 开通 → bridge WebSocket attach → 代理 `open`，含半关闭响应投递、多 bridge 隔离、删隧道后立即断开。还覆盖开通管控、隧道和连接上限（全局、按地址、访客份额）、header 和空闲超时、bridge 停滞和溢出处理。
 - 单元测试：ClientHello 解析、CSR 校验（含篡改签名）、CIDR 解析和限流、数据库和 bridge 状态机。
 - `.github/scripts/test-fetch-official-client.sh` —— CI 下载脚本的离线检查：digest 对得上才成功，digest 对不上或缺失就 fail-closed，什么都不解压。
+- `memory_probe_reports_rss_per_stage`（`#[ignore]`）—— 运行时内存探针：在进程内启动中转，分阶段加压（隧道、连接、stream buffer）并打印每阶段的 RSS。
+  `cargo test --test e2e memory_probe -- --ignored --nocapture`
 
 ### 用官方客户端做端到端（CI）
 

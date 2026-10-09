@@ -654,7 +654,7 @@ type Bridge = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream
 
 /// Provisions a tunnel with a ready certificate and attaches one bridge that
 /// serves the base route.
-async fn attached_bridge(srv: &TestServer) -> (String, Bridge) {
+async fn attached_bridge(srv: &TestServer) -> (String, Bridge, String) {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -695,7 +695,8 @@ async fn attached_bridge(srv: &TestServer) -> (String, Bridge) {
     .unwrap();
     let attached: serde_json::Value = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
     assert_eq!(attached["type"], "attached");
-    (id, ws)
+    let bridge_id = attached["session"].as_str().unwrap().to_string();
+    (id, ws, bridge_id)
 }
 
 /// Connects a visitor with the given SNI and waits for the bridge to announce
@@ -794,7 +795,7 @@ async fn stalled_visitor_does_not_hold_up_heartbeats_or_other_streams() {
         c.stream_buffer_bytes = 1 << 20;
     })
     .await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (_stalled, stalled_conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
     let (mut healthy, healthy_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
@@ -846,7 +847,7 @@ async fn visitor_that_stops_reading_is_reset_once_its_stall_budget_expires() {
     use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
 
     let srv = start_server_with(|c| c.stream_buffer_bytes = 64 << 20).await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut stalled, stalled_conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
 
@@ -878,7 +879,7 @@ async fn overflowing_visitor_is_reset_without_waiting_for_the_stall_budget() {
         c.stream_buffer_bytes = 1 << 20;
     })
     .await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut stalled, stalled_conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
 
@@ -910,7 +911,7 @@ async fn queued_frames_arrive_in_order_and_end_follows_them() {
     use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
 
     let srv = start_server_with(|c| c.stream_buffer_bytes = 64 << 20).await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
 
@@ -963,7 +964,7 @@ async fn client_reset_closes_only_that_visitor_socket() {
     use opentunnel_relay::proto::bridge::encode_data_frame;
 
     let srv = start_server().await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut aborted, aborted_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
     let (mut kept, kept_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
@@ -1073,7 +1074,7 @@ async fn simultaneous_attach_to_same_route_has_one_winner() {
 #[tokio::test]
 async fn idle_stream_is_closed_and_the_bridge_is_told() {
     let srv = start_server_with(|c| c.stream_idle = Duration::from_millis(300)).await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
 
@@ -1090,7 +1091,7 @@ async fn traffic_in_either_direction_keeps_a_stream_open() {
     use opentunnel_relay::proto::bridge::encode_data_frame;
 
     let srv = start_server_with(|c| c.stream_idle = Duration::from_millis(400)).await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
 
@@ -1120,7 +1121,7 @@ async fn traffic_in_either_direction_keeps_a_stream_open() {
 async fn stream_whose_bridge_never_answers_is_reset_before_the_idle_limit() {
     let srv =
         start_server_with(|c| c.timeouts.tls_first_response = Duration::from_millis(300)).await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
 
@@ -1141,7 +1142,7 @@ async fn quiet_stream_that_has_answered_is_not_cut_by_the_first_response_budget(
 
     let srv =
         start_server_with(|c| c.timeouts.tls_first_response = Duration::from_millis(300)).await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
 
@@ -1252,7 +1253,7 @@ async fn visitors_cannot_take_the_slots_reserved_for_bridges() {
         c.max_connections_per_ip = 0;
     })
     .await;
-    let (id, mut ws) = attached_bridge(&srv).await;
+    let (id, mut ws, _) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
 
     // Visitors may hold only max - reserved = 2 connections.
@@ -1268,7 +1269,7 @@ async fn visitors_cannot_take_the_slots_reserved_for_bridges() {
         .unwrap_or(0);
     assert_eq!(n, 0, "visitor beyond its pool must be closed");
 
-    let (_other_id, _other_ws) = attached_bridge(&srv).await;
+    let (_other_id, _other_ws, _) = attached_bridge(&srv).await;
 }
 
 #[tokio::test]
@@ -1332,4 +1333,132 @@ async fn tunnel_cap_answers_503() {
     let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
     assert_eq!(status, 503, "{body}");
     assert!(body.contains("ServiceUnavailableError"), "{body}");
+}
+
+/// Reads this process's resident set size in bytes (Linux only).
+#[cfg(target_os = "linux")]
+fn rss_bytes() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+    for line in status.lines() {
+        if let Some(kb) = line
+            .strip_prefix("VmRSS:")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|num| num.parse::<u64>().ok())
+        {
+            return kb * 1024;
+        }
+    }
+    panic!("VmRSS not found in /proc/self/status");
+}
+
+/// Runtime memory probe. Starts the relay in-process (ACME bypassed with a
+/// throwaway self-signed API certificate, like the other e2e tests), applies
+/// load in stages, and prints RSS at each stage so operators can size their
+/// VPS. The relay shares this process with the test harness, so the absolute
+/// numbers include harness overhead — the deltas between stages are the
+/// meaningful part. Allocator retention means RSS rarely drops; compare
+/// upward steps only.
+///
+/// The stream-buffer stage bypasses sockets on purpose: on localhost the
+/// kernel's autotuned TCP buffers absorb a stalled visitor's data, so the
+/// relay-side queue would never fill. Driving `enqueue_data` directly measures
+/// the true per-stream buffer cost.
+///
+/// Run on demand (it is `ignore`d in the normal suite):
+/// `cargo test --test e2e memory_probe -- --ignored --nocapture`
+#[cfg(target_os = "linux")]
+#[ignore]
+#[tokio::test]
+async fn memory_probe_reports_rss_per_stage() {
+    use opentunnel_relay::bridge::Enqueue;
+
+    // Generous stall budget so stalled visitors keep their buffers while we measure.
+    let srv = start_server_with(|c| {
+        c.timeouts.bridge_stall = Duration::from_secs(60);
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let idle = rss_bytes();
+
+    // Stage 1: 50 tunnels, each with one attached bridge.
+    let mut endpoints: Vec<(String, Bridge, String)> = Vec::with_capacity(50);
+    for _ in 0..50 {
+        endpoints.push(attached_bridge(&srv).await);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let with_bridges = rss_bytes();
+
+    // Stage 2: 300 concurrent visitor connections, idle (no data flowing).
+    let mut visitors = Vec::with_capacity(300);
+    let n_endpoints = endpoints.len();
+    for i in 0..300 {
+        let (id, ws, _) = &mut endpoints[i % n_endpoints];
+        let sni = format!("{id}.{DOMAIN}");
+        let (sock, _conn) = open_visitor(srv.port, ws, &sni, None).await;
+        visitors.push(sock);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let with_visitors = rss_bytes();
+
+    // Stage 3: fill stream buffers directly. No visitor sockets are opened for
+    // these channels, so nothing drains them; every byte lands in the relay's
+    // per-stream queue. 10 streams x 1.5 MiB, under the 2 MiB budget each.
+    // The channels are held (not dropped): dropping the receiver releases the
+    // queue, which is the desired no-leak behavior on disconnect, but would
+    // defeat the measurement.
+    let payload = vec![0xEE; 32 * 1024];
+    let mut accepted: u64 = 0;
+    let mut held = Vec::new();
+    for (id, _, bridge_id) in endpoints.iter().take(10) {
+        let session = srv
+            .state
+            .sessions
+            .get_or_load(&srv.state.db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        let channel = session
+            .open_channel_for_route("@", 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        for _ in 0..48 {
+            assert!(
+                matches!(
+                    session.enqueue_data(bridge_id, channel.conn, &payload).await,
+                    Enqueue::Accepted
+                ),
+                "buffer unexpectedly full"
+            );
+            accepted += payload.len() as u64;
+        }
+        held.push(channel);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let with_buffers = rss_bytes();
+    drop(held);
+
+    fn mib(b: u64) -> f64 {
+        b as f64 / 1024.0 / 1024.0
+    }
+    println!("\n==== relay memory probe (RSS of this process) ====");
+    println!(
+        "idle (server up, no tunnels):       {:>7.1} MiB",
+        mib(idle)
+    );
+    println!(
+        "+ 50 tunnels w/ attached bridges:   {:>7.1} MiB  ({:.0} KiB per tunnel+bridge)",
+        mib(with_bridges),
+        with_bridges.saturating_sub(idle) as f64 / 50.0 / 1024.0
+    );
+    println!(
+        "+ 300 idle visitor connections:      {:>7.1} MiB  ({:.0} KiB per conn)",
+        mib(with_visitors),
+        with_visitors.saturating_sub(with_bridges) as f64 / 300.0 / 1024.0
+    );
+    println!(
+        "+ {:.1} MiB queued in stream buffers: {:>7.1} MiB",
+        mib(accepted),
+        mib(with_buffers)
+    );
+    println!("================================================\n");
 }
