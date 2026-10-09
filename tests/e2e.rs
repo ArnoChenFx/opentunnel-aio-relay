@@ -42,7 +42,6 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         max_tunnels: 0,
         max_certs_per_day: 0,
         max_connections: 1024,
-        create_token: None,
         create_allow_cidrs: CidrList::default(),
         rate_limit_per_hour: 0,
         timeouts: Timeouts {
@@ -1038,18 +1037,6 @@ async fn allowlist_refuses_sources_outside_it() {
     })
     .await;
     let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
-    assert_eq!(status, 201, "{body}");
-}
-
-#[tokio::test]
-async fn create_token_is_required_for_tunnel_creation() {
-    let srv = start_server_with(|c| c.create_token = Some("s3cret".into())).await;
-
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
-    assert_eq!(status, 401, "{body}");
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some("wrong"), "{}").await;
-    assert_eq!(status, 401, "{body}");
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some("s3cret"), "{}").await;
     assert_eq!(status, 201, "{body}");
 }
 

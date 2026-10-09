@@ -95,7 +95,6 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_MAX_CERTS_PER_DAY` | `7` | New certificate orders per rolling 24 hours across all tunnels. Renewals are never refused. `0` disables |
 | `OT_RATE_LIMIT_PER_HOUR` | `30` | Requests per hour from one source address to tunnel creation and certificate binding. IPv6 sources are counted per /64. `0` disables |
 | `OT_CREATE_ALLOW_CIDRS` | — (empty: any source) | Comma-separated IPv4/IPv6 addresses or CIDR ranges allowed to create tunnels and bind certificates |
-| `OT_CREATE_TOKEN` | — (unset: open) | Bearer token required on `POST /api/tunnel`. The official client does not send one |
 
 Fixed limits that are not configurable: the ClientHello and TLS handshake must
 finish within 10 s, and each request's headers must arrive within 10 s. A bridge
@@ -113,21 +112,15 @@ optional.
 1. **Source allowlist** (`OT_CREATE_ALLOW_CIDRS`): other addresses get `403`.
 2. **Rate limit** (`OT_RATE_LIMIT_PER_HOUR`): per source address, in fixed
    one-hour windows. Over the limit, the relay answers `429` with `Retry-After`.
-   Requests that then fail the token check still count.
-3. **Create token** (`OT_CREATE_TOKEN`): `POST /api/tunnel` requires
-   `Authorization: Bearer <token>`, otherwise `401`.
-4. **Tunnel cap** (`OT_MAX_TUNNELS`): only `DELETE /api/tunnel/{id}` frees a
+3. **Tunnel cap** (`OT_MAX_TUNNELS`): only `DELETE /api/tunnel/{id}` frees a
    slot. Idle tunnels are not reaped automatically.
-5. **Certificate budget** (`OT_MAX_CERTS_PER_DAY`): new orders across all
+4. **Certificate budget** (`OT_MAX_CERTS_PER_DAY`): new orders across all
    tunnels in a rolling 24 hours. Renewals always proceed. The default of 7 a
    day keeps a relay under Let's Encrypt's limit of 50 certificates per
    registered domain per week.
 
-Trade-offs to know before turning these on:
+Trade-offs to know:
 
-- The official client sends no credentials on `POST /api/tunnel`, so
-  `OT_CREATE_TOKEN` stops it from provisioning. Set the token only for clients
-  that send the header.
 - The allowlist and the rate limit use the TCP peer address. The relay does not
   read `X-Forwarded-For` or similar headers. Behind a NAT or a load balancer,
   all clients share one source address and therefore one budget.

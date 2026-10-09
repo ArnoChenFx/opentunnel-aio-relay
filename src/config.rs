@@ -72,15 +72,9 @@ pub struct Config {
     #[arg(long, env = "OT_MAX_CONNECTIONS", default_value_t = 1024)]
     pub max_connections: usize,
 
-    /// Bearer token that `POST /api/tunnel` requires in `Authorization`. Unset
-    /// leaves tunnel creation open to any source that passes the other checks,
-    /// which is how the official client expects to work.
-    #[arg(long, env = "OT_CREATE_TOKEN", hide_env_values = true)]
-    pub create_token: Option<String>,
-
     /// Source addresses allowed to create tunnels and order certificates, as
     /// comma-separated IPv4 or IPv6 addresses or CIDR ranges. Empty allows any
-    /// source. Checked before the rate limit and the create token.
+    /// source. Checked before the rate limit.
     #[arg(long, env = "OT_CREATE_ALLOW_CIDRS", default_value = "")]
     pub create_allow_cidrs: CidrList,
 
@@ -100,9 +94,6 @@ impl Config {
     pub fn normalize(&mut self) -> anyhow::Result<()> {
         self.domain = normalize_domain(&self.domain);
         anyhow::ensure!(!self.domain.is_empty(), "OT_DOMAIN is empty");
-        if self.create_token.as_deref().is_some_and(str::is_empty) {
-            self.create_token = None;
-        }
         Ok(())
     }
 }
