@@ -104,14 +104,8 @@ jobs:
     # No point republishing `latest` on the daily schedule with no new code.
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Checksums
-        run: (cd dist && sha256sum *.tar.gz > sha256sums.txt && cat sha256sums.txt)
-
+      # NOTE: checkout first! actions/checkout runs `git clean -ffdx` by
+      # default, which would wipe the downloaded artifacts below.
       # Keep the floating `latest` tag on the commit that produced it.
       - uses: actions/checkout@v5
         if: github.ref_type != 'tag'
@@ -122,6 +116,14 @@ jobs:
         run: |
           git tag -f latest ${{ github.sha }}
           git push -f origin latest
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: (cd dist && sha256sum *.tar.gz > sha256sums.txt && cat sha256sums.txt)
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
