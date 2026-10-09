@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tower::ServiceExt;
 
-use crate::bridge::{ChannelMsg, OutMsg};
+use crate::bridge::{ChannelMsg, OutMsg, VisitorChannel};
 use crate::error::{Error, Result};
 use crate::proto::{bridge as proto, names};
 use crate::sni::{parse_client_hello, Parse};
@@ -294,8 +294,13 @@ async fn serve_tunnel(
     }
     let route = names::route_for_sni(&sni, &session.hostname)
         .ok_or_else(|| Error::Internal("unknown route".into()))?;
-    let (conn, mut chan_rx, mut channel_shutdown, bridge_tx) = session
-        .open_channel_for_route(&route)
+    let VisitorChannel {
+        conn,
+        bridge_tx,
+        cancel: mut channel_shutdown,
+        mut inbound,
+    } = session
+        .open_channel_for_route(&route, state.config.stream_buffer_bytes)
         .await
         .ok_or_else(|| Error::Internal("no bridge for route".into()))?;
     tracing::debug!(tunnel = %session.id, %route, %conn, %peer, "proxying connection");
@@ -346,13 +351,13 @@ async fn serve_tunnel(
 
     // Bridge -> public socket. A cancel drops this future through the select
     // below, so a write blocked on a slow visitor is abandoned as well.
+    let stall = state.config.timeouts.bridge_stall;
     let activity_down = activity.clone();
     let pump_down = async move {
         loop {
-            match chan_rx.recv().await {
+            match inbound.recv().await {
                 Some(ChannelMsg::Data(data)) => {
-                    writer.write_all(&data).await?;
-                    activity_down.touch();
+                    write_within_stall(&mut writer, &data, stall, &activity_down).await?;
                 }
                 Some(ChannelMsg::End) => {
                     writer.shutdown().await?;
@@ -380,12 +385,16 @@ async fn serve_tunnel(
         if cancelled_by_bridge {
             tracing::debug!(%conn, error = %error, "proxy connection cancelled");
         } else {
-            tracing::debug!(%conn, error = %error, "proxy connection terminated");
+            let code = if error.is::<VisitorStalled>() {
+                proto::codes::BACKPRESSURE
+            } else {
+                "connection_terminated"
+            };
+            tracing::debug!(%conn, error = %error, code, "proxy connection terminated");
             let reset = serde_json::to_string(&proto::ServerMessage::Reset {
                 conn,
-                code: "connection_terminated".into(),
+                code: code.into(),
             })?;
-            let stall = state.config.timeouts.bridge_stall;
             if tokio::time::timeout(stall, bridge_tx.send(OutMsg::Text(reset)))
                 .await
                 .is_err()
@@ -429,6 +438,37 @@ impl Activity {
             tokio::time::sleep(limit - quiet_for).await;
         }
     }
+}
+
+/// A visitor accepted no bytes for the whole stall budget while data was waiting.
+#[derive(Debug, thiserror::Error)]
+#[error("visitor accepted no bytes for {0:?}")]
+struct VisitorStalled(Duration);
+
+/// Writes all of `data` to a visitor. The stall budget applies to each write
+/// call, so every partial write restarts it: a slow but steady visitor is
+/// never reset here.
+async fn write_within_stall<W>(
+    writer: &mut W,
+    mut data: &[u8],
+    stall: Duration,
+    activity: &Activity,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while !data.is_empty() {
+        let written = match tokio::time::timeout(stall, writer.write(data)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(VisitorStalled(stall).into()),
+        };
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+        }
+        activity.touch();
+        data = &data[written..];
+    }
+    Ok(())
 }
 
 /// Resolves with the reason once the bridge cancels this connection.
@@ -540,6 +580,42 @@ mod tests {
         }
         assert_eq!(&seen[..4], &[10, 20, 40, 80]);
         assert_eq!(*seen.last().unwrap(), 1000);
+    }
+
+    #[tokio::test]
+    async fn slow_but_steady_visitor_is_not_reset() {
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        let drain = tokio::spawn(async move {
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 8];
+            while received.len() < 80 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let n = reader.read(&mut chunk).await.unwrap();
+                received.extend_from_slice(&chunk[..n]);
+            }
+            received
+        });
+
+        let data: Vec<u8> = (0..80).collect();
+        let activity = Activity::new();
+        write_within_stall(&mut writer, &data, Duration::from_millis(200), &activity)
+            .await
+            .unwrap();
+        assert_eq!(drain.await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn visitor_that_accepts_nothing_is_reported_as_stalled() {
+        let (mut writer, _reader) = tokio::io::duplex(8);
+        let error = write_within_stall(
+            &mut writer,
+            &[1u8; 64],
+            Duration::from_millis(100),
+            &Activity::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<VisitorStalled>(), "got: {error}");
     }
 
     struct StallClientReads(TcpStream);

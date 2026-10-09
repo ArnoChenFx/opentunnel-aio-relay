@@ -72,6 +72,13 @@ pub struct Config {
     #[arg(long, env = "OT_MAX_CONNECTIONS", default_value_t = 1024)]
     pub max_connections: usize,
 
+    /// Bytes the relay will hold for one visitor that is not reading. A visitor
+    /// that falls further behind is reset with `backpressure`; other connections
+    /// are unaffected. Worst-case memory is this value times the number of open
+    /// connections, so size it with OT_MAX_CONNECTIONS.
+    #[arg(long, env = "OT_STREAM_BUFFER_BYTES", default_value_t = 2 * 1024 * 1024)]
+    pub stream_buffer_bytes: usize,
+
     /// Source addresses allowed to create tunnels and order certificates, as
     /// comma-separated IPv4 or IPv6 addresses or CIDR ranges. Empty allows any
     /// source. Checked before the rate limit.
@@ -94,9 +101,16 @@ impl Config {
     pub fn normalize(&mut self) -> anyhow::Result<()> {
         self.domain = normalize_domain(&self.domain);
         anyhow::ensure!(!self.domain.is_empty(), "OT_DOMAIN is empty");
+        anyhow::ensure!(
+            self.stream_buffer_bytes >= MIN_STREAM_BUFFER_BYTES,
+            "OT_STREAM_BUFFER_BYTES must be at least {MIN_STREAM_BUFFER_BYTES}"
+        );
         Ok(())
     }
 }
+
+/// Two full-size frames: enough for one in flight and one waiting.
+const MIN_STREAM_BUFFER_BYTES: usize = 2 * crate::proto::bridge::MAX_PAYLOAD_SIZE;
 
 /// Lowercases a domain and strips surrounding whitespace and trailing dots,
 /// so `Tunnel.Example.COM.` and `tunnel.example.com` name the same zone.
@@ -110,10 +124,9 @@ pub struct Timeouts {
     /// Time a client gets to send its ClientHello, finish the TLS handshake, and
     /// send the headers of each API request.
     pub client_hello: Duration,
-    /// How long a full per-connection queue may block the bridge reader before
-    /// that one connection is reset. The official client uses the same policy
-    /// with a 30 s budget; this relay uses a shorter one because the reader is
-    /// shared, so every other stream on the bridge waits while it blocks.
+    /// How long a visitor may accept no bytes while relayed data waits for it
+    /// before that one connection is reset. The bridge reader never waits on a
+    /// visitor, so this only bounds how long a stalled connection holds its buffer.
     pub bridge_stall: Duration,
     /// Upper bound for one ACME order, including DNS propagation. A timed-out
     /// order is marked failed and its TXT records are removed. An issuance

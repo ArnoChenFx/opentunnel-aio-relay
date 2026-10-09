@@ -42,6 +42,7 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         max_tunnels: 0,
         max_certs_per_day: 0,
         max_connections: 1024,
+        stream_buffer_bytes: 2 * 1024 * 1024,
         create_allow_cidrs: CidrList::default(),
         rate_limit_per_hour: 0,
         timeouts: Timeouts {
@@ -735,19 +736,114 @@ async fn expect_reset<S>(
     }
 }
 
+/// A control message as a WebSocket text frame.
+fn control_message(value: serde_json::Value) -> tokio_tungstenite::tungstenite::Message {
+    tokio_tungstenite::tungstenite::Message::Text(value.to_string().into())
+}
+
+/// Reads bridge messages until a pong echoing `time_sent` and a reset of
+/// `conn` with `code` have both arrived, in either order.
+async fn await_pong_and_reset<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    time_sent: u64,
+    conn: u32,
+    code: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use futures_util::StreamExt;
+    let (mut pong, mut reset) = (false, false);
+    while !(pong && reset) {
+        let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("bridge sent neither the heartbeat reply nor the reset in time")
+            .expect("bridge closed")
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+            continue;
+        };
+        let control: serde_json::Value = serde_json::from_str(&text).unwrap();
+        match control["type"].as_str() {
+            Some("pong") if control["time_sent"].as_u64() == Some(time_sent) => pong = true,
+            Some("reset") if control["conn"].as_u64() == Some(conn as u64) => {
+                assert_eq!(control["code"], code);
+                reset = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Floods one visitor that never reads, then checks that the bridge still
+/// answers heartbeats and carries another visitor's traffic in both directions.
 #[tokio::test]
-async fn stalled_visitor_is_reset_while_other_streams_keep_flowing() {
+async fn stalled_visitor_does_not_hold_up_heartbeats_or_other_streams() {
     use futures_util::SinkExt;
     use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
 
-    let srv = start_server().await;
+    // The production stall budget. A reader blocked on the stalled visitor
+    // would hold the heartbeat for all of it, far past the deadline below.
+    let srv = start_server_with(|c| {
+        c.timeouts.bridge_stall = Duration::from_secs(10);
+        c.stream_buffer_bytes = 1 << 20;
+    })
+    .await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (_stalled, stalled_conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
+    let (mut healthy, healthy_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    // 16 MiB at a visitor that never reads: far beyond its buffer and the kernel's.
+    // Timing starts before the flood, because a blocked bridge also stalls the
+    // sends below rather than the heartbeat alone.
+    let flooded = std::time::Instant::now();
+    let frame = encode_data_frame(stalled_conn, &vec![0xEE; MAX_PAYLOAD_SIZE]);
+    for _ in 0..512 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            frame.clone().into(),
+        ))
+        .await
+        .unwrap();
+    }
+    ws.send(control_message(
+        serde_json::json!({"type": "ping", "time_sent": 7}),
+    ))
+    .await
+    .unwrap();
+    await_pong_and_reset(&mut ws, 7, stalled_conn, "backpressure").await;
+    assert!(
+        flooded.elapsed() < Duration::from_secs(5),
+        "bridge answered the heartbeat after {:?}",
+        flooded.elapsed()
+    );
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        encode_data_frame(healthy_conn, b"to visitor").into(),
+    ))
+    .await
+    .unwrap();
+    let mut received = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(3), healthy.read_exact(&mut received))
+        .await
+        .expect("other stream stopped flowing")
+        .unwrap();
+    assert_eq!(&received, b"to visitor");
+
+    healthy.write_all(b"from visitor").await.unwrap();
+    expect_data(&mut ws, healthy_conn, b"from visitor").await;
+}
+
+/// The cap is larger than the flood, so only the stall budget can reset the visitor.
+#[tokio::test]
+async fn visitor_that_stops_reading_is_reset_once_its_stall_budget_expires() {
+    use futures_util::SinkExt;
+    use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
+
+    let srv = start_server_with(|c| c.stream_buffer_bytes = 64 << 20).await;
     let (id, mut ws) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut stalled, stalled_conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
-    let (mut healthy, healthy_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
 
-    // Far more than the connection queue and kernel buffers can absorb, so the
-    // bridge must give up on this visitor. The socket is never read from.
     let frame = encode_data_frame(stalled_conn, &vec![0xEE; MAX_PAYLOAD_SIZE]);
     for _ in 0..512 {
         ws.send(tokio_tungstenite::tungstenite::Message::Binary(
@@ -758,39 +854,63 @@ async fn stalled_visitor_is_reset_while_other_streams_keep_flowing() {
     }
     expect_reset(&mut ws, stalled_conn, "backpressure").await;
 
-    // The stalled visitor is closed, either by EOF or by a reset error.
     let mut drained = Vec::new();
     let closed =
         tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut drained)).await;
     assert!(closed.is_ok(), "stalled visitor socket was not closed");
-
-    let request = b"after the reset";
-    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
-        encode_data_frame(healthy_conn, request).into(),
-    ))
-    .await
-    .unwrap();
-    let mut received = vec![0u8; request.len()];
-    tokio::time::timeout(Duration::from_secs(5), healthy.read_exact(&mut received))
-        .await
-        .expect("healthy connection stalled after the reset")
-        .unwrap();
-    assert_eq!(received, request);
 }
 
+/// With a stall budget far longer than the test, a reset can only come from
+/// the buffer overflowing, and it must arrive without waiting for the budget.
 #[tokio::test]
-async fn full_queue_delivers_every_frame_and_end_in_order() {
+async fn overflowing_visitor_is_reset_without_waiting_for_the_stall_budget() {
     use futures_util::SinkExt;
     use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
 
-    let srv = start_server().await;
+    let srv = start_server_with(|c| {
+        c.timeouts.bridge_stall = Duration::from_secs(60);
+        c.stream_buffer_bytes = 1 << 20;
+    })
+    .await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut stalled, stalled_conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
+
+    let flooded = std::time::Instant::now();
+    let frame = encode_data_frame(stalled_conn, &vec![0xEE; MAX_PAYLOAD_SIZE]);
+    for _ in 0..512 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            frame.clone().into(),
+        ))
+        .await
+        .unwrap();
+    }
+    expect_reset(&mut ws, stalled_conn, "backpressure").await;
+    assert!(
+        flooded.elapsed() < Duration::from_secs(5),
+        "overflow reset arrived after {:?}",
+        flooded.elapsed()
+    );
+
+    let mut drained = Vec::new();
+    let closed =
+        tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut drained)).await;
+    assert!(closed.is_ok(), "overflowed visitor socket was not closed");
+}
+
+#[tokio::test]
+async fn queued_frames_arrive_in_order_and_end_follows_them() {
+    use futures_util::SinkExt;
+    use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
+
+    let srv = start_server_with(|c| c.stream_buffer_bytes = 64 << 20).await;
     let (id, mut ws) = attached_bridge(&srv).await;
     let sni = format!("{id}.{DOMAIN}");
     let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
 
-    // The visitor waits before reading, so the connection queue fills and the
-    // End frame must wait behind it. Nothing may be dropped, and the stall
-    // budget must not expire. Each frame carries its index to catch reordering.
+    // The visitor waits before reading, so frames queue up and the End frame
+    // must wait behind them. Nothing may be dropped, and the stall budget must
+    // not expire. Each frame carries its index to catch reordering.
     let frames: Vec<Vec<u8>> = (0..600u32)
         .map(|i| {
             let mut payload = vec![0xAB; MAX_PAYLOAD_SIZE];

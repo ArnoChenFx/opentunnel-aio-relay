@@ -7,10 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -27,9 +26,15 @@ use crate::state::{now_rfc3339, AppState};
 
 const MAX_INBOUND_WS_BINARY_SIZE: usize = bridge::CONN_ID_SIZE + bridge::MAX_PAYLOAD_SIZE;
 
-/// Queued messages per proxied connection, matching the official client's
-/// inbound queue. A visitor that falls this far behind is reset.
-const CHANNEL_QUEUE: usize = 64;
+/// Bookkeeping charged against a visitor's buffer for each queued frame, on top
+/// of its payload. Without it, a flood of one-byte frames could hold far more
+/// memory than the byte budget suggests.
+const QUEUE_ENTRY_OVERHEAD: usize = 128;
+
+/// What one queued frame of `len` payload bytes costs against the budget.
+fn queue_cost(len: usize) -> usize {
+    len + QUEUE_ENTRY_OVERHEAD
+}
 
 /// Outgoing frames queued for one bridge WebSocket.
 #[derive(Debug)]
@@ -53,6 +58,41 @@ pub struct BridgeHandle {
     pub tx: mpsc::Sender<OutMsg>,
 }
 
+/// Result of queueing one inbound data frame for a visitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enqueue {
+    Accepted,
+    /// The visitor's buffer would have overflowed. The connection has been
+    /// removed and cancelled with `backpressure`; the client must be told.
+    Overflowed,
+}
+
+/// The relay's side of one proxied connection, handed to its ingress task.
+pub struct VisitorChannel {
+    pub conn: ConnId,
+    pub bridge_tx: mpsc::Sender<OutMsg>,
+    pub cancel: watch::Receiver<Option<String>>,
+    pub inbound: ChannelInbound,
+}
+
+/// Inbound queue of one visitor. The bridge reader only pushes onto it and
+/// never waits for it; the task writing to the visitor pops from it.
+pub struct ChannelInbound {
+    rx: mpsc::UnboundedReceiver<ChannelMsg>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl ChannelInbound {
+    pub async fn recv(&mut self) -> Option<ChannelMsg> {
+        let msg = self.rx.recv().await?;
+        if let ChannelMsg::Data(data) = &msg {
+            self.queued
+                .fetch_sub(queue_cost(data.len()), Ordering::SeqCst);
+        }
+        Some(msg)
+    }
+}
+
 pub struct Session {
     pub id: String,
     pub hostname: String,
@@ -67,7 +107,13 @@ pub struct Session {
 
 struct ChannelHandle {
     bridge_id: String,
-    tx: mpsc::Sender<ChannelMsg>,
+    tx: mpsc::UnboundedSender<ChannelMsg>,
+    /// Queue cost (see `queue_cost`) of frames not yet taken by the visitor's writer.
+    queued: Arc<AtomicUsize>,
+    /// Most queue cost that may be outstanding before the connection is reset.
+    budget: usize,
+    /// Set once the client has ended its side. Later data is discarded.
+    ended: bool,
     cancel: watch::Sender<Option<String>>,
 }
 
@@ -170,7 +216,6 @@ pub async fn run_bridge(state: Arc<AppState>, tunnel_id: String, mut socket: Web
 }
 
 async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSocket) -> Result<()> {
-    let stall = state.config.timeouts.bridge_stall;
     // The client must send `attach` within 10 seconds (protocol spec).
     let first = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
         .await
@@ -339,7 +384,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                 match msg {
                     Message::Text(text) => {
                         if let Some(control) = parse_client_message(&text) {
-                            if let Some(reply) = handle_control(&session, &bridge_id, control, stall).await {
+                            if let Some(reply) = handle_control(&session, &bridge_id, control).await {
                                 if send_text(socket, &reply).await.is_err() {
                                     break;
                                 }
@@ -352,20 +397,14 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                             break;
                         }
                         if let Some((conn, payload)) = decode_data_frame(&data) {
-                            if let Some(tx) = channel_sender_for_bridge(&session, &bridge_id, conn).await {
-                                let queued = tx.send(ChannelMsg::Data(payload.to_vec()));
-                                if tokio::time::timeout(stall, queued).await.is_err() {
-                                    // The visitor stopped reading for the whole stall
-                                    // budget. Abort this connection only, and tell the
-                                    // client at once so it stops forwarding to it.
-                                    session.abort_channel(&bridge_id, conn, bridge::codes::BACKPRESSURE).await;
-                                    let reset = ServerMessage::Reset {
-                                        conn,
-                                        code: bridge::codes::BACKPRESSURE.into(),
-                                    };
-                                    if send_text(socket, &reset).await.is_err() {
-                                        break;
-                                    }
+                            if session.enqueue_data(&bridge_id, conn, payload).await == Enqueue::Overflowed {
+                                tracing::debug!(tunnel = %tunnel_id, bridge = %bridge_id, conn, "visitor buffer full; resetting connection");
+                                let reset = ServerMessage::Reset {
+                                    conn,
+                                    code: bridge::codes::BACKPRESSURE.into(),
+                                };
+                                if send_text(socket, &reset).await.is_err() {
+                                    break;
                                 }
                             }
                         }
@@ -442,27 +481,13 @@ async fn handle_control(
     session: &Arc<Session>,
     bridge_id: &str,
     control: ClientMessage,
-    stall: Duration,
 ) -> Option<ServerMessage> {
     match control {
         ClientMessage::Ping { time_sent } => Some(ServerMessage::Pong { time_sent }),
         ClientMessage::Pong { .. } => None,
         ClientMessage::End { conn } => {
-            let tx = channel_sender_for_bridge(session, bridge_id, conn).await?;
-            // End ends the visitor's read side and must not be dropped. If the
-            // queue stays full past the stall budget, reset the connection instead.
-            match tokio::time::timeout(stall, tx.send(ChannelMsg::End)).await {
-                Ok(_) => None,
-                Err(_) => {
-                    session
-                        .abort_channel(bridge_id, conn, bridge::codes::BACKPRESSURE)
-                        .await;
-                    Some(ServerMessage::Reset {
-                        conn,
-                        code: bridge::codes::BACKPRESSURE.into(),
-                    })
-                }
-            }
+            session.enqueue_end(bridge_id, conn).await;
+            None
         }
         ClientMessage::Reset { conn, code } => {
             session.abort_channel(bridge_id, conn, &code).await;
@@ -470,20 +495,6 @@ async fn handle_control(
         }
         ClientMessage::Attach { .. } => None,
     }
-}
-
-async fn channel_sender_for_bridge(
-    session: &Session,
-    bridge_id: &str,
-    conn: ConnId,
-) -> Option<mpsc::Sender<ChannelMsg>> {
-    session
-        .channels
-        .lock()
-        .await
-        .get(&conn)
-        .filter(|channel| channel.bridge_id == bridge_id)
-        .map(|channel| channel.tx.clone())
 }
 
 /// Lenient decode: unknown message types are ignored per the protocol spec.
@@ -524,16 +535,14 @@ impl Session {
 
     /// Atomically resolves a route and registers its channel. Bridge removal
     /// uses the same lock order, so it either sees this channel and cancels it
-    /// or the route lookup fails after the bridge is gone.
+    /// or the route lookup fails after the bridge is gone. `budget` is how much
+    /// queued inbound data (see `queue_cost`) may wait for the visitor before it
+    /// is reset.
     pub async fn open_channel_for_route(
         &self,
         route: &str,
-    ) -> Option<(
-        ConnId,
-        mpsc::Receiver<ChannelMsg>,
-        watch::Receiver<Option<String>>,
-        mpsc::Sender<OutMsg>,
-    )> {
+        budget: usize,
+    ) -> Option<VisitorChannel> {
         let _bridges = self.bridges.lock().await;
         if self.is_closed() {
             return None;
@@ -548,25 +557,67 @@ impl Session {
         while conn == 0 || channels.contains_key(&conn) {
             conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
         }
-        let (tx, rx) = mpsc::channel::<ChannelMsg>(CHANNEL_QUEUE);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(0));
         let (cancel, cancel_rx) = watch::channel(None);
         channels.insert(
             conn,
             ChannelHandle {
-                bridge_id: bridge_id.clone(),
+                bridge_id,
                 tx,
+                queued: queued.clone(),
+                budget,
+                ended: false,
                 cancel,
             },
         );
-        Some((conn, rx, cancel_rx, bridge_tx))
+        Some(VisitorChannel {
+            conn,
+            bridge_tx,
+            cancel: cancel_rx,
+            inbound: ChannelInbound { rx, queued },
+        })
     }
 
-    pub async fn channel_sender(&self, conn: ConnId) -> Option<mpsc::Sender<ChannelMsg>> {
-        self.channels
-            .lock()
-            .await
-            .get(&conn)
-            .map(|channel| channel.tx.clone())
+    /// Queues inbound data for a visitor without waiting for it to read. A
+    /// frame that would take the queue past the connection's budget resets that
+    /// connection alone. Frames for unknown or ended connections are dropped.
+    pub async fn enqueue_data(&self, bridge_id: &str, conn: ConnId, payload: &[u8]) -> Enqueue {
+        let mut channels = self.channels.lock().await;
+        let Some(channel) = channels.get_mut(&conn).filter(|c| c.bridge_id == bridge_id) else {
+            return Enqueue::Accepted;
+        };
+        if channel.ended || payload.is_empty() {
+            return Enqueue::Accepted;
+        }
+        let cost = queue_cost(payload.len());
+        if channel.queued.load(Ordering::SeqCst) + cost > channel.budget {
+            let removed = channels.remove(&conn);
+            drop(channels);
+            if let Some(removed) = removed {
+                cancel_channel(removed, bridge::codes::BACKPRESSURE);
+            }
+            return Enqueue::Overflowed;
+        }
+        channel.queued.fetch_add(cost, Ordering::SeqCst);
+        if channel.tx.send(ChannelMsg::Data(payload.to_vec())).is_err() {
+            channel.queued.fetch_sub(cost, Ordering::SeqCst);
+        }
+        Enqueue::Accepted
+    }
+
+    /// Queues the client's end-of-stream behind any data already queued, so it
+    /// cannot overtake it. It adds no bytes to the budget and is never dropped.
+    pub async fn enqueue_end(&self, bridge_id: &str, conn: ConnId) {
+        let mut channels = self.channels.lock().await;
+        let Some(channel) = channels
+            .get_mut(&conn)
+            .filter(|c| c.bridge_id == bridge_id && !c.ended)
+        else {
+            return;
+        };
+        channel.ended = true;
+        let _ = channel.tx.send(ChannelMsg::End);
     }
 
     pub async fn close_channel(&self, conn: ConnId) {
@@ -648,6 +699,30 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_BUDGET: usize = 1 << 20;
+
+    /// A channel whose byte budget is already spent, so any further data overflows.
+    fn full_channel(
+        bridge_id: &str,
+    ) -> (
+        ChannelHandle,
+        watch::Receiver<Option<String>>,
+        ChannelInbound,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(TEST_BUDGET));
+        let (cancel, cancel_rx) = watch::channel(None);
+        let handle = ChannelHandle {
+            bridge_id: bridge_id.into(),
+            tx,
+            queued: queued.clone(),
+            budget: TEST_BUDGET,
+            ended: false,
+            cancel,
+        };
+        (handle, cancel_rx, ChannelInbound { rx, queued })
+    }
 
     fn test_session(id: &str) -> Arc<Session> {
         let (shutdown, _) = watch::channel(false);
@@ -732,12 +807,15 @@ mod tests {
             .unwrap());
 
         let (opened, ()) = tokio::join!(
-            session.open_channel_for_route("@"),
+            session.open_channel_for_route("@", TEST_BUDGET),
             detach_bridge(&db, &session, "only"),
         );
         drop(opened);
         assert!(session.channels.lock().await.is_empty());
-        assert!(session.open_channel_for_route("@").await.is_none());
+        assert!(session
+            .open_channel_for_route("@", TEST_BUDGET)
+            .await
+            .is_none());
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -745,21 +823,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnel_shutdown_does_not_wait_for_a_full_channel_queue() {
+    async fn tunnel_shutdown_does_not_wait_for_a_full_visitor_buffer() {
         let session = test_session("test");
-        let (tx, _rx) = mpsc::channel(256);
-        for _ in 0..256 {
-            tx.try_send(ChannelMsg::Data(vec![1])).unwrap();
-        }
-        let (cancel, mut cancel_rx) = watch::channel(None);
-        session.channels.lock().await.insert(
-            1,
-            ChannelHandle {
-                bridge_id: "bridge".into(),
-                tx,
-                cancel,
-            },
-        );
+        let (handle, mut cancel_rx, _inbound) = full_channel("bridge");
+        session.channels.lock().await.insert(1, handle);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -775,25 +842,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridge_detach_does_not_wait_for_a_full_channel_queue() {
+    async fn bridge_detach_does_not_wait_for_a_full_visitor_buffer() {
         let (db, path) = test_db().await;
         let session = test_session("test");
         assert!(register_bridge(&db, &session, bridge("bridge", "@"))
             .await
             .unwrap());
-        let (tx, _rx) = mpsc::channel(256);
-        for _ in 0..256 {
-            tx.try_send(ChannelMsg::Data(vec![1])).unwrap();
-        }
-        let (cancel, mut cancel_rx) = watch::channel(None);
-        session.channels.lock().await.insert(
-            1,
-            ChannelHandle {
-                bridge_id: "bridge".into(),
-                tx,
-                cancel,
-            },
-        );
+        let (handle, mut cancel_rx, _inbound) = full_channel("bridge");
+        session.channels.lock().await.insert(1, handle);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -814,5 +870,144 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn overflow_resets_only_the_connection_that_overflowed() {
+        let budget = queue_cost(60) + 1;
+        let session = test_session("test");
+        session.bridges.lock().await.push(bridge("bridge", "@"));
+        let mut slow = session.open_channel_for_route("@", budget).await.unwrap();
+        let mut other = session.open_channel_for_route("@", budget).await.unwrap();
+
+        assert_eq!(
+            session.enqueue_data("bridge", slow.conn, &[1; 60]).await,
+            Enqueue::Accepted
+        );
+        assert_eq!(
+            session.enqueue_data("bridge", slow.conn, &[2; 60]).await,
+            Enqueue::Overflowed
+        );
+        assert_eq!(
+            slow.cancel.borrow_and_update().as_deref(),
+            Some(bridge::codes::BACKPRESSURE)
+        );
+        assert!(!session.channels.lock().await.contains_key(&slow.conn));
+        assert_eq!(
+            session.enqueue_data("bridge", slow.conn, &[3]).await,
+            Enqueue::Accepted
+        );
+
+        assert_eq!(
+            session.enqueue_data("bridge", other.conn, &[4; 60]).await,
+            Enqueue::Accepted
+        );
+        match other.inbound.recv().await {
+            Some(ChannelMsg::Data(data)) => assert_eq!(data, vec![4; 60]),
+            message => panic!("expected data, got {message:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn end_is_delivered_after_queued_data_even_when_the_budget_is_spent() {
+        let session = test_session("test");
+        session.bridges.lock().await.push(bridge("bridge", "@"));
+        let mut visitor = session
+            .open_channel_for_route("@", queue_cost(10))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.enqueue_data("bridge", visitor.conn, &[9; 10]).await,
+            Enqueue::Accepted
+        );
+        session.enqueue_end("bridge", visitor.conn).await;
+        assert_eq!(
+            session.enqueue_data("bridge", visitor.conn, &[7]).await,
+            Enqueue::Accepted
+        );
+
+        match visitor.inbound.recv().await {
+            Some(ChannelMsg::Data(data)) => assert_eq!(data, vec![9; 10]),
+            message => panic!("expected data first, got {message:?}"),
+        }
+        assert!(matches!(
+            visitor.inbound.recv().await,
+            Some(ChannelMsg::End)
+        ));
+        let queued = session
+            .channels
+            .lock()
+            .await
+            .get(&visitor.conn)
+            .unwrap()
+            .queued
+            .load(Ordering::SeqCst);
+        assert_eq!(queued, 0, "data after the client's End must be discarded");
+    }
+
+    #[tokio::test]
+    async fn bytes_taken_by_the_visitor_free_the_budget() {
+        let session = test_session("test");
+        session.bridges.lock().await.push(bridge("bridge", "@"));
+        let mut visitor = session
+            .open_channel_for_route("@", queue_cost(64))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.enqueue_data("bridge", visitor.conn, &[1; 64]).await,
+            Enqueue::Accepted
+        );
+        assert!(visitor.inbound.recv().await.is_some());
+        assert_eq!(
+            session.enqueue_data("bridge", visitor.conn, &[2; 64]).await,
+            Enqueue::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_frames_cannot_exceed_the_budget_through_bookkeeping() {
+        let session = test_session("test");
+        session.bridges.lock().await.push(bridge("bridge", "@"));
+        let mut visitor = session
+            .open_channel_for_route("@", 4 * queue_cost(1))
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            assert_eq!(
+                session.enqueue_data("bridge", visitor.conn, &[1]).await,
+                Enqueue::Accepted
+            );
+        }
+        assert_eq!(
+            session.enqueue_data("bridge", visitor.conn, &[1]).await,
+            Enqueue::Overflowed
+        );
+        assert_eq!(
+            visitor.cancel.borrow_and_update().as_deref(),
+            Some(bridge::codes::BACKPRESSURE)
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_from_another_bridge_never_touch_a_channel() {
+        let session = test_session("test");
+        session.bridges.lock().await.push(bridge("owner", "@"));
+        let visitor = session
+            .open_channel_for_route("@", queue_cost(100))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session
+                .enqueue_data("intruder", visitor.conn, &[1; 200])
+                .await,
+            Enqueue::Accepted
+        );
+        let channels = session.channels.lock().await;
+        let channel = channels.get(&visitor.conn).expect("channel survives");
+        assert_eq!(channel.queued.load(Ordering::SeqCst), 0);
     }
 }

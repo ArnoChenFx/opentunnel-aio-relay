@@ -91,16 +91,33 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
 | `OT_ACME_EMAIL` | `acme@localhost` | ACME account contact |
 | `OT_MAX_CONNECTIONS` | `1024` | Connections open at once on the listener (API, bridge, and visitor sockets). Extra connections are refused at accept. `0` disables |
+| `OT_STREAM_BUFFER_BYTES` | `2097152` (2 MiB) | Data held for one visitor that has not read it yet. A visitor that falls further behind is reset with `backpressure`. Minimum `65536` |
 | `OT_MAX_TUNNELS` | `1000` | Live tunnels (not deleted). Creating one past the cap returns `503`. `0` disables |
 | `OT_MAX_CERTS_PER_DAY` | `7` | New certificate orders per rolling 24 hours across all tunnels. Renewals are never refused. `0` disables |
 | `OT_RATE_LIMIT_PER_HOUR` | `30` | Requests per hour from one source address to tunnel creation and certificate binding. IPv6 sources are counted per /64. `0` disables |
 | `OT_CREATE_ALLOW_CIDRS` | — (empty: any source) | Comma-separated IPv4/IPv6 addresses or CIDR ranges allowed to create tunnels and bind certificates |
 
 Fixed limits that are not configurable: the ClientHello and TLS handshake must
-finish within 10 s, and each request's headers must arrive within 10 s. A bridge
-queue that stays full for 10 s resets only that stream. A forwarded stream with
-no traffic for 5 min is closed. An ACME order may run for 10 min. Calls to ACME
-and Cloudflare time out after 10 s to connect and 30 s in total.
+finish within 10 s, and each request's headers must arrive within 10 s. A
+visitor that accepts no data for 10 s while relayed data waits for it is reset
+alone, with `backpressure`. A forwarded stream with no traffic for 5 min is
+closed. An ACME order may run for 10 min. Calls to ACME and Cloudflare time out
+after 10 s to connect and 30 s in total.
+
+### Buffering for slow visitors
+
+Each forwarded connection has its own buffer for data its visitor has not read
+yet. The bridge reader never waits for a visitor, so a visitor that stops
+reading cannot delay other connections or the bridge's heartbeats. A connection
+whose buffer overflows is reset at once with `backpressure`, and the client is
+told in the same step.
+
+The protocol has no per-stream flow control, so the relay cannot pause one
+connection without pausing all of them. A visitor that reads more slowly than
+the bridge sends, for longer than its buffer holds, is reset. Raise
+`OT_STREAM_BUFFER_BYTES` for bulk transfers to slow clients. Memory use can
+reach that value for each open connection, so keep the product within the
+relay's RAM.
 
 ## Abuse controls
 
