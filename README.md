@@ -49,8 +49,12 @@ tunnel.example.com      A    203.0.113.10
 
 ### 2. Credentials
 
-- **Cloudflare API token** with DNS-edit access to the zone (for ACME DNS-01).
-  Certificates come from **Let's Encrypt** by default — no extra account needed.
+- **DNS credentials for ACME DNS-01**, either:
+  - a **Cloudflare API token** with DNS-edit access to the zone (the default), or
+  - an **Alibaba Cloud RAM AccessKey** with the Alidns permissions listed in
+    [README-zh.md](README-zh.md#阿里云-dns) (in Chinese).
+
+Certificates come from **Let's Encrypt** by default — no extra account needed.
 
 ### 3. Run
 
@@ -67,6 +71,10 @@ export OT_CF_ZONE_ID=your-zone-id
 
 On first start it issues a TLS certificate for `tunnel.example.com` via ACME
 DNS-01 and stores it in `./data/` next to `relay.db`. No manual cert handling.
+
+To use Alibaba Cloud DNS instead of Cloudflare, set `OT_ALIYUN_ACCESS_KEY_ID` and
+`OT_ALIYUN_ACCESS_KEY_SECRET` in place of the `OT_CF_*` variables. The
+[Chinese README](README-zh.md#阿里云-dns) covers the RAM policy and the full setup.
 
 ### 4. Use it
 
@@ -88,7 +96,11 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_DOMAIN` | — (required) | Public domain, e.g. `tunnel.example.com` |
 | `OT_LISTEN` | `0.0.0.0:443` | TCP listen address |
 | `OT_DATA_DIR` | `./data` | SQLite db + API certificate storage |
-| `OT_CF_TOKEN` / `OT_CF_ZONE_ID` | — (required) | Cloudflare DNS for ACME challenges |
+| `OT_DNS_PROVIDER` | auto | `cloudflare` or `aliyun`. Auto picks `aliyun` when only Alibaba Cloud credentials are set, and `cloudflare` otherwise |
+| `OT_CF_TOKEN` / `OT_CF_ZONE_ID` | — (required for Cloudflare) | Cloudflare DNS for ACME challenges |
+| `OT_ALIYUN_ACCESS_KEY_ID` / `OT_ALIYUN_ACCESS_KEY_SECRET` | — (required for Alibaba Cloud) | RAM AccessKey for Alibaba Cloud DNS, used for ACME challenges |
+| `OT_ALIYUN_DOMAIN` | — (auto) | Registered domain in Alibaba Cloud DNS that contains `OT_DOMAIN`. Looked up when unset |
+| `OT_ALIYUN_ENDPOINT` | `alidns.aliyuncs.com` | Alibaba Cloud DNS API host |
 | `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | — (empty) | Only for CAs that require EAB (e.g. ZeroSSL) |
 | `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
 | `OT_ACME_EMAIL` | `acme@localhost` | ACME account contact |
@@ -110,8 +122,8 @@ this check stops, and `OT_STREAM_IDLE_SECS` governs quiet streams. A visitor tha
 accepts no data for 10 s
 while relayed data waits for it is reset alone, with `backpressure`. Every API
 response except the bridge's WebSocket upgrade carries `Connection: close`. An
-ACME order may run for 10 min. Calls to ACME and Cloudflare time out after 10 s
-to connect and 30 s in total.
+ACME order may run for 10 min. Calls to ACME and the DNS API (Cloudflare or
+Alibaba Cloud) time out after 10 s to connect and 30 s in total.
 
 ### Buffering for slow visitors
 
@@ -216,8 +228,8 @@ relay also restricts the SQLite database and API private key to mode 600.
   serving its current certificate until it expires. Failed attempts are retried
   with exponential backoff: 1 h, 2 h, 4 h, 8 h, then every 12 h.
 - **Time limit per order**: an ACME order must finish within 10 minutes,
-  including DNS propagation. Its DNS TXT records are removed on failure. Orders
-  interrupted by a restart are requeued at startup.
+  including DNS propagation. Its DNS TXT records are removed when the order
+  ends. Orders interrupted by a restart are requeued at startup.
 - **API certificate**: issued at first startup and reused afterwards, as long
   as it is still valid and covers `OT_DOMAIN`. It is renewed in the background
   before expiry, and new TLS handshakes use the renewed certificate. If renewal
