@@ -159,16 +159,28 @@ cargo test
   including half-close response delivery, multiple-bridge isolation, and
   immediate connection shutdown after tunnel deletion.
 - Unit tests: ClientHello parser, CSR validation (incl. tampered signatures).
+- `.github/scripts/test-fetch-official-client.sh` — offline checks for the CI
+  download script: a verified digest succeeds, while a mismatched or missing
+  digest fails closed without extracting anything.
 
 ### End-to-end with the official client (CI)
 
-The `integration` job downloads the official `opentunnel` CLI release binary
-(tracks upstream `latest` by default — see `OFFICIAL_CLIENT_RELEASE` in the
-workflow; pin a version for reproducible runs), starts this relay, and runs a
-real tunnel: provision via the HTTP API → attach the bridge WebSocket → fetch
-a page through the SNI-routed TLS connection that the client terminates. It needs real Let's Encrypt certificates (the official client only
-trusts the bundled Mozilla roots), so it performs live ACME DNS-01 issuance —
-2 certificates per run.
+The `integration` job downloads the official `opentunnel` CLI from its GitHub
+release. `OFFICIAL_CLIENT_RELEASE` selects the release: `latest` (the default)
+or a tag such as `v0.4.0` to pin. `.github/scripts/fetch-official-client.sh`
+resolves that release through the GitHub API, reads the sha256 digest GitHub
+reports for `opentunnel-linux-x64.tar.gz`, and refuses to run the binary unless
+the downloaded file matches it. The resolved tag is logged. Upstream publishes
+no checksum file, so this API digest is the integrity reference. It guards
+against corruption and substitution in transit. It does not guard against a
+compromised upstream release, because GitHub serves both the asset and its
+digest.
+
+The job then starts this relay and runs a real tunnel: provision via the HTTP
+API → attach the bridge WebSocket → fetch a page through the SNI-routed TLS
+connection that the client terminates. It needs real Let's Encrypt
+certificates (the official client only trusts the bundled Mozilla roots), so
+it performs live ACME DNS-01 issuance — 2 certificates per run.
 
 One-time setup (repo Settings → Secrets → Actions):
 
@@ -180,7 +192,10 @@ One-time setup (repo Settings → Secrets → Actions):
 
 Without these secrets the job skips itself (forks stay green). To respect
 Let's Encrypt's rate limit (50 certs per registered domain per week) it runs
-on tag pushes, a daily schedule, and manual dispatch — not on every push.
+on tag pushes, a weekly schedule (Mondays), and manual dispatch — not on every
+push. The weekly schedule also covers the unit tests and release builds.
+The relay's data directory is never cached between runs, so issued keys and
+account keys do not end up in the Actions cache.
 
 ## Security model
 

@@ -6,8 +6,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
   schedule:
-    # Daily: unit tests + release builds + the official-client E2E below.
-    - cron: '17 3 * * *'
+    # Weekly (Mondays): unit tests + release builds + the official-client E2E
+    # below. Weekly keeps the Let's Encrypt and Cloudflare usage low.
+    - cron: '17 3 * * 1'
 
 permissions:
   contents: read
@@ -23,6 +24,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
+      - name: Test official client fetch script (offline)
+        run: bash .github/scripts/test-fetch-official-client.sh
 
   build:
     name: Build (${{ matrix.target }})
@@ -103,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # No point republishing `latest` on the daily schedule with no new code.
+    # No point republishing `latest` on the weekly schedule with no new code.
     if: github.event_name != 'schedule'
     steps:
       # NOTE: checkout first! actions/checkout runs `git clean -ffdx` by
@@ -164,7 +167,7 @@ jobs:
       cancel-in-progress: false
     # Real Let's Encrypt issuance happens here (2 certs per run on CI_DOMAIN:
     # one for the API domain, one for the tunnel). Let's Encrypt allows 50
-    # certs per registered domain per week, so this runs on tags, the daily
+    # certs per registered domain per week, so this runs on tags, the weekly
     # schedule, and manual dispatch -- not on every push.
     #
     if: >-
@@ -172,9 +175,10 @@ jobs:
           github.event_name == 'schedule' ||
           github.event_name == 'workflow_dispatch' }}
     env:
-      # Which official client release to test against. "latest" tracks
-      # upstream's newest release so incompatibilities surface fast; pin a
-      # version like "v0.4.0" for reproducible runs.
+      # Official client release under test. "latest" tracks upstream's newest
+      # release so incompatibilities surface quickly. Set a tag such as
+      # "v0.4.0" for a reproducible run. Either way the download is checked
+      # against the digest GitHub publishes for that release's asset.
       OFFICIAL_CLIENT_RELEASE: latest
     steps:
       - uses: actions/checkout@v5
@@ -199,15 +203,9 @@ jobs:
 
       - name: Download official client release
         if: steps.integration-secrets.outputs.available == 'true'
-        run: |
-          if [ "${OFFICIAL_CLIENT_RELEASE}" = "latest" ]; then
-            URL="https://github.com/anomalyco/opentunnel/releases/latest/download/opentunnel-linux-x64.tar.gz"
-          else
-            URL="https://github.com/anomalyco/opentunnel/releases/download/${OFFICIAL_CLIENT_RELEASE}/opentunnel-linux-x64.tar.gz"
-          fi
-          curl -fsSL -o /tmp/official-client.tgz "$URL"
-          mkdir -p /tmp/official-client && tar -xzf /tmp/official-client.tgz -C /tmp/official-client
-          /tmp/official-client/opentunnel --version
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch-official-client.sh
 
       - name: Official client <-> our relay, end to end
         if: steps.integration-secrets.outputs.available == 'true'
