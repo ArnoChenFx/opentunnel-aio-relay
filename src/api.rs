@@ -21,6 +21,8 @@ use crate::proto::api::{
 };
 use crate::state::{now_rfc3339, AppState};
 
+const MAX_BRIDGE_WS_MESSAGE_SIZE: usize = 64 * 1024;
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -144,10 +146,12 @@ async fn bind_certificate(
     let record = authed_record(&state.db, &id, &headers)?;
     let (request_hostname, identifiers) = validate_csr(&body.csr, &record.hostname)?;
 
-    // Repeated submissions of the same CSR must not enqueue duplicate ACME
-    // orders, including after a fast failure; submit a new CSR to start a new
-    // issuance attempt.
-    if record.cert_id.is_some() && record.csr_pem.as_deref() == Some(body.csr.as_str()) {
+    // Repeated submissions of the same CSR must not enqueue duplicate orders
+    // while issuance is active or after success. A failed attempt is retryable.
+    if record.cert_id.is_some()
+        && record.csr_pem.as_deref() == Some(body.csr.as_str())
+        && record.cert_state != CertState::Failed
+    {
         return Ok((StatusCode::ACCEPTED, Json(certificate_info(&record)?)));
     }
     if matches!(record.cert_state, CertState::Challenge | CertState::Issuing) {
@@ -210,8 +214,13 @@ fn validate_csr(csr_pem: &str, hostname: &str) -> Result<(String, Vec<String>)> 
         for ext in extensions {
             if let ParsedExtension::SubjectAlternativeName(san) = ext {
                 for name in &san.general_names {
-                    if let GeneralName::DNSName(dns) = name {
-                        identifiers.push(dns.to_string());
+                    match name {
+                        GeneralName::DNSName(dns) => identifiers.push(dns.to_string()),
+                        _ => {
+                            return Err(Error::BadRequest(
+                                "CSR contains an unsupported non-DNS SAN".into(),
+                            ));
+                        }
                     }
                 }
             }
@@ -267,6 +276,8 @@ async fn connect_bridge(
     // Echo the subprotocol: the Rust client (tokio-tungstenite) rejects the
     // handshake if the server does not confirm the requested protocol.
     Ok(ws
+        .max_message_size(MAX_BRIDGE_WS_MESSAGE_SIZE)
+        .max_frame_size(MAX_BRIDGE_WS_MESSAGE_SIZE)
         .protocols([crate::proto::bridge::WEBSOCKET_SUBPROTOCOL])
         .on_upgrade(move |socket: WebSocket| async move {
             bridge::run_bridge(state, id, socket).await;
@@ -298,6 +309,16 @@ mod tests {
         params.serialize_request(&key).unwrap().pem().unwrap()
     }
 
+    fn make_csr_with_extra_san(hostname: &str, extra: rcgen::SanType) -> String {
+        let mut params = rcgen::CertificateParams::new(vec![hostname.to_string()]).unwrap();
+        params.subject_alt_names.push(extra);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, hostname);
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        params.serialize_request(&key).unwrap().pem().unwrap()
+    }
+
     #[test]
     fn csr_accepts_valid_request() {
         let csr = make_csr(
@@ -325,6 +346,24 @@ mod tests {
     fn csr_rejects_extra_san() {
         let csr = make_csr("abc123.relay.test", &["abc123.relay.test", "other.test"]);
         assert!(validate_csr(&csr, "abc123.relay.test").is_err());
+    }
+
+    #[test]
+    fn csr_rejects_ip_san() {
+        let csr = make_csr_with_extra_san(
+            "abc123.relay.test",
+            rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()),
+        );
+        let error = validate_csr(&csr, "abc123.relay.test").unwrap_err();
+        assert!(error.to_string().contains("non-DNS SAN"));
+    }
+
+    #[test]
+    fn csr_rejects_uri_san() {
+        let uri = rcgen::Ia5String::try_from("spiffe://relay.test/client").unwrap();
+        let csr = make_csr_with_extra_san("abc123.relay.test", rcgen::SanType::URI(uri));
+        let error = validate_csr(&csr, "abc123.relay.test").unwrap_err();
+        assert!(error.to_string().contains("non-DNS SAN"));
     }
 
     #[test]
