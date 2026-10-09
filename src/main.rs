@@ -11,13 +11,19 @@
 //! - Certificates are issued/renewed via ACME DNS-01 (Let's Encrypt by default).
 //!
 //! Clients point at this server with `OPENTUNNEL_API=https://<domain>` and
-//! must send the server admin bearer token when creating a tunnel.
+//! create tunnels using the official client API, subject to the configured
+//! source-IP allowlist, rate limit, and active-tunnel cap.
 
 use std::sync::Arc;
 
 use clap::Parser;
 use opentunnel_relay::{
-    acme, api, bridge::SessionManager, config::Config, db::Db, ingress, state::AppState,
+    acme, api,
+    bridge::SessionManager,
+    config::Config,
+    db::Db,
+    ingress,
+    state::{AppState, TunnelCreationPolicy},
 };
 use tracing_subscriber::EnvFilter;
 
@@ -28,8 +34,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    if config.admin_token.len() < 32 || !config.admin_token.is_ascii() {
-        anyhow::bail!("OT_ADMIN_TOKEN must contain at least 32 ASCII bytes");
+    if config.tunnel_create_rate_window_secs == 0 {
+        anyhow::bail!("OT_TUNNEL_CREATE_RATE_WINDOW_SECS must be greater than zero");
     }
     // rustls uses the process-wide default provider; make it ring explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -57,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         db,
         sessions: SessionManager::default(),
+        tunnel_creation_policy: TunnelCreationPolicy::new(&config),
         api_tls,
         http,
     });

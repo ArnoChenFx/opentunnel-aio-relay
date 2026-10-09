@@ -67,6 +67,13 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelCreateResult {
+    Created,
+    Collision,
+    AtCapacity,
+}
+
 impl Db {
     /// Runs a synchronous SQLite operation on Tokio's blocking pool.
     pub async fn call<T, F>(db: Arc<Self>, operation: F) -> Result<T>
@@ -153,6 +160,38 @@ impl Db {
             params![id, hostname, token_hash, now],
         )?;
         Ok(rows == 1)
+    }
+
+    /// Creates a tunnel only when the configured non-deleted tunnel cap allows it.
+    /// The immediate transaction keeps the count check and insert atomic.
+    pub fn create_tunnel_with_limit(
+        &self,
+        id: &str,
+        hostname: &str,
+        token_hash: &str,
+        now: &str,
+        max_active_tunnels: usize,
+    ) -> Result<TunnelCreateResult> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let active_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tunnels WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(active_count).unwrap_or(usize::MAX) >= max_active_tunnels {
+            return Ok(TunnelCreateResult::AtCapacity);
+        }
+        let rows = tx.execute(
+            "INSERT OR IGNORE INTO tunnels (id, hostname, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, hostname, token_hash, now],
+        )?;
+        tx.commit()?;
+        Ok(if rows == 1 {
+            TunnelCreateResult::Created
+        } else {
+            TunnelCreateResult::Collision
+        })
     }
 
     pub fn get_tunnel(&self, id: &str) -> Result<Option<TunnelRecord>> {

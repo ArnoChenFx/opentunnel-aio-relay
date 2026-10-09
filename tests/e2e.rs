@@ -9,13 +9,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opentunnel_relay::{
-    acme, api, bridge::SessionManager, config::Config, db::Db, ingress, state::AppState,
+    acme, api,
+    bridge::SessionManager,
+    config::{Config, IpNetwork},
+    db::Db,
+    ingress,
+    state::{AppState, TunnelCreationPolicy},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const DOMAIN: &str = "relay.test";
-const ADMIN_TOKEN: &str = "test-admin-token-for-e2e-only-at-least-32-bytes";
 
 struct TestServer {
     port: u16,
@@ -28,7 +32,10 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         domain: DOMAIN.to_string(),
         listen: "127.0.0.1:0".to_string(),
         data_dir: data_dir.to_path_buf(),
-        admin_token: ADMIN_TOKEN.to_string(),
+        tunnel_create_ip_allowlist: vec![],
+        tunnel_create_rate_limit: 5,
+        tunnel_create_rate_window_secs: 60,
+        max_active_tunnels: 1000,
         cf_token: "test".to_string(),
         cf_zone_id: "test".to_string(),
         acme_eab_kid: "test".to_string(),
@@ -48,6 +55,10 @@ fn init_log() {
 }
 
 async fn start_server() -> TestServer {
+    start_server_with_config(|_| {}).await
+}
+
+async fn start_server_with_config(configure: impl FnOnce(&mut Config)) -> TestServer {
     init_log();
     let data_dir = std::env::temp_dir().join(format!(
         "ot-relay-e2e-{}-{}",
@@ -70,7 +81,8 @@ async fn start_server() -> TestServer {
     )
     .unwrap();
 
-    let config = test_config(&data_dir);
+    let mut config = test_config(&data_dir);
+    configure(&mut config);
     let db = Arc::new(Db::open(&data_dir.join("relay.db")).unwrap());
     let http = reqwest::Client::builder().build().unwrap();
     let api_tls = acme::ensure_api_cert(&config, db.clone(), &http)
@@ -89,10 +101,12 @@ async fn start_server() -> TestServer {
         );
     }
 
+    let tunnel_creation_policy = TunnelCreationPolicy::new(&config);
     let state = Arc::new(AppState {
         config,
         db,
         sessions: SessionManager::default(),
+        tunnel_creation_policy,
         api_tls: Arc::new(tokio::sync::RwLock::new(api_tls)),
         http,
     });
@@ -307,19 +321,8 @@ async fn api_provisioning_flow() {
     assert_eq!(status, 200);
     assert!(body.contains("\"ok\":true"), "{body}");
 
-    let (status, _) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
-    assert_eq!(status, 401);
-    let (status, _) = http_request(
-        &srv,
-        "POST",
-        "/api/tunnel",
-        Some("incorrect-admin-token"),
-        "{}",
-    )
-    .await;
-    assert_eq!(status, 401);
-
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
+    // Stock clients create tunnels without a server-wide admin token.
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -349,6 +352,42 @@ async fn api_provisioning_flow() {
 }
 
 #[tokio::test]
+async fn tunnel_creation_enforces_source_ip_allowlist() {
+    let srv = start_server_with_config(|config| {
+        config.tunnel_create_ip_allowlist = vec!["192.0.2.0/24".parse::<IpNetwork>().unwrap()];
+    })
+    .await;
+
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("source IP is not allowed"), "{body}");
+}
+
+#[tokio::test]
+async fn tunnel_creation_is_rate_limited_per_source_ip() {
+    let srv = start_server_with_config(|config| config.tunnel_create_rate_limit = 1).await;
+
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 429, "{body}");
+}
+
+#[tokio::test]
+async fn tunnel_creation_respects_active_tunnel_cap() {
+    let srv = start_server_with_config(|config| config.max_active_tunnels = 1).await;
+
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 503, "{body}");
+    assert!(
+        body.contains("configured active tunnel cap (1) reached"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn ordinary_api_response_closes_http_keep_alive_connection() {
     let srv = start_server().await;
     let mut tls = tls_connect(srv.port, &srv.cert_pem).await;
@@ -370,7 +409,7 @@ async fn ordinary_api_response_closes_http_keep_alive_connection() {
 #[tokio::test]
 async fn retrying_same_csr_does_not_restart_active_issuance() {
     let srv = start_server().await;
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -413,7 +452,7 @@ async fn retrying_same_csr_does_not_restart_active_issuance() {
 #[tokio::test]
 async fn failed_issuance_obeys_backoff_but_new_csr_can_restart() {
     let srv = start_server().await;
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -479,7 +518,7 @@ async fn bridge_attach_and_sni_routing() {
 
     // Provision a tunnel, then fake a ready certificate (ACME is out of scope
     // for this test; issuance itself is exercised against staging CAs).
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();
@@ -667,7 +706,7 @@ async fn simultaneous_attach_to_same_route_has_one_winner() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let srv = start_server().await;
-    let (status, body) = http_request(&srv, "POST", "/api/tunnel", Some(ADMIN_TOKEN), "{}").await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = created["tunnel"]["id"].as_str().unwrap().to_string();

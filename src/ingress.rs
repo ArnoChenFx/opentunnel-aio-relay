@@ -81,7 +81,7 @@ async fn handle_connection(
 
     let domain = state.config.domain.to_lowercase();
     if hello.server_name == domain {
-        return serve_api(socket, buf, state, router, deadline, permit).await;
+        return serve_api(socket, peer, buf, state, router, deadline, permit).await;
     }
     drop(permit);
     serve_tunnel(socket, peer, buf, hello.server_name, hello.alpn, state).await
@@ -170,6 +170,7 @@ impl<R: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prepended<R> {
 /// Terminates TLS for the API domain and serves the axum router over it.
 async fn serve_api(
     socket: TcpStream,
+    peer: SocketAddr,
     initial: Vec<u8>,
     state: Arc<AppState>,
     router: Router,
@@ -185,6 +186,7 @@ async fn serve_api(
     let tls = accept_tls_until(&acceptor, stream, deadline).await?;
     drop(permit);
     let io = TokioIo::new(tls);
+    let source_ip = peer.ip();
     let svc = hyper_util::service::TowerToHyperService::new(tower::service_fn(
         move |req: hyper::Request<hyper::body::Incoming>| {
             let router = router.clone();
@@ -194,7 +196,9 @@ async fn serve_api(
                     .get(hyper::header::UPGRADE)
                     .and_then(|value| value.to_str().ok())
                     .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-                match router.oneshot(req.map(axum::body::Body::new)).await {
+                let mut request = req.map(axum::body::Body::new);
+                request.extensions_mut().insert(source_ip);
+                match router.oneshot(request).await {
                     Ok(mut res) => {
                         if !websocket_upgrade {
                             res.headers_mut().insert(

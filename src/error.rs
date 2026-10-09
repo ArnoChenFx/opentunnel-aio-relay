@@ -15,6 +15,12 @@ pub enum Error {
     #[error("{0}")]
     Unauthorized(String),
     #[error("{0}")]
+    Forbidden(String),
+    #[error("{0}")]
+    RateLimited(String),
+    #[error("{0}")]
+    CapacityReached(String),
+    #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
@@ -36,6 +42,9 @@ impl IntoResponse for Error {
         let (status, tag) = match &self {
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),
             Error::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "Unauthorized"),
+            Error::Forbidden(_) => (StatusCode::FORBIDDEN, "Forbidden"),
+            Error::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, "TooManyRequests"),
+            Error::CapacityReached(_) => (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),
             Error::NotFound(_) => (StatusCode::NOT_FOUND, "NotFound"),
             Error::Conflict(_) => (StatusCode::CONFLICT, "Conflict"),
             Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),

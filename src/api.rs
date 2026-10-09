@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -13,13 +13,14 @@ use axum::{
 };
 
 use crate::bridge::{self, hash_token, random_token, random_tunnel_id};
-use crate::db::{CertState, Db};
+use crate::db::{CertState, Db, TunnelCreateResult};
 use crate::error::{Error, Result};
 use crate::proto::api::{
     ApiError, BindCertificateRequest, CertificateInfo, CertificateState, CreateTunnelResponse,
     TunnelInfo, TunnelState,
 };
 use crate::state::{now_rfc3339, AppState};
+use std::net::IpAddr;
 
 const MAX_BRIDGE_WS_MESSAGE_SIZE: usize = 64 * 1024;
 
@@ -119,23 +120,11 @@ fn certificate_info(record: &crate::db::TunnelRecord) -> Result<CertificateInfo>
 
 async fn create_tunnel(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(source_ip): Extension<IpAddr>,
 ) -> Result<impl IntoResponse> {
-    let supplied = bearer_token(&headers)
-        .ok_or_else(|| Error::Unauthorized("missing server admin token".into()))?;
-    let supplied_hash = ring::digest::digest(&ring::digest::SHA256, supplied.as_bytes());
-    let expected_hash =
-        ring::digest::digest(&ring::digest::SHA256, state.config.admin_token.as_bytes());
-    #[allow(deprecated)]
-    let token_matches = ring::constant_time::verify_slices_are_equal(
-        supplied_hash.as_ref(),
-        expected_hash.as_ref(),
-    )
-    .is_ok();
-    if !token_matches {
-        return Err(Error::Unauthorized("bad server admin token".into()));
-    }
+    state.tunnel_creation_policy.check_source_ip(source_ip)?;
     let domain = state.config.domain.to_lowercase();
+    let max_active_tunnels = state.tunnel_creation_policy.max_active_tunnels();
     // Retry on the (unlikely) id collision.
     for _ in 0..5 {
         let id = random_tunnel_id();
@@ -145,11 +134,17 @@ async fn create_tunnel(
         let now = now_rfc3339();
         let db_id = id.clone();
         let created = Db::call(state.db.clone(), move |db| {
-            db.create_tunnel(&db_id, &hostname, &token_hash, &now)
+            db.create_tunnel_with_limit(&db_id, &hostname, &token_hash, &now, max_active_tunnels)
         })
         .await?;
-        if !created {
-            continue;
+        match created {
+            TunnelCreateResult::Created => {}
+            TunnelCreateResult::Collision => continue,
+            TunnelCreateResult::AtCapacity => {
+                return Err(Error::CapacityReached(format!(
+                    "configured active tunnel cap ({max_active_tunnels}) reached"
+                )))
+            }
         }
         let lookup_id = id.clone();
         let record = Db::call(state.db.clone(), move |db| db.get_tunnel(&lookup_id))
