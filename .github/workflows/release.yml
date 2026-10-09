@@ -10,7 +10,7 @@ on:
     - cron: '17 3 * * *'
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -101,6 +101,8 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     # No point republishing `latest` on the daily schedule with no new code.
     if: github.event_name != 'schedule'
     steps:
@@ -142,6 +144,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     # Serialized: two runs would fight over the same DNS-01 TXT record.
     concurrency:
       group: opentunnel-integration
@@ -151,22 +155,28 @@ jobs:
     # certs per registered domain per week, so this runs on tags, the daily
     # schedule, and manual dispatch -- not on every push.
     #
-    # NOTE: `secrets` cannot appear in a job-level `if:` (GitHub rejects the
-    # whole file with "Unrecognized named-value: 'secrets'"). The secret is
-    # mapped to env below and the E2E step is gated on the env var instead;
-    # without the secret the job succeeds with that step skipped.
     if: >-
       ${{ github.ref_type == 'tag' ||
           github.event_name == 'schedule' ||
           github.event_name == 'workflow_dispatch' }}
     env:
-      # Which official client release to test against. "latest" tracks
-      # upstream's newest release so incompatibilities surface fast; pin a
-      # version like "v0.4.0" for reproducible runs.
-      OFFICIAL_CLIENT_RELEASE: latest
-      CI_CF_TOKEN: ${{ secrets.CI_CF_TOKEN }}
+      # Pin the upstream binary so scheduled runs are reproducible.
+      OFFICIAL_CLIENT_RELEASE: v0.4.0
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Check integration credentials
+        id: integration-secrets
+        env:
+          CI_CF_TOKEN: ${{ secrets.CI_CF_TOKEN }}
+        run: |
+          if [[ -n "$CI_CF_TOKEN" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/download-artifact@v4
         with:
@@ -174,19 +184,15 @@ jobs:
           path: relay-dist
 
       - name: Download official client release
-        if: env.CI_CF_TOKEN != ''
+        if: steps.integration-secrets.outputs.available == 'true'
         run: |
-          if [ "${OFFICIAL_CLIENT_RELEASE}" = "latest" ]; then
-            URL="https://github.com/anomalyco/opentunnel/releases/latest/download/opentunnel-linux-x64.tar.gz"
-          else
-            URL="https://github.com/anomalyco/opentunnel/releases/download/${OFFICIAL_CLIENT_RELEASE}/opentunnel-linux-x64.tar.gz"
-          fi
+          URL="https://github.com/anomalyco/opentunnel/releases/download/${OFFICIAL_CLIENT_RELEASE}/opentunnel-linux-x64.tar.gz"
           curl -fsSL -o /tmp/official-client.tgz "$URL"
           mkdir -p /tmp/official-client && tar -xzf /tmp/official-client.tgz -C /tmp/official-client
           /tmp/official-client/opentunnel --version
 
       - name: Official client <-> our relay, end to end
-        if: env.CI_CF_TOKEN != ''
+        if: steps.integration-secrets.outputs.available == 'true'
         env:
           CI_DOMAIN: ${{ secrets.CI_DOMAIN }}
           CI_CF_TOKEN: ${{ secrets.CI_CF_TOKEN }}

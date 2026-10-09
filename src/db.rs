@@ -97,6 +97,12 @@ impl Db {
                  value TEXT NOT NULL
              );",
         )?;
+        // No bridge survives a process restart; do not expose stale online
+        // status from the previous process lifetime.
+        conn.execute(
+            "UPDATE tunnels SET state = 'offline' WHERE state != 'offline'",
+            [],
+        )?;
         secure_database_file(path)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -252,7 +258,8 @@ impl Db {
                     fail_reason, csr_pem, created_at, last_connected_at
              FROM tunnels
              WHERE deleted_at IS NULL
-               AND cert_state = 'ready'
+               AND cert_state IN ('ready', 'failed')
+               AND cert_pem IS NOT NULL
                AND cert_expiry IS NOT NULL
                AND csr_pem IS NOT NULL",
         )?;
@@ -389,6 +396,43 @@ mod tests {
             );
         }
         drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_file_name(format!(
+            "{}-wal",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+        let _ = std::fs::remove_file(path.with_file_name(format!(
+            "{}-shm",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+    }
+
+    #[test]
+    fn failed_renewal_is_scanned_and_stale_online_state_is_cleared_on_reopen() {
+        let path = test_path();
+        let db = Db::open(&path).unwrap();
+        let now = chrono::Utc::now();
+        let now_text = now.to_rfc3339();
+        let expiry = (now + chrono::Duration::days(10)).to_rfc3339();
+        db.create_tunnel("t1", "t1.example.test", "hash", &now_text)
+            .unwrap();
+        db.begin_issuance("t1", "cert1", "same-csr").unwrap();
+        db.set_ready("cert1", "CERT", "CHAIN", &expiry).unwrap();
+        db.set_online("t1", true, &now_text).unwrap();
+        db.set_failed("cert1", "temporary CA outage").unwrap();
+
+        let candidates = db
+            .renewal_candidates(30 * 24 * 3600, 90 * 24 * 3600, now.timestamp())
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].cert_state, CertState::Failed);
+        assert!(db.try_begin_issuance("t1", "cert2", "same-csr").unwrap());
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(reopened.get_tunnel("t1").unwrap().unwrap().state, "offline");
+
+        drop(reopened);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_file_name(format!(
             "{}-wal",

@@ -24,6 +24,8 @@ use crate::proto::bridge::{
 use crate::proto::names;
 use crate::state::{now_rfc3339, AppState};
 
+const MAX_INBOUND_WS_BINARY_SIZE: usize = bridge::CONN_ID_SIZE + bridge::MAX_PAYLOAD_SIZE;
+
 /// Outgoing frames queued for one bridge WebSocket.
 #[derive(Debug)]
 pub enum OutMsg {
@@ -249,35 +251,34 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         let _ = socket.close().await;
         return Ok(());
     }
-    // A route belongs to one bridge at a time (takeover via retry).
-    {
-        let bridges = session.bridges.lock().await;
+    let bridge_id = format!("sess_{}", random_session_id());
+    let (tx, mut rx) = mpsc::channel::<OutMsg>(512);
+    // Conflict check and registration must share one critical section so two
+    // simultaneous attach requests cannot both claim the same route.
+    let conflict = {
+        let mut bridges = session.bridges.lock().await;
         let conflict = bridges
             .iter()
             .any(|b| b.routes.iter().any(|r| routes.iter().any(|want| want == r)));
-        if conflict {
-            drop(bridges);
-            send_text(
-                socket,
-                &ServerMessage::AttachError {
-                    code: "route_conflict".to_string(),
-                },
-            )
-            .await?;
-            let _ = socket.close().await;
-            return Ok(());
+        if !conflict {
+            bridges.push(BridgeHandle {
+                id: bridge_id.clone(),
+                routes: routes.clone(),
+                tx,
+            });
         }
-    }
-
-    let bridge_id = format!("sess_{}", random_session_id());
-    let (tx, mut rx) = mpsc::channel::<OutMsg>(512);
-    {
-        let mut bridges = session.bridges.lock().await;
-        bridges.push(BridgeHandle {
-            id: bridge_id.clone(),
-            routes: routes.clone(),
-            tx,
-        });
+        conflict
+    };
+    if conflict {
+        send_text(
+            socket,
+            &ServerMessage::AttachError {
+                code: "route_conflict".to_string(),
+            },
+        )
+        .await?;
+        let _ = socket.close().await;
+        return Ok(());
     }
     state.db.set_online(tunnel_id, true, &now_rfc3339())?;
     state.db.touch_connected(tunnel_id, &now_rfc3339())?;
@@ -339,6 +340,10 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                         }
                     }
                     Message::Binary(data) => {
+                        if data.len() > MAX_INBOUND_WS_BINARY_SIZE {
+                            tracing::debug!(tunnel = %tunnel_id, bridge = %bridge_id, size = data.len(), "oversized bridge frame");
+                            break;
+                        }
                         if let Some((conn, payload)) = decode_data_frame(&data) {
                             let tx = {
                                 let channels = session.channels.lock().await;
@@ -348,7 +353,11 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                                     .map(|channel| channel.tx.clone())
                             };
                             if let Some(tx) = tx {
-                                let _ = tx.send(ChannelMsg::Data(payload.to_vec())).await;
+                                if tx.try_send(ChannelMsg::Data(payload.to_vec())).is_err() {
+                                    // A slow public socket must not stall this
+                                    // bridge's reader and every other channel.
+                                    session.close_channel(conn).await;
+                                }
                             }
                         }
                     }
@@ -408,13 +417,17 @@ async fn handle_control(
         ClientMessage::Pong { .. } => None,
         ClientMessage::End { conn } => {
             if let Some(tx) = channel_sender_for_bridge(session, bridge_id, conn).await {
-                let _ = tx.send(ChannelMsg::End).await;
+                if tx.try_send(ChannelMsg::End).is_err() {
+                    session.close_channel(conn).await;
+                }
             }
             None
         }
         ClientMessage::Reset { conn, code } => {
             if let Some(tx) = channel_sender_for_bridge(session, bridge_id, conn).await {
-                let _ = tx.send(ChannelMsg::Reset(code)).await;
+                if tx.try_send(ChannelMsg::Reset(code)).is_err() {
+                    session.close_channel(conn).await;
+                }
             }
             None
         }

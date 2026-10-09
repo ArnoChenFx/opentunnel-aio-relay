@@ -24,6 +24,7 @@ use crate::db::{CertState, Db};
 use crate::state::AppState;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+const JOSE_JSON_CONTENT_TYPE: &str = "application/jose+json";
 
 fn b64(data: &[u8]) -> String {
     B64.encode(data)
@@ -169,6 +170,14 @@ fn jws_body(pkcs8: &[u8], protected: &Value, payload: &[u8]) -> Result<Value> {
     Ok(json!({"protected": p, "payload": pl, "signature": s}))
 }
 
+fn jws_http_request(http: &Client, url: &str, body: &Value) -> Result<reqwest::Request> {
+    Ok(http
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, JOSE_JSON_CONTENT_TYPE)
+        .body(serde_json::to_vec(body)?)
+        .build()?)
+}
+
 /// Builds the externalAccountBinding object (for CAs that require it, e.g. ZeroSSL).
 fn external_account_binding(
     eab_kid: &str,
@@ -256,7 +265,7 @@ impl Acme {
         &self,
         url: &str,
         use_kid: bool,
-        payload: &Value,
+        payload: &[u8],
     ) -> Result<reqwest::Response> {
         for attempt in 0..2 {
             let nonce = self.nonce().await?;
@@ -266,12 +275,11 @@ impl Acme {
             } else {
                 protected["jwk"] = self.account_jwk.clone();
             }
-            let body = jws_body(
-                &self.key_pkcs8,
-                &protected,
-                serde_json::to_vec(payload)?.as_slice(),
-            )?;
-            let res = self.http.post(url).json(&body).send().await?;
+            let body = jws_body(&self.key_pkcs8, &protected, payload)?;
+            let res = self
+                .http
+                .execute(jws_http_request(&self.http, url, &body)?)
+                .await?;
             if res.status().as_u16() == 400 && attempt == 0 {
                 let text = res.text().await.unwrap_or_default();
                 if text.contains("badNonce") {
@@ -289,7 +297,7 @@ impl Acme {
 
     /// POST-as-GET (empty JWS payload).
     async fn post_as_get(&self, url: &str) -> Result<Value> {
-        let res = self.post_jws(url, true, &json!({})).await?;
+        let res = self.post_jws(url, true, b"").await?;
         res.json().await.context("parsing ACME response")
     }
 
@@ -319,11 +327,10 @@ impl Acme {
             &protected,
             serde_json::to_vec(&payload)?.as_slice(),
         )?;
+        let request = jws_http_request(&self.http, &self.dir.new_account, &body)?;
         let res = self
             .http
-            .post(&self.dir.new_account)
-            .json(&body)
-            .send()
+            .execute(request)
             .await
             .context("creating ACME account")?;
         let status = res.status();
@@ -384,12 +391,9 @@ pub async fn issue(
         .iter()
         .map(|d| json!({"type": "dns", "value": d}))
         .collect();
+    let new_order_payload = serde_json::to_vec(&json!({"identifiers": order_ids}))?;
     let res = acme
-        .post_jws(
-            &acme.dir.new_order.clone(),
-            true,
-            &json!({"identifiers": order_ids}),
-        )
+        .post_jws(&acme.dir.new_order.clone(), true, &new_order_payload)
         .await?;
     if res.status().as_u16() != 201 {
         bail!("ACME newOrder failed: {}", res.status());
@@ -484,7 +488,7 @@ pub async fn issue(
             crate::dns::wait_for_txt(http, &name, &expected, Duration::from_secs(60)).await?;
         }
         for ch in &challenges {
-            acme.post_jws(&ch.url, true, &json!({})).await?;
+            acme.post_jws(&ch.url, true, b"").await?;
         }
         for auth_url in &auth_urls {
             let mut auth: Value = acme.post_as_get(auth_url).await?;
@@ -502,8 +506,9 @@ pub async fn issue(
 
         // --- finalize with the CSR ---
         let csr_der = pem_to_der(csr_pem, "CERTIFICATE REQUEST")?;
+        let finalize_payload = serde_json::to_vec(&json!({"csr": b64(&csr_der)}))?;
         let res = acme
-            .post_jws(&finalize_url, true, &json!({"csr": b64(&csr_der)}))
+            .post_jws(&finalize_url, true, &finalize_payload)
             .await?;
         let mut order: Value = res.json().await?;
         for _ in 0..30 {
@@ -518,7 +523,7 @@ pub async fn issue(
             .and_then(|c| c.as_str())
             .filter(|_| order.get("status").and_then(|s| s.as_str()) == Some("valid"))
             .ok_or_else(|| anyhow!("ACME order ended in {:?}", order.get("status")))?;
-        let res = acme.post_jws(cert_url, true, &json!({})).await?;
+        let res = acme.post_jws(cert_url, true, b"").await?;
         let chain_pem = res.text().await.context("downloading certificate")?;
         anyhow::Ok(chain_pem)
     };
@@ -608,8 +613,9 @@ fn identifiers_from_csr(csr_pem: &str) -> Result<Vec<String>> {
         for ext in extensions {
             if let ParsedExtension::SubjectAlternativeName(san) = ext {
                 for name in &san.general_names {
-                    if let GeneralName::DNSName(dns) = name {
-                        ids.push(dns.to_string());
+                    match name {
+                        GeneralName::DNSName(dns) => ids.push(dns.to_string()),
+                        _ => bail!("unsupported non-DNS SAN in CSR"),
                     }
                 }
             }
@@ -646,36 +652,42 @@ async fn issue_for_tunnel(state: &AppState, tunnel_id: &str, cert_id: &str) -> R
     if record.cert_id.as_deref() != Some(cert_id) {
         return Ok(()); // superseded by a newer issuance
     }
-    let csr_pem = record
-        .csr_pem
-        .clone()
-        .ok_or_else(|| anyhow!("no CSR stored"))?;
-    let identifiers = identifiers_from_csr(&csr_pem)?;
-    let cfg = AcmeConfig::from_config(&state.config);
-    let issued = match issue(
-        &state.http,
-        &state.db,
-        &cfg,
-        &identifiers,
-        &csr_pem,
-        |token, key| {
-            let _ = state.db.set_challenge(cert_id, token, key);
-        },
-    )
-    .await
-    {
+    let issuance = async {
+        let csr_pem = record
+            .csr_pem
+            .clone()
+            .ok_or_else(|| anyhow!("no CSR stored"))?;
+        let identifiers = identifiers_from_csr(&csr_pem)?;
+        let cfg = AcmeConfig::from_config(&state.config);
+        issue(
+            &state.http,
+            &state.db,
+            &cfg,
+            &identifiers,
+            &csr_pem,
+            |token, key| {
+                let _ = state.db.set_challenge(cert_id, token, key);
+            },
+        )
+        .await
+    }
+    .await;
+    let issued = match issuance {
         Ok(issued) => issued,
         Err(e) => {
             fail(&e.to_string());
             return Err(e);
         }
     };
-    state.db.set_ready(
+    if let Err(e) = state.db.set_ready(
         cert_id,
         &issued.certificate_pem,
         &issued.chain_pem,
         &issued.expiry_rfc3339,
-    )?;
+    ) {
+        fail(&e.to_string());
+        return Err(e.into());
+    }
     if let Some(session) = state.sessions.get_or_load(&state.db, tunnel_id).await? {
         session
             .cert_ready
@@ -707,7 +719,12 @@ pub async fn renewal_loop(state: Arc<AppState>) {
         for record in candidates {
             // Skip if an issuance is already in flight.
             let fresh = match state.db.get_tunnel(&record.id) {
-                Ok(Some(r)) if r.cert_state == CertState::Ready => r,
+                Ok(Some(r))
+                    if matches!(r.cert_state, CertState::Ready | CertState::Failed)
+                        && r.cert_pem.is_some() =>
+                {
+                    r
+                }
                 _ => continue,
             };
             let csr = match fresh.csr_pem {
@@ -859,7 +876,13 @@ fn build_server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::Serv
 /// days of expiry (covers tunnels that went idle and came back).
 pub async fn maybe_renew_on_attach(state: Arc<AppState>, tunnel_id: &str) {
     let record = match state.db.get_tunnel(tunnel_id) {
-        Ok(Some(r)) if r.deleted_at.is_none() && r.cert_state == CertState::Ready => r,
+        Ok(Some(r))
+            if r.deleted_at.is_none()
+                && matches!(r.cert_state, CertState::Ready | CertState::Failed)
+                && r.cert_pem.is_some() =>
+        {
+            r
+        }
         _ => return,
     };
     let expiring = record
@@ -883,5 +906,60 @@ pub async fn maybe_renew_on_attach(state: Arc<AppState>, tunnel_id: &str) {
     {
         tracing::info!(tunnel = %tunnel_id, "renewing certificate on attach");
         spawn_issuance(state, tunnel_id.to_string(), cert_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> Vec<u8> {
+        ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &ring::rand::SystemRandom::new(),
+        )
+        .unwrap()
+        .as_ref()
+        .to_vec()
+    }
+
+    #[test]
+    fn post_as_get_jws_payload_is_empty() {
+        let body = jws_body(&test_key(), &json!({"alg": "ES256"}), b"").unwrap();
+        assert_eq!(body["payload"], "");
+    }
+
+    #[test]
+    fn acme_jws_requests_use_jose_json_content_type() {
+        let body = json!({"protected": "p", "payload": "", "signature": "s"});
+        let request =
+            jws_http_request(&Client::new(), "https://acme.test/new-account", &body).unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.headers()[reqwest::header::CONTENT_TYPE],
+            JOSE_JSON_CONTENT_TYPE
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(request.body().unwrap().as_bytes().unwrap()).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn identifier_extraction_rejects_non_dns_sans() {
+        let hostname = "abc123.relay.test";
+        let mut params = rcgen::CertificateParams::new(vec![hostname.to_string()]).unwrap();
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, hostname);
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let csr = params.serialize_request(&key).unwrap().pem().unwrap();
+        assert!(identifiers_from_csr(&csr)
+            .unwrap_err()
+            .to_string()
+            .contains("non-DNS SAN"));
     }
 }

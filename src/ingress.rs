@@ -55,20 +55,20 @@ async fn handle_connection(
     state: Arc<AppState>,
     router: Router,
 ) -> Result<()> {
-    let (buf, hello) = read_client_hello(&mut socket, CLIENT_HELLO_TIMEOUT).await?;
+    let deadline = tokio::time::Instant::now() + CLIENT_HELLO_TIMEOUT;
+    let (buf, hello) = read_client_hello_until(&mut socket, deadline).await?;
 
     let domain = state.config.domain.to_lowercase();
     if hello.server_name == domain {
-        return serve_api(socket, buf, state, router).await;
+        return serve_api(socket, buf, state, router, deadline).await;
     }
     serve_tunnel(socket, peer, buf, hello.server_name, hello.alpn, state).await
 }
 
-async fn read_client_hello(
+async fn read_client_hello_until(
     socket: &mut TcpStream,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<(Vec<u8>, crate::sni::ClientHello)> {
-    let deadline = tokio::time::Instant::now() + timeout;
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let hello = loop {
@@ -151,6 +151,7 @@ async fn serve_api(
     initial: Vec<u8>,
     state: Arc<AppState>,
     router: Router,
+    deadline: tokio::time::Instant,
 ) -> Result<()> {
     let tls_config = state.api_tls.read().await.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -158,10 +159,7 @@ async fn serve_api(
         buf: std::io::Cursor::new(initial),
         inner: socket,
     };
-    let tls = acceptor
-        .accept(stream)
-        .await
-        .map_err(|e| Error::Internal(format!("API TLS accept failed: {e}")))?;
+    let tls = accept_tls_until(&acceptor, stream, deadline).await?;
     let io = TokioIo::new(tls);
     let svc = hyper_util::service::TowerToHyperService::new(tower::service_fn(
         move |req: hyper::Request<hyper::body::Incoming>| {
@@ -183,6 +181,20 @@ async fn serve_api(
         .await
         .map_err(|e| Error::Internal(format!("API connection error: {e}")))?;
     Ok(())
+}
+
+async fn accept_tls_until<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    deadline: tokio::time::Instant,
+) -> Result<tokio_rustls::server::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout_at(deadline, acceptor.accept(stream))
+        .await
+        .map_err(|_| Error::Internal("API TLS handshake timeout".into()))?
+        .map_err(|e| Error::Internal(format!("API TLS accept failed: {e}")))
 }
 
 /// Blind passthrough: route by SNI to the tunnel's bridge without
@@ -313,7 +325,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_client_hello(&mut socket, Duration::from_millis(220)).await
+            read_client_hello_until(
+                &mut socket,
+                tokio::time::Instant::now() + Duration::from_millis(220),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -326,5 +342,87 @@ mod tests {
             .expect("ClientHello deadline should be absolute")
             .unwrap();
         assert!(result.unwrap_err().to_string().contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn api_tls_handshake_obeys_client_hello_deadline() {
+        let certified = rcgen::generate_simple_self_signed(vec!["relay.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            accept_tls_until(&acceptor, socket, deadline)
+                .await
+                .map(|_| ())
+        });
+
+        let socket = TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("relay.test")
+            .unwrap()
+            .to_owned();
+        let client = tokio::spawn(async move {
+            let _ = connector
+                .connect(server_name, StallClientReads(socket))
+                .await;
+        });
+        let server = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(server.unwrap_err().to_string().contains("timeout"));
+        client.abort();
+    }
+
+    struct StallClientReads(TcpStream);
+
+    impl tokio::io::AsyncRead for StallClientReads {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for StallClientReads {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
     }
 }

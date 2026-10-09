@@ -376,6 +376,46 @@ async fn retrying_same_csr_does_not_restart_active_issuance() {
 }
 
 #[tokio::test]
+async fn retrying_same_csr_restarts_failed_issuance() {
+    let srv = start_server().await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["tunnel"]["id"].as_str().unwrap().to_string();
+    let hostname = created["tunnel"]["hostname"].as_str().unwrap();
+    let token = created["token"].as_str().unwrap().to_string();
+
+    let mut params = rcgen::CertificateParams::new(vec![hostname.to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, hostname);
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let csr = params.serialize_request(&key).unwrap().pem().unwrap();
+    srv.state
+        .db
+        .begin_issuance(&id, "cert_failed", &csr)
+        .unwrap();
+    srv.state
+        .db
+        .set_failed("cert_failed", "temporary CA outage")
+        .unwrap();
+
+    let body = serde_json::json!({"csr": csr.clone()}).to_string();
+    let (status, response) = http_request(
+        &srv,
+        "POST",
+        &format!("/api/tunnel/{id}/certificate"),
+        Some(&token),
+        &body,
+    )
+    .await;
+    assert_eq!(status, 202, "{response}");
+    let record = srv.state.db.get_tunnel(&id).unwrap().unwrap();
+    assert_ne!(record.cert_id.as_deref(), Some("cert_failed"));
+    assert_eq!(record.csr_pem.as_deref(), Some(csr.as_str()));
+}
+
+#[tokio::test]
 async fn bridge_attach_and_sni_routing() {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -564,4 +604,79 @@ async fn bridge_attach_and_sni_routing() {
     .expect("active public connection stayed open after tunnel deletion")
     .unwrap();
     expect_close(&mut ws2).await;
+}
+
+#[tokio::test]
+async fn simultaneous_attach_to_same_route_has_one_winner() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let srv = start_server().await;
+    let (status, body) = http_request(&srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["tunnel"]["id"].as_str().unwrap().to_string();
+    let token = created["token"].as_str().unwrap().to_string();
+    srv.state
+        .db
+        .begin_issuance(&id, "cert_concurrent_attach", "dummy-csr")
+        .unwrap();
+    srv.state
+        .db
+        .set_ready(
+            "cert_concurrent_attach",
+            "CERT",
+            "CHAIN",
+            "2099-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+    let tls1 = tls_connect(srv.port, &srv.cert_pem).await;
+    let mut req1 = format!("wss://{DOMAIN}:{}/api/tunnel/{id}/connect", srv.port)
+        .into_client_request()
+        .unwrap();
+    req1.headers_mut()
+        .insert("sec-websocket-protocol", "opentunnel".parse().unwrap());
+    let (mut ws1, _) = tokio_tungstenite::client_async(req1, tls1).await.unwrap();
+
+    let tls2 = tls_connect(srv.port, &srv.cert_pem).await;
+    let mut req2 = format!("wss://{DOMAIN}:{}/api/tunnel/{id}/connect", srv.port)
+        .into_client_request()
+        .unwrap();
+    req2.headers_mut()
+        .insert("sec-websocket-protocol", "opentunnel".parse().unwrap());
+    let (mut ws2, _) = tokio_tungstenite::client_async(req2, tls2).await.unwrap();
+
+    let attach = serde_json::json!({
+        "type": "attach",
+        "token": token,
+        "transport": "ws",
+        "routes": ["@"],
+        "client": {"version": "0.1.0", "max_conns": 256},
+    });
+    let message = tokio_tungstenite::tungstenite::Message::Text(attach.to_string().into());
+    let (sent1, sent2) = tokio::join!(ws1.send(message.clone()), ws2.send(message));
+    sent1.unwrap();
+    sent2.unwrap();
+
+    let response1: serde_json::Value = serde_json::from_str(&recv_text(&mut ws1).await).unwrap();
+    let response2: serde_json::Value = serde_json::from_str(&recv_text(&mut ws2).await).unwrap();
+    let kinds = [
+        response1["type"].as_str().unwrap(),
+        response2["type"].as_str().unwrap(),
+    ];
+    assert!(
+        kinds.contains(&"attached"),
+        "responses: {response1}, {response2}"
+    );
+    assert!(
+        kinds.contains(&"attach_error"),
+        "responses: {response1}, {response2}"
+    );
+    let error = if response1["type"] == "attach_error" {
+        &response1
+    } else {
+        &response2
+    };
+    assert_eq!(error["code"], "route_conflict");
 }
