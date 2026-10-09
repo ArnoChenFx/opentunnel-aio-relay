@@ -302,11 +302,6 @@ impl Acme {
     }
 
     async fn new_account(&mut self) -> Result<()> {
-        let nonce = self.nonce().await?;
-        let protected = json!({
-            "alg": "ES256", "jwk": self.account_jwk,
-            "nonce": nonce, "url": self.dir.new_account,
-        });
         let mut payload = json!({
             "contact": [format!("mailto:{}", self.cfg.email)],
             "termsOfServiceAgreed": true,
@@ -322,22 +317,11 @@ impl Acme {
             )?;
             payload["externalAccountBinding"] = eab;
         }
-        let body = jws_body(
-            &self.key_pkcs8,
-            &protected,
-            serde_json::to_vec(&payload)?.as_slice(),
-        )?;
-        let request = jws_http_request(&self.http, &self.dir.new_account, &body)?;
+        let payload = serde_json::to_vec(&payload)?;
         let res = self
-            .http
-            .execute(request)
+            .post_jws(&self.dir.new_account, false, &payload)
             .await
             .context("creating ACME account")?;
-        let status = res.status();
-        if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
-            bail!("ACME newAccount failed ({status}): {text}");
-        }
         let url = res
             .headers()
             .get("location")
@@ -943,6 +927,112 @@ mod tests {
             serde_json::from_slice::<Value>(request.body().unwrap().as_bytes().unwrap()).unwrap(),
             body
         );
+    }
+
+    #[tokio::test]
+    async fn new_account_retries_bad_nonce_with_a_fresh_nonce() {
+        use axum::body::Bytes;
+        use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{head, post};
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let nonce_count = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let nonce_route = {
+            let nonce_count = nonce_count.clone();
+            head(move || {
+                let nonce_count = nonce_count.clone();
+                async move {
+                    let nonce = nonce_count.fetch_add(1, Ordering::SeqCst);
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        "replay-nonce",
+                        HeaderValue::from_str(&format!("nonce-{nonce}")).unwrap(),
+                    );
+                    (headers, "")
+                }
+            })
+        };
+        let account_route = {
+            let attempts = attempts.clone();
+            let received = received.clone();
+            post(move |body: Bytes| {
+                let attempts = attempts.clone();
+                let received = received.clone();
+                async move {
+                    received
+                        .lock()
+                        .await
+                        .push(serde_json::from_slice(&body).unwrap());
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            r#"{"type":"urn:ietf:params:acme:error:badNonce"}"#,
+                        )
+                            .into_response()
+                    } else {
+                        let mut response = StatusCode::CREATED.into_response();
+                        response.headers_mut().insert(
+                            header::LOCATION,
+                            HeaderValue::from_static("https://acme.test/account/123"),
+                        );
+                        response
+                    }
+                }
+            })
+        };
+        let app = Router::new()
+            .route("/nonce", nonce_route)
+            .route("/account", account_route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let key_pkcs8 = test_key();
+        let (x, y) = public_jwk_coords(&key_pkcs8).unwrap();
+        let mut acme = Acme {
+            http: Client::new(),
+            dir: Directory {
+                new_nonce: format!("{base}/nonce"),
+                new_account: format!("{base}/account"),
+                new_order: format!("{base}/order"),
+            },
+            cfg: AcmeConfig {
+                directory_url: base,
+                email: "test@example.invalid".into(),
+                eab_kid: String::new(),
+                eab_hmac: String::new(),
+                cf_token: String::new(),
+                cf_zone_id: String::new(),
+            },
+            key_pkcs8,
+            account_jwk: public_jwk(&x, &y),
+            account_url: None,
+        };
+
+        let result = acme.new_account().await;
+        server.abort();
+        result.unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(nonce_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            acme.account_url.as_deref(),
+            Some("https://acme.test/account/123")
+        );
+        let received = received.lock().await;
+        assert_eq!(received.len(), 2);
+        for (index, body) in received.iter().enumerate() {
+            let protected = B64.decode(body["protected"].as_str().unwrap()).unwrap();
+            let protected: Value = serde_json::from_slice(&protected).unwrap();
+            assert_eq!(protected["nonce"], format!("nonce-{index}"));
+            assert!(protected.get("jwk").is_some());
+        }
     }
 
     #[test]

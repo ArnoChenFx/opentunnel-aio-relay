@@ -63,6 +63,7 @@ pub struct Session {
 struct ChannelHandle {
     bridge_id: String,
     tx: mpsc::Sender<ChannelMsg>,
+    cancel: watch::Sender<Option<String>>,
 }
 
 #[derive(Default)]
@@ -253,22 +254,16 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
     }
     let bridge_id = format!("sess_{}", random_session_id());
     let (tx, mut rx) = mpsc::channel::<OutMsg>(512);
-    // Conflict check and registration must share one critical section so two
-    // simultaneous attach requests cannot both claim the same route.
-    let conflict = {
-        let mut bridges = session.bridges.lock().await;
-        let conflict = bridges
-            .iter()
-            .any(|b| b.routes.iter().any(|r| routes.iter().any(|want| want == r)));
-        if !conflict {
-            bridges.push(BridgeHandle {
-                id: bridge_id.clone(),
-                routes: routes.clone(),
-                tx,
-            });
-        }
-        conflict
-    };
+    let conflict = !register_bridge(
+        &state.db,
+        &session,
+        BridgeHandle {
+            id: bridge_id.clone(),
+            routes: routes.clone(),
+            tx,
+        },
+    )
+    .await?;
     if conflict {
         send_text(
             socket,
@@ -280,11 +275,9 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         let _ = socket.close().await;
         return Ok(());
     }
-    state.db.set_online(tunnel_id, true, &now_rfc3339())?;
-    state.db.touch_connected(tunnel_id, &now_rfc3339())?;
     tracing::info!(tunnel = %tunnel_id, bridge = %bridge_id, routes = ?routes, "bridge attached");
 
-    send_text(
+    if let Err(error) = send_text(
         socket,
         &ServerMessage::Attached {
             session: bridge_id.clone(),
@@ -293,7 +286,13 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             idle_timeout_ms: bridge::IDLE_TIMEOUT_MS,
         },
     )
-    .await?;
+    .await
+    {
+        // Registration happened before the reply so route ownership is
+        // consistent; if the peer has already gone, release it immediately.
+        detach_bridge(&state.db, &session, &bridge_id).await;
+        return Err(error);
+    }
 
     // Renew now if the certificate is close to expiry (covers idle tunnels
     // coming back). Runs in the background; the current cert keeps serving.
@@ -371,20 +370,43 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         }
     }
 
-    detach_bridge(&state, &session, &bridge_id).await;
+    detach_bridge(&state.db, &session, &bridge_id).await;
     let _ = socket.close().await;
     Ok(())
 }
 
-async fn detach_bridge(state: &AppState, session: &Arc<Session>, bridge_id: &str) {
-    let remaining;
-    {
+async fn register_bridge(db: &Db, session: &Session, bridge: BridgeHandle) -> Result<bool> {
+    let mut bridges = session.bridges.lock().await;
+    if session.is_closed() {
+        return Err(Error::Internal("tunnel was deleted".into()));
+    }
+    let conflict = bridges.iter().any(|b| {
+        b.routes
+            .iter()
+            .any(|r| bridge.routes.iter().any(|want| want == r))
+    });
+    if conflict {
+        return Ok(false);
+    }
+
+    // Persist membership transitions while holding the same lock used by
+    // detach, so a delayed offline write cannot overwrite a newer attach.
+    db.set_online(&session.id, true, &now_rfc3339())?;
+    bridges.push(bridge);
+    Ok(true)
+}
+
+async fn detach_bridge(db: &Db, session: &Session, bridge_id: &str) {
+    let owned_channels = {
         let mut bridges = session.bridges.lock().await;
         bridges.retain(|b| b.id != bridge_id);
-        remaining = bridges.len();
-    }
-    // Abort only channels owned by this bridge; other bridges remain active.
-    let owned_senders = {
+        if bridges.is_empty() {
+            // Serialize the persisted online state with later bridge attaches.
+            let _ = db.set_online(&session.id, false, &now_rfc3339());
+        }
+
+        // Route removal and channel cleanup are ordered against
+        // open_channel_for_route, which takes these locks in the same order.
         let mut channels = session.channels.lock().await;
         let owned: Vec<ConnId> = channels
             .iter()
@@ -392,18 +414,18 @@ async fn detach_bridge(state: &AppState, session: &Arc<Session>, bridge_id: &str
             .collect();
         owned
             .into_iter()
-            .filter_map(|conn| channels.remove(&conn).map(|channel| channel.tx))
+            .filter_map(|conn| channels.remove(&conn))
             .collect::<Vec<_>>()
     };
-    for tx in owned_senders {
-        let _ = tx
-            .send(ChannelMsg::Reset("bridge_disconnected".into()))
-            .await;
-    }
-    if remaining == 0 {
-        let _ = state.db.set_online(&session.id, false, &now_rfc3339());
+    for channel in owned_channels {
+        cancel_channel(channel, "bridge_disconnected");
     }
     tracing::info!(tunnel = %session.id, bridge = %bridge_id, "bridge detached");
+}
+
+fn cancel_channel(channel: ChannelHandle, reason: &str) {
+    channel.cancel.send_replace(Some(reason.to_string()));
+    let _ = channel.tx.try_send(ChannelMsg::Reset(reason.to_string()));
 }
 
 /// Handles an incoming control message. Returns a reply to send, if any.
@@ -485,6 +507,45 @@ impl Session {
             .map(|b| (b.id.clone(), b.tx.clone()))
     }
 
+    /// Atomically resolves a route and registers its channel. Bridge removal
+    /// uses the same lock order, so it either sees this channel and cancels it
+    /// or the route lookup fails after the bridge is gone.
+    pub async fn open_channel_for_route(
+        &self,
+        route: &str,
+    ) -> Option<(
+        ConnId,
+        mpsc::Receiver<ChannelMsg>,
+        watch::Receiver<Option<String>>,
+        mpsc::Sender<OutMsg>,
+    )> {
+        let _bridges = self.bridges.lock().await;
+        if self.is_closed() {
+            return None;
+        }
+        let (bridge_id, bridge_tx) = _bridges
+            .iter()
+            .find(|bridge| bridge.routes.iter().any(|candidate| candidate == route))
+            .map(|bridge| (bridge.id.clone(), bridge.tx.clone()))?;
+
+        let mut channels = self.channels.lock().await;
+        let mut conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
+        while conn == 0 || channels.contains_key(&conn) {
+            conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
+        }
+        let (tx, rx) = mpsc::channel::<ChannelMsg>(256);
+        let (cancel, cancel_rx) = watch::channel(None);
+        channels.insert(
+            conn,
+            ChannelHandle {
+                bridge_id: bridge_id.clone(),
+                tx,
+                cancel,
+            },
+        );
+        Some((conn, rx, cancel_rx, bridge_tx))
+    }
+
     /// Registers a new proxied connection; returns its connection id.
     pub async fn open_channel(&self, bridge_id: &str) -> (ConnId, mpsc::Receiver<ChannelMsg>) {
         let mut conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
@@ -498,6 +559,7 @@ impl Session {
             ChannelHandle {
                 bridge_id: bridge_id.to_string(),
                 tx,
+                cancel: watch::channel(None).0,
             },
         );
         (conn, rx)
@@ -512,7 +574,9 @@ impl Session {
     }
 
     pub async fn close_channel(&self, conn: ConnId) {
-        self.channels.lock().await.remove(&conn);
+        if let Some(channel) = self.channels.lock().await.remove(&conn) {
+            channel.cancel.send_replace(Some("channel_closed".into()));
+        }
     }
 
     pub async fn send_data(
@@ -549,15 +613,177 @@ impl Session {
 
     async fn shutdown_live_connections(&self) {
         self.bridges.lock().await.clear();
-        let senders = {
+        let channels = {
             let mut channels = self.channels.lock().await;
             channels
                 .drain()
-                .map(|(_, channel)| channel.tx)
+                .map(|(_, channel)| channel)
                 .collect::<Vec<_>>()
         };
-        for tx in senders {
-            let _ = tx.send(ChannelMsg::Reset("tunnel_deleted".into())).await;
+        for channel in channels {
+            cancel_channel(channel, "tunnel_deleted");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_session(id: &str) -> Arc<Session> {
+        let (shutdown, _) = watch::channel(false);
+        Arc::new(Session {
+            id: id.to_string(),
+            hostname: format!("{id}.relay.test"),
+            token_hash: "hash".into(),
+            cert_ready: AtomicBool::new(true),
+            bridges: AsyncMutex::new(Vec::new()),
+            channels: AsyncMutex::new(HashMap::new()),
+            next_conn: AtomicU32::new(1),
+            closed: AtomicBool::new(false),
+            shutdown,
+        })
+    }
+
+    fn test_db() -> (Arc<Db>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ot-relay-bridge-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Arc::new(Db::open(&path).unwrap());
+        db.create_tunnel("test", "test.relay.test", "hash", "now")
+            .unwrap();
+        (db, path)
+    }
+
+    fn bridge(id: &str, route: &str) -> BridgeHandle {
+        let (tx, _rx) = mpsc::channel(8);
+        BridgeHandle {
+            id: id.into(),
+            routes: vec![route.into()],
+            tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_detach_race_keeps_online_state_in_sync_with_membership() {
+        let (db, path) = test_db();
+        let session = test_session("test");
+        assert!(register_bridge(&db, &session, bridge("old", "@"))
+            .await
+            .unwrap());
+
+        let db_detach = db.clone();
+        let session_detach = session.clone();
+        let db_attach = db.clone();
+        let session_attach = session.clone();
+        let ((), attached) = tokio::join!(
+            detach_bridge(&db_detach, &session_detach, "old"),
+            register_bridge(&db_attach, &session_attach, bridge("new", "api")),
+        );
+        assert!(attached.unwrap());
+        assert_eq!(session.bridges.lock().await.len(), 1);
+        assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "online");
+
+        detach_bridge(&db, &session, "new").await;
+        assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "offline");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn route_open_racing_bridge_detach_cannot_leave_an_orphan_channel() {
+        let (db, path) = test_db();
+        let session = test_session("test");
+        assert!(register_bridge(&db, &session, bridge("only", "@"))
+            .await
+            .unwrap());
+
+        let (opened, ()) = tokio::join!(
+            session.open_channel_for_route("@"),
+            detach_bridge(&db, &session, "only"),
+        );
+        drop(opened);
+        assert!(session.channels.lock().await.is_empty());
+        assert!(session.open_channel_for_route("@").await.is_none());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_shutdown_does_not_wait_for_a_full_channel_queue() {
+        let session = test_session("test");
+        let (tx, _rx) = mpsc::channel(256);
+        for _ in 0..256 {
+            tx.try_send(ChannelMsg::Data(vec![1])).unwrap();
+        }
+        let (cancel, mut cancel_rx) = watch::channel(None);
+        session.channels.lock().await.insert(
+            1,
+            ChannelHandle {
+                bridge_id: "bridge".into(),
+                tx,
+                cancel,
+            },
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.shutdown_live_connections(),
+        )
+        .await
+        .expect("shutdown blocked on a full per-channel queue");
+        assert_eq!(
+            cancel_rx.borrow_and_update().as_deref(),
+            Some("tunnel_deleted")
+        );
+        assert!(session.channels.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bridge_detach_does_not_wait_for_a_full_channel_queue() {
+        let (db, path) = test_db();
+        let session = test_session("test");
+        assert!(register_bridge(&db, &session, bridge("bridge", "@"))
+            .await
+            .unwrap());
+        let (tx, _rx) = mpsc::channel(256);
+        for _ in 0..256 {
+            tx.try_send(ChannelMsg::Data(vec![1])).unwrap();
+        }
+        let (cancel, mut cancel_rx) = watch::channel(None);
+        session.channels.lock().await.insert(
+            1,
+            ChannelHandle {
+                bridge_id: "bridge".into(),
+                tx,
+                cancel,
+            },
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            detach_bridge(&db, &session, "bridge"),
+        )
+        .await
+        .expect("bridge detach blocked on a full per-channel queue");
+        assert_eq!(
+            cancel_rx.borrow_and_update().as_deref(),
+            Some("bridge_disconnected")
+        );
+        assert!(session.channels.lock().await.is_empty());
+        assert_eq!(db.get_tunnel("test").unwrap().unwrap().state, "offline");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 }

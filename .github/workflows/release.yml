@@ -127,14 +127,26 @@ jobs:
       - name: Checksums
         run: (cd dist && sha256sum *.tar.gz > sha256sums.txt && cat sha256sums.txt)
 
+      - name: Classify release tag
+        id: release-class
+        if: github.ref_type == 'tag'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION%%+*}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
           name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
-          prerelease: ${{ github.ref_type != 'tag' }}
+          prerelease: ${{ github.ref_type != 'tag' || steps.release-class.outputs.prerelease == 'true' }}
           generate_release_notes: ${{ github.ref_type == 'tag' }}
-          make_latest: ${{ github.ref_type == 'tag' && 'true' || 'false' }}
+          make_latest: ${{ github.ref_type == 'tag' && steps.release-class.outputs.prerelease != 'true' && 'true' || 'false' }}
           files: |
             dist/*.tar.gz
             dist/sha256sums.txt

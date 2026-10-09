@@ -15,6 +15,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::ServiceExt;
 
 use crate::bridge::{ChannelMsg, OutMsg};
@@ -25,6 +26,7 @@ use crate::state::AppState;
 
 const CLIENT_HELLO_LIMIT: usize = 64 * 1024;
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_HANDSHAKES: usize = 256;
 
 pub async fn run(state: Arc<AppState>, router: Router) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&state.config.listen).await?;
@@ -37,16 +39,25 @@ pub async fn run_on(
     state: Arc<AppState>,
     router: Router,
 ) -> anyhow::Result<()> {
+    let handshake_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     loop {
         let (socket, peer) = listener.accept().await?;
+        let Some(permit) = try_acquire_handshake(&handshake_permits) else {
+            drop(socket);
+            continue;
+        };
         let state = state.clone();
         let router = router.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, peer, state, router).await {
+            if let Err(e) = handle_connection(socket, peer, state, router, permit).await {
                 tracing::debug!(%peer, error = %e, "ingress connection closed");
             }
         });
     }
+}
+
+fn try_acquire_handshake(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(permits).try_acquire_owned().ok()
 }
 
 async fn handle_connection(
@@ -54,14 +65,16 @@ async fn handle_connection(
     peer: SocketAddr,
     state: Arc<AppState>,
     router: Router,
+    permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + CLIENT_HELLO_TIMEOUT;
     let (buf, hello) = read_client_hello_until(&mut socket, deadline).await?;
 
     let domain = state.config.domain.to_lowercase();
     if hello.server_name == domain {
-        return serve_api(socket, buf, state, router, deadline).await;
+        return serve_api(socket, buf, state, router, deadline, permit).await;
     }
+    drop(permit);
     serve_tunnel(socket, peer, buf, hello.server_name, hello.alpn, state).await
 }
 
@@ -152,6 +165,7 @@ async fn serve_api(
     state: Arc<AppState>,
     router: Router,
     deadline: tokio::time::Instant,
+    permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let tls_config = state.api_tls.read().await.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -160,6 +174,7 @@ async fn serve_api(
         inner: socket,
     };
     let tls = accept_tls_until(&acceptor, stream, deadline).await?;
+    drop(permit);
     let io = TokioIo::new(tls);
     let svc = hyper_util::service::TowerToHyperService::new(tower::service_fn(
         move |req: hyper::Request<hyper::body::Incoming>| {
@@ -232,12 +247,10 @@ async fn serve_tunnel(
     }
     let route = names::route_for_sni(&sni, &session.hostname)
         .ok_or_else(|| Error::Internal("unknown route".into()))?;
-    let (bridge_id, bridge_tx) = session
-        .bridge_for_route(&route)
+    let (conn, mut chan_rx, mut channel_shutdown, bridge_tx) = session
+        .open_channel_for_route(&route)
         .await
         .ok_or_else(|| Error::Internal("no bridge for route".into()))?;
-
-    let (conn, mut chan_rx) = session.open_channel(&bridge_id).await;
     tracing::debug!(tunnel = %session.id, %route, %conn, %peer, "proxying connection");
 
     // Tell the bridge about the new connection, then replay the buffered
@@ -284,10 +297,31 @@ async fn serve_tunnel(
     // Bridge -> public socket.
     let pump_down = async move {
         loop {
-            match chan_rx.recv().await {
-                Some(ChannelMsg::Data(data)) => writer.write_all(&data).await?,
+            let message = tokio::select! {
+                changed = channel_shutdown.changed() => {
+                    let _ = changed;
+                    return Err(anyhow::anyhow!("bridge channel cancelled: {}", channel_cancel_reason(&channel_shutdown)));
+                }
+                message = chan_rx.recv() => message,
+            };
+            match message {
+                Some(ChannelMsg::Data(data)) => {
+                    tokio::select! {
+                        result = writer.write_all(&data) => result?,
+                        changed = channel_shutdown.changed() => {
+                            let _ = changed;
+                            return Err(anyhow::anyhow!("bridge channel cancelled: {}", channel_cancel_reason(&channel_shutdown)));
+                        }
+                    }
+                }
                 Some(ChannelMsg::End) => {
-                    writer.shutdown().await?;
+                    tokio::select! {
+                        result = writer.shutdown() => result?,
+                        changed = channel_shutdown.changed() => {
+                            let _ = changed;
+                            return Err(anyhow::anyhow!("bridge channel cancelled: {}", channel_cancel_reason(&channel_shutdown)));
+                        }
+                    }
                     return Ok::<(), anyhow::Error>(());
                 }
                 Some(ChannelMsg::Reset(reason)) => {
@@ -313,6 +347,13 @@ async fn serve_tunnel(
     }
     session.close_channel(conn).await;
     Ok(())
+}
+
+fn channel_cancel_reason(shutdown: &tokio::sync::watch::Receiver<Option<String>>) -> String {
+    shutdown
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| "channel closed".into())
 }
 
 #[cfg(test)]
@@ -388,6 +429,18 @@ mod tests {
             .unwrap();
         assert!(server.unwrap_err().to_string().contains("timeout"));
         client.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_handshake_limit_rejects_excess_and_releases_capacity() {
+        let permits = Arc::new(Semaphore::new(2));
+        let first = try_acquire_handshake(&permits).expect("first permit");
+        let second = try_acquire_handshake(&permits).expect("second permit");
+        assert!(try_acquire_handshake(&permits).is_none());
+
+        drop(first);
+        assert!(try_acquire_handshake(&permits).is_some());
+        drop(second);
     }
 
     struct StallClientReads(TcpStream);
