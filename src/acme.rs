@@ -2,8 +2,9 @@
 //! certificate lifecycle management.
 //!
 //! This replaces the Cloudflare Workflow of the hosted deployment. The flow
-//! is the same: DNS-01 challenges via the Cloudflare DNS API, TXT cleanup
-//! afterwards, and renewals driven by a background task. The private keys
+//! is the same: DNS-01 challenges via the configured DNS provider (Cloudflare
+//! or Alibaba Cloud DNS), TXT cleanup afterwards, and renewals driven by a
+//! background task. The private keys
 //! never leave the machines that generated them: tunnel keys stay on the
 //! clients (only CSRs are submitted), and the ACME account key is generated
 //! once and kept in the local database.

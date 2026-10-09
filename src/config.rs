@@ -26,14 +26,42 @@ pub struct Config {
     #[arg(long, env = "OT_DATA_DIR", default_value = "./data")]
     pub data_dir: PathBuf,
 
+    /// DNS service that publishes the ACME DNS-01 TXT records: `cloudflare` or
+    /// `aliyun`. Empty picks `aliyun` when only Alibaba Cloud credentials are
+    /// set, and `cloudflare` otherwise.
+    #[arg(long, env = "OT_DNS_PROVIDER", default_value = "")]
+    pub dns_provider: String,
+
     /// Cloudflare API token with DNS edit access to the zone of OT_DOMAIN.
-    /// Used for ACME DNS-01 challenges.
-    #[arg(long, env = "OT_CF_TOKEN")]
+    /// Required when the DNS provider is `cloudflare`.
+    #[arg(long, env = "OT_CF_TOKEN", default_value = "")]
     pub cf_token: String,
 
-    /// Cloudflare zone ID of OT_DOMAIN.
-    #[arg(long, env = "OT_CF_ZONE_ID")]
+    /// Cloudflare zone ID of OT_DOMAIN. Required when the DNS provider is `cloudflare`.
+    #[arg(long, env = "OT_CF_ZONE_ID", default_value = "")]
     pub cf_zone_id: String,
+
+    /// AccessKey ID of an Alibaba Cloud RAM user that may manage TXT records in
+    /// the zone of OT_DOMAIN. Required when the DNS provider is `aliyun`.
+    #[arg(long, env = "OT_ALIYUN_ACCESS_KEY_ID", default_value = "")]
+    pub aliyun_access_key_id: String,
+
+    /// AccessKey secret of OT_ALIYUN_ACCESS_KEY_ID.
+    #[arg(long, env = "OT_ALIYUN_ACCESS_KEY_SECRET", default_value = "")]
+    pub aliyun_access_key_secret: String,
+
+    /// Registered domain in Alibaba Cloud DNS that contains OT_DOMAIN, such as
+    /// example.com. Empty looks the zone up with DescribeDomains.
+    #[arg(long, env = "OT_ALIYUN_DOMAIN", default_value = "")]
+    pub aliyun_domain: String,
+
+    /// Alibaba Cloud DNS API host. The public endpoint is the default.
+    #[arg(
+        long,
+        env = "OT_ALIYUN_ENDPOINT",
+        default_value = "alidns.aliyuncs.com"
+    )]
+    pub aliyun_endpoint: String,
 
     /// ACME external account binding. Only needed for CAs that require it
     /// (e.g. ZeroSSL: dashboard -> Developer). Leave empty for Let's Encrypt.
@@ -118,6 +146,22 @@ pub struct Config {
     pub timeouts: Timeouts,
 }
 
+/// The DNS service that publishes ACME DNS-01 TXT records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsProviderKind {
+    Cloudflare,
+    Aliyun,
+}
+
+impl DnsProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Aliyun => "aliyun",
+        }
+    }
+}
+
 impl Config {
     /// Puts operator-supplied values into the canonical form the rest of the
     /// server compares against. Run once at startup, before anything serves.
@@ -134,8 +178,83 @@ impl Config {
             self.reserved_connections,
             self.max_connections
         );
+        self.aliyun_access_key_id = self.aliyun_access_key_id.trim().to_string();
+        self.aliyun_access_key_secret = self.aliyun_access_key_secret.trim().to_string();
+        self.aliyun_domain = normalize_domain(&self.aliyun_domain);
+        self.aliyun_endpoint = normalize_endpoint(&self.aliyun_endpoint)?;
+        if self.dns_provider_kind()? == DnsProviderKind::Aliyun && !self.aliyun_domain.is_empty() {
+            anyhow::ensure!(
+                self.domain == self.aliyun_domain
+                    || self.domain.ends_with(&format!(".{}", self.aliyun_domain)),
+                "OT_DOMAIN ({}) is not inside OT_ALIYUN_DOMAIN ({})",
+                self.domain,
+                self.aliyun_domain
+            );
+        }
         Ok(())
     }
+
+    /// The DNS service in use: the one named by OT_DNS_PROVIDER, or else the
+    /// one whose credentials are set, with Cloudflare when both are.
+    pub fn dns_provider_kind(&self) -> anyhow::Result<DnsProviderKind> {
+        let has_cloudflare = !self.cf_token.trim().is_empty() || !self.cf_zone_id.trim().is_empty();
+        let has_aliyun = !self.aliyun_access_key_id.trim().is_empty()
+            || !self.aliyun_access_key_secret.trim().is_empty();
+        let kind = match self.dns_provider.trim().to_ascii_lowercase().as_str() {
+            "cloudflare" => DnsProviderKind::Cloudflare,
+            "aliyun" => DnsProviderKind::Aliyun,
+            "" if has_aliyun && !has_cloudflare => DnsProviderKind::Aliyun,
+            "" if !has_cloudflare && !has_aliyun => anyhow::bail!(
+                "no DNS credentials are set: set OT_CF_TOKEN and OT_CF_ZONE_ID for Cloudflare, \
+                 or OT_ALIYUN_ACCESS_KEY_ID and OT_ALIYUN_ACCESS_KEY_SECRET for Alibaba Cloud DNS"
+            ),
+            "" => DnsProviderKind::Cloudflare,
+            other => {
+                anyhow::bail!("OT_DNS_PROVIDER must be `cloudflare` or `aliyun`, got {other:?}")
+            }
+        };
+        let required: [(&str, &String); 2] = match kind {
+            DnsProviderKind::Cloudflare => [
+                ("OT_CF_TOKEN", &self.cf_token),
+                ("OT_CF_ZONE_ID", &self.cf_zone_id),
+            ],
+            DnsProviderKind::Aliyun => [
+                ("OT_ALIYUN_ACCESS_KEY_ID", &self.aliyun_access_key_id),
+                (
+                    "OT_ALIYUN_ACCESS_KEY_SECRET",
+                    &self.aliyun_access_key_secret,
+                ),
+            ],
+        };
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|(_, value)| value.trim().is_empty())
+            .map(|(name, _)| *name)
+            .collect();
+        anyhow::ensure!(
+            missing.is_empty(),
+            "the {} DNS provider needs {}",
+            kind.as_str(),
+            missing.join(" and ")
+        );
+        Ok(kind)
+    }
+}
+
+/// Canonical form of the Alibaba Cloud DNS endpoint: a bare host name, which
+/// may carry a port.
+fn normalize_endpoint(raw: &str) -> anyhow::Result<String> {
+    let endpoint = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if endpoint.is_empty() {
+        return Ok("alidns.aliyuncs.com".to_string());
+    }
+    anyhow::ensure!(
+        !endpoint.contains("://")
+            && !endpoint.contains('/')
+            && !endpoint.contains(char::is_whitespace),
+        "OT_ALIYUN_ENDPOINT must be a host name such as alidns.aliyuncs.com, got {raw:?}"
+    );
+    Ok(endpoint)
 }
 
 /// Two full-size frames: enough for one in flight and one waiting.
@@ -281,5 +400,184 @@ mod tests {
         ])
         .unwrap();
         assert!(config.normalize().is_err());
+    }
+
+    #[test]
+    fn cloudflare_is_the_default_dns_provider() {
+        let config = parse(&["--dns-provider", ""]);
+        assert_eq!(
+            config.dns_provider_kind().unwrap(),
+            DnsProviderKind::Cloudflare
+        );
+    }
+
+    #[test]
+    fn aliyun_is_chosen_when_only_its_credentials_are_set() {
+        let config = Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--dns-provider",
+            "",
+            "--cf-token",
+            "",
+            "--cf-zone-id",
+            "",
+            "--aliyun-access-key-id",
+            "LTAItest",
+            "--aliyun-access-key-secret",
+            "secret",
+        ])
+        .unwrap();
+        assert_eq!(config.dns_provider_kind().unwrap(), DnsProviderKind::Aliyun);
+    }
+
+    #[test]
+    fn cloudflare_is_chosen_when_both_providers_have_credentials() {
+        let config = Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--dns-provider",
+            "",
+            "--cf-token",
+            "t",
+            "--cf-zone-id",
+            "z",
+            "--aliyun-access-key-id",
+            "LTAItest",
+            "--aliyun-access-key-secret",
+            "secret",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.dns_provider_kind().unwrap(),
+            DnsProviderKind::Cloudflare
+        );
+    }
+
+    #[test]
+    fn an_explicit_provider_wins_and_needs_its_own_credentials() {
+        let config = Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--dns-provider",
+            "ALIYUN",
+            "--cf-token",
+            "t",
+            "--cf-zone-id",
+            "z",
+            "--aliyun-access-key-id",
+            "LTAItest",
+            "--aliyun-access-key-secret",
+            "secret",
+        ])
+        .unwrap();
+        assert_eq!(config.dns_provider_kind().unwrap(), DnsProviderKind::Aliyun);
+
+        let mut config = Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--dns-provider",
+            "aliyun",
+            "--cf-token",
+            "t",
+            "--cf-zone-id",
+            "z",
+            "--aliyun-access-key-id",
+            "",
+            "--aliyun-access-key-secret",
+            "",
+        ])
+        .unwrap();
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("OT_ALIYUN_ACCESS_KEY_ID"), "{error}");
+    }
+
+    #[test]
+    fn unknown_provider_and_missing_credentials_are_rejected() {
+        let config = parse(&["--dns-provider", "route53"]);
+        assert!(config.dns_provider_kind().is_err());
+
+        let config = Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            "relay.test",
+            "--dns-provider",
+            "",
+            "--cf-token",
+            "",
+            "--cf-zone-id",
+            "",
+        ])
+        .unwrap();
+        let error = config.dns_provider_kind().unwrap_err().to_string();
+        assert!(error.contains("OT_CF_TOKEN"), "{error}");
+        assert!(error.contains("OT_ALIYUN_ACCESS_KEY_ID"), "{error}");
+    }
+
+    #[test]
+    fn aliyun_domain_must_contain_the_relay_domain() {
+        let with_zone = |domain: &str, zone: &str| {
+            Config::try_parse_from([
+                "opentunnel-relay",
+                "--domain",
+                domain,
+                "--dns-provider",
+                "aliyun",
+                "--cf-token",
+                "",
+                "--cf-zone-id",
+                "",
+                "--aliyun-access-key-id",
+                "LTAItest",
+                "--aliyun-access-key-secret",
+                "secret",
+                "--aliyun-domain",
+                zone,
+            ])
+            .unwrap()
+        };
+        assert!(with_zone("relay.test", "example.com").normalize().is_err());
+        assert!(with_zone("tunnel.example.com", "example.com")
+            .normalize()
+            .is_ok());
+        assert!(with_zone("Tunnel.Example.COM.", "example.com.")
+            .normalize()
+            .is_ok());
+    }
+
+    #[test]
+    fn aliyun_endpoint_must_be_a_bare_host() {
+        let endpoint_after_normalize = |endpoint: &str| {
+            let mut config = Config::try_parse_from([
+                "opentunnel-relay",
+                "--domain",
+                "relay.test",
+                "--dns-provider",
+                "aliyun",
+                "--cf-token",
+                "",
+                "--cf-zone-id",
+                "",
+                "--aliyun-access-key-id",
+                "LTAItest",
+                "--aliyun-access-key-secret",
+                "secret",
+                "--aliyun-endpoint",
+                endpoint,
+            ])
+            .unwrap();
+            config.normalize().map(|()| config.aliyun_endpoint)
+        };
+        assert_eq!(
+            endpoint_after_normalize("Alidns.AliyunCS.com.").unwrap(),
+            "alidns.aliyuncs.com"
+        );
+        assert_eq!(endpoint_after_normalize("").unwrap(), "alidns.aliyuncs.com");
+        assert!(endpoint_after_normalize("https://alidns.aliyuncs.com").is_err());
+        assert!(endpoint_after_normalize("alidns.aliyuncs.com/path").is_err());
     }
 }

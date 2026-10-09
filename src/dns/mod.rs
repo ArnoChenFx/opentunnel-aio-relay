@@ -5,6 +5,7 @@
 //! that hosts the zone, and [`wait_for_txt`] confirms that public resolvers can
 //! see them before the CA is asked to validate.
 
+mod aliyun;
 mod cloudflare;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -19,8 +20,9 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::{Config, DnsProviderKind};
 
+pub use aliyun::AliyunDns;
 pub use cloudflare::CloudflareDns;
 
 /// A boxed future, which keeps [`DnsProvider`] usable as a trait object
@@ -38,12 +40,22 @@ pub trait DnsProvider: Send + Sync {
     fn delete_txt<'a>(&'a self, record_id: &'a str) -> BoxFuture<'a, Result<()>>;
 }
 
+/// The provider the configuration selects.
 pub fn from_config(config: &Config, http: Client) -> Result<Arc<dyn DnsProvider>> {
-    let provider: Arc<dyn DnsProvider> = Arc::new(CloudflareDns::new(
-        http,
-        config.cf_zone_id.clone(),
-        config.cf_token.clone(),
-    ));
+    let provider: Arc<dyn DnsProvider> = match config.dns_provider_kind()? {
+        DnsProviderKind::Cloudflare => Arc::new(CloudflareDns::new(
+            http,
+            config.cf_zone_id.clone(),
+            config.cf_token.clone(),
+        )),
+        DnsProviderKind::Aliyun => Arc::new(AliyunDns::new(
+            http,
+            &config.aliyun_endpoint,
+            &config.aliyun_access_key_id,
+            &config.aliyun_access_key_secret,
+            Some(config.aliyun_domain.as_str()).filter(|domain| !domain.is_empty()),
+        )?),
+    };
     Ok(provider)
 }
 

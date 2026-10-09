@@ -31,6 +31,10 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Config::parse();
     config.normalize()?;
+    tracing::info!(
+        dns_provider = config.dns_provider_kind()?.as_str(),
+        "ACME DNS-01 challenges will use this DNS provider"
+    );
     // rustls uses the process-wide default provider; make it ring explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
