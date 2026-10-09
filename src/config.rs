@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Single-binary self-hosted relay for the OpenTunnel protocol.
 ///
@@ -52,4 +53,25 @@ pub struct Config {
 
     #[arg(long, env = "OT_ACME_EMAIL", default_value = "acme@localhost")]
     pub acme_email: String,
+
+    #[arg(skip)]
+    pub timeouts: Timeouts,
+}
+
+/// Internal time budgets. Not exposed as flags: they only need to change in tests.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// How long a full per-connection queue may block the bridge reader before
+    /// that one connection is reset. The official client uses the same policy
+    /// with a 30 s budget; this relay uses a shorter one because the reader is
+    /// shared, so every other stream on the bridge waits while it blocks.
+    pub bridge_stall: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            bridge_stall: Duration::from_secs(10),
+        }
+    }
 }

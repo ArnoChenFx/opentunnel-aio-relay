@@ -9,7 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opentunnel_relay::{
-    acme, api, bridge::SessionManager, config::Config, db::Db, ingress, state::AppState,
+    acme, api,
+    bridge::SessionManager,
+    config::{Config, Timeouts},
+    db::Db,
+    ingress,
+    state::AppState,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,6 +38,9 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         acme_eab_hmac: "test".to_string(),
         acme_url: "https://example.invalid".to_string(),
         acme_email: "test@example.invalid".to_string(),
+        timeouts: Timeouts {
+            bridge_stall: Duration::from_millis(500),
+        },
     }
 }
 
@@ -604,6 +612,231 @@ async fn bridge_attach_and_sni_routing() {
     .expect("active public connection stayed open after tunnel deletion")
     .unwrap();
     expect_close(&mut ws2).await;
+}
+
+type Bridge = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+/// Provisions a tunnel with a ready certificate and attaches one bridge that
+/// serves the base route.
+async fn attached_bridge(srv: &TestServer) -> (String, Bridge) {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (status, body) = http_request(srv, "POST", "/api/tunnel", None, "{}").await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["tunnel"]["id"].as_str().unwrap().to_string();
+    let token = created["token"].as_str().unwrap().to_string();
+    srv.state
+        .db
+        .begin_issuance(&id, "cert_streams", "dummy-csr")
+        .unwrap();
+    srv.state
+        .db
+        .set_ready("cert_streams", "CERT", "CHAIN", "2099-01-01T00:00:00Z")
+        .unwrap();
+
+    let tls = tls_connect(srv.port, &srv.cert_pem).await;
+    let mut req = format!("wss://{DOMAIN}:{}/api/tunnel/{id}/connect", srv.port)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "opentunnel".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::client_async(req, tls).await.unwrap();
+    let attach = serde_json::json!({
+        "type": "attach",
+        "token": token,
+        "transport": "ws",
+        "routes": ["@"],
+        "client": {"version": "0.1.0", "max_conns": 256},
+    });
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        attach.to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let attached: serde_json::Value = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
+    assert_eq!(attached["type"], "attached");
+    (id, ws)
+}
+
+/// Connects a visitor with the given SNI and waits for the bridge to announce
+/// the connection. `recv_buffer` shrinks the visitor's kernel receive buffer so
+/// a visitor that stops reading backs up quickly.
+async fn open_visitor(
+    port: u16,
+    bridge: &mut Bridge,
+    sni: &str,
+    recv_buffer: Option<u32>,
+) -> (TcpStream, u32) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Some(size) = recv_buffer {
+        socket.set_recv_buffer_size(size).unwrap();
+    }
+    let mut public = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+    public.write_all(&client_hello(sni)).await.unwrap();
+    let conn = expect_open(bridge, sni).await;
+    (public, conn)
+}
+
+async fn expect_reset<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    expected_conn: u32,
+    expected_code: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use futures_util::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for reset")
+            .expect("bridge closed")
+            .unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            let control: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if control["type"] == "reset" && control["conn"].as_u64() == Some(expected_conn as u64)
+            {
+                assert_eq!(control["code"], expected_code);
+                return;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stalled_visitor_is_reset_while_other_streams_keep_flowing() {
+    use futures_util::SinkExt;
+    use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
+
+    let srv = start_server().await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut stalled, stalled_conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
+    let (mut healthy, healthy_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    // Far more than the connection queue and kernel buffers can absorb, so the
+    // bridge must give up on this visitor. The socket is never read from.
+    let frame = encode_data_frame(stalled_conn, &vec![0xEE; MAX_PAYLOAD_SIZE]);
+    for _ in 0..512 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            frame.clone().into(),
+        ))
+        .await
+        .unwrap();
+    }
+    expect_reset(&mut ws, stalled_conn, "backpressure").await;
+
+    // The stalled visitor is closed, either by EOF or by a reset error.
+    let mut drained = Vec::new();
+    let closed =
+        tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut drained)).await;
+    assert!(closed.is_ok(), "stalled visitor socket was not closed");
+
+    let request = b"after the reset";
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        encode_data_frame(healthy_conn, request).into(),
+    ))
+    .await
+    .unwrap();
+    let mut received = vec![0u8; request.len()];
+    tokio::time::timeout(Duration::from_secs(5), healthy.read_exact(&mut received))
+        .await
+        .expect("healthy connection stalled after the reset")
+        .unwrap();
+    assert_eq!(received, request);
+}
+
+#[tokio::test]
+async fn full_queue_delivers_every_frame_and_end_in_order() {
+    use futures_util::SinkExt;
+    use opentunnel_relay::proto::bridge::{encode_data_frame, MAX_PAYLOAD_SIZE};
+
+    let srv = start_server().await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut visitor, conn) = open_visitor(srv.port, &mut ws, &sni, Some(4096)).await;
+
+    // The visitor waits before reading, so the connection queue fills and the
+    // End frame must wait behind it. Nothing may be dropped, and the stall
+    // budget must not expire. Each frame carries its index to catch reordering.
+    let frames: Vec<Vec<u8>> = (0..600u32)
+        .map(|i| {
+            let mut payload = vec![0xAB; MAX_PAYLOAD_SIZE];
+            payload[..4].copy_from_slice(&i.to_be_bytes());
+            payload
+        })
+        .collect();
+    let expected = frames.concat();
+    let reader = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), visitor.read_to_end(&mut received))
+            .await
+            .expect("visitor never reached end-of-stream")
+            .unwrap();
+        received
+    });
+    for payload in &frames {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            encode_data_frame(conn, payload).into(),
+        ))
+        .await
+        .unwrap();
+    }
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"type": "end", "conn": conn})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let received = reader.await.unwrap();
+    assert_eq!(received.len(), expected.len());
+    assert!(
+        received == expected,
+        "visitor received altered or reordered data"
+    );
+}
+
+#[tokio::test]
+async fn client_reset_closes_only_that_visitor_socket() {
+    use futures_util::SinkExt;
+    use opentunnel_relay::proto::bridge::encode_data_frame;
+
+    let srv = start_server().await;
+    let (id, mut ws) = attached_bridge(&srv).await;
+    let sni = format!("{id}.{DOMAIN}");
+    let (mut aborted, aborted_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+    let (mut kept, kept_conn) = open_visitor(srv.port, &mut ws, &sni, None).await;
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"type": "reset", "conn": aborted_conn, "code": "upstream_io_error"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let mut drained = Vec::new();
+    let closed =
+        tokio::time::timeout(Duration::from_secs(3), aborted.read_to_end(&mut drained)).await;
+    assert!(
+        closed.is_ok(),
+        "client reset did not close the visitor socket"
+    );
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        encode_data_frame(kept_conn, b"still open").into(),
+    ))
+    .await
+    .unwrap();
+    let mut received = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(3), kept.read_exact(&mut received))
+        .await
+        .expect("unrelated connection was reset")
+        .unwrap();
+    assert_eq!(&received, b"still open");
 }
 
 #[tokio::test]

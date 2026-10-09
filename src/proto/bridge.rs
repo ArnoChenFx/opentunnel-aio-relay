@@ -122,6 +122,9 @@ pub mod codes {
     pub const UNKNOWN_ROUTE: &str = "unknown_route";
     pub const UPSTREAM_CONNECT_FAILED: &str = "upstream_connect_failed";
     pub const UPSTREAM_IO_ERROR: &str = "upstream_io_error";
+    /// The relay could not hand a connection's traffic to the visitor within the
+    /// stall budget, so that connection was reset. Other connections are unaffected.
+    pub const BACKPRESSURE: &str = "backpressure";
 
     /// Attach errors that will not succeed on retry.
     pub fn is_fatal_attach_error(code: &str) -> bool {

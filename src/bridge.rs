@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -26,6 +27,10 @@ use crate::state::{now_rfc3339, AppState};
 
 const MAX_INBOUND_WS_BINARY_SIZE: usize = bridge::CONN_ID_SIZE + bridge::MAX_PAYLOAD_SIZE;
 
+/// Queued messages per proxied connection, matching the official client's
+/// inbound queue. A visitor that falls this far behind is reset.
+const CHANNEL_QUEUE: usize = 64;
+
 /// Outgoing frames queued for one bridge WebSocket.
 #[derive(Debug)]
 pub enum OutMsg {
@@ -33,13 +38,13 @@ pub enum OutMsg {
     Binary(Vec<u8>),
 }
 
-/// Incoming traffic for one proxied TCP connection, delivered to the task
-/// that owns the public socket.
+/// Incoming traffic for one proxied TCP connection, delivered in order to the
+/// task that owns the public socket. Aborts travel on the channel's `cancel`
+/// watch instead, so they never wait behind queued data.
 #[derive(Debug)]
 pub enum ChannelMsg {
     Data(Vec<u8>),
     End,
-    Reset(String),
 }
 
 pub struct BridgeHandle {
@@ -163,6 +168,7 @@ pub async fn run_bridge(state: Arc<AppState>, tunnel_id: String, mut socket: Web
 }
 
 async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSocket) -> Result<()> {
+    let stall = state.config.timeouts.bridge_stall;
     // The client must send `attach` within 10 seconds (protocol spec).
     let first = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
         .await
@@ -331,7 +337,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                 match msg {
                     Message::Text(text) => {
                         if let Some(control) = parse_client_message(&text) {
-                            if let Some(reply) = handle_control(&session, &bridge_id, control).await {
+                            if let Some(reply) = handle_control(&session, &bridge_id, control, stall).await {
                                 if send_text(socket, &reply).await.is_err() {
                                     break;
                                 }
@@ -344,18 +350,20 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                             break;
                         }
                         if let Some((conn, payload)) = decode_data_frame(&data) {
-                            let tx = {
-                                let channels = session.channels.lock().await;
-                                channels
-                                    .get(&conn)
-                                    .filter(|channel| channel.bridge_id == bridge_id)
-                                    .map(|channel| channel.tx.clone())
-                            };
-                            if let Some(tx) = tx {
-                                if tx.try_send(ChannelMsg::Data(payload.to_vec())).is_err() {
-                                    // A slow public socket must not stall this
-                                    // bridge's reader and every other channel.
-                                    session.close_channel(conn).await;
+                            if let Some(tx) = channel_sender_for_bridge(&session, &bridge_id, conn).await {
+                                let queued = tx.send(ChannelMsg::Data(payload.to_vec()));
+                                if tokio::time::timeout(stall, queued).await.is_err() {
+                                    // The visitor stopped reading for the whole stall
+                                    // budget. Abort this connection only, and tell the
+                                    // client at once so it stops forwarding to it.
+                                    session.abort_channel(&bridge_id, conn, bridge::codes::BACKPRESSURE).await;
+                                    let reset = ServerMessage::Reset {
+                                        conn,
+                                        code: bridge::codes::BACKPRESSURE.into(),
+                                    };
+                                    if send_text(socket, &reset).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -425,7 +433,6 @@ async fn detach_bridge(db: &Db, session: &Session, bridge_id: &str) {
 
 fn cancel_channel(channel: ChannelHandle, reason: &str) {
     channel.cancel.send_replace(Some(reason.to_string()));
-    let _ = channel.tx.try_send(ChannelMsg::Reset(reason.to_string()));
 }
 
 /// Handles an incoming control message. Returns a reply to send, if any.
@@ -433,24 +440,30 @@ async fn handle_control(
     session: &Arc<Session>,
     bridge_id: &str,
     control: ClientMessage,
+    stall: Duration,
 ) -> Option<ServerMessage> {
     match control {
         ClientMessage::Ping { time_sent } => Some(ServerMessage::Pong { time_sent }),
         ClientMessage::Pong { .. } => None,
         ClientMessage::End { conn } => {
-            if let Some(tx) = channel_sender_for_bridge(session, bridge_id, conn).await {
-                if tx.try_send(ChannelMsg::End).is_err() {
-                    session.close_channel(conn).await;
+            let tx = channel_sender_for_bridge(session, bridge_id, conn).await?;
+            // End ends the visitor's read side and must not be dropped. If the
+            // queue stays full past the stall budget, reset the connection instead.
+            match tokio::time::timeout(stall, tx.send(ChannelMsg::End)).await {
+                Ok(_) => None,
+                Err(_) => {
+                    session
+                        .abort_channel(bridge_id, conn, bridge::codes::BACKPRESSURE)
+                        .await;
+                    Some(ServerMessage::Reset {
+                        conn,
+                        code: bridge::codes::BACKPRESSURE.into(),
+                    })
                 }
             }
-            None
         }
         ClientMessage::Reset { conn, code } => {
-            if let Some(tx) = channel_sender_for_bridge(session, bridge_id, conn).await {
-                if tx.try_send(ChannelMsg::Reset(code)).is_err() {
-                    session.close_channel(conn).await;
-                }
-            }
+            session.abort_channel(bridge_id, conn, &code).await;
             None
         }
         ClientMessage::Attach { .. } => None,
@@ -533,7 +546,7 @@ impl Session {
         while conn == 0 || channels.contains_key(&conn) {
             conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
         }
-        let (tx, rx) = mpsc::channel::<ChannelMsg>(256);
+        let (tx, rx) = mpsc::channel::<ChannelMsg>(CHANNEL_QUEUE);
         let (cancel, cancel_rx) = watch::channel(None);
         channels.insert(
             conn,
@@ -544,25 +557,6 @@ impl Session {
             },
         );
         Some((conn, rx, cancel_rx, bridge_tx))
-    }
-
-    /// Registers a new proxied connection; returns its connection id.
-    pub async fn open_channel(&self, bridge_id: &str) -> (ConnId, mpsc::Receiver<ChannelMsg>) {
-        let mut conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel::<ChannelMsg>(256);
-        let mut channels = self.channels.lock().await;
-        while conn == 0 || channels.contains_key(&conn) {
-            conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
-        }
-        channels.insert(
-            conn,
-            ChannelHandle {
-                bridge_id: bridge_id.to_string(),
-                tx,
-                cancel: watch::channel(None).0,
-            },
-        );
-        (conn, rx)
     }
 
     pub async fn channel_sender(&self, conn: ConnId) -> Option<mpsc::Sender<ChannelMsg>> {
@@ -576,6 +570,29 @@ impl Session {
     pub async fn close_channel(&self, conn: ConnId) {
         if let Some(channel) = self.channels.lock().await.remove(&conn) {
             channel.cancel.send_replace(Some("channel_closed".into()));
+        }
+    }
+
+    /// Cancels one connection owned by `bridge_id` and detaches it. Returns
+    /// false if it was already gone or belongs to another bridge.
+    async fn abort_channel(&self, bridge_id: &str, conn: ConnId, reason: &str) -> bool {
+        let channel = {
+            let mut channels = self.channels.lock().await;
+            if channels
+                .get(&conn)
+                .is_some_and(|channel| channel.bridge_id == bridge_id)
+            {
+                channels.remove(&conn)
+            } else {
+                None
+            }
+        };
+        match channel {
+            Some(channel) => {
+                cancel_channel(channel, reason);
+                true
+            }
+            None => false,
         }
     }
 

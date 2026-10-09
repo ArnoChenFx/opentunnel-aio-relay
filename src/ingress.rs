@@ -15,7 +15,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tower::ServiceExt;
 
 use crate::bridge::{ChannelMsg, OutMsg};
@@ -294,66 +294,63 @@ async fn serve_tunnel(
         Ok::<(), anyhow::Error>(())
     };
 
-    // Bridge -> public socket.
+    // Bridge -> public socket. A cancel drops this future through the select
+    // below, so a write blocked on a slow visitor is abandoned as well.
     let pump_down = async move {
         loop {
-            let message = tokio::select! {
-                changed = channel_shutdown.changed() => {
-                    let _ = changed;
-                    return Err(anyhow::anyhow!("bridge channel cancelled: {}", channel_cancel_reason(&channel_shutdown)));
-                }
-                message = chan_rx.recv() => message,
-            };
-            match message {
-                Some(ChannelMsg::Data(data)) => {
-                    tokio::select! {
-                        result = writer.write_all(&data) => result?,
-                        changed = channel_shutdown.changed() => {
-                            let _ = changed;
-                            return Err(anyhow::anyhow!("bridge channel cancelled: {}", channel_cancel_reason(&channel_shutdown)));
-                        }
-                    }
-                }
+            match chan_rx.recv().await {
+                Some(ChannelMsg::Data(data)) => writer.write_all(&data).await?,
                 Some(ChannelMsg::End) => {
-                    tokio::select! {
-                        result = writer.shutdown() => result?,
-                        changed = channel_shutdown.changed() => {
-                            let _ = changed;
-                            return Err(anyhow::anyhow!("bridge channel cancelled: {}", channel_cancel_reason(&channel_shutdown)));
-                        }
-                    }
+                    writer.shutdown().await?;
                     return Ok::<(), anyhow::Error>(());
-                }
-                Some(ChannelMsg::Reset(reason)) => {
-                    return Err(anyhow::anyhow!("bridge reset: {reason}"));
                 }
                 None => return Err(anyhow::anyhow!("bridge channel closed")),
             }
         }
     };
 
+    // `biased` makes a bridge-side cancel win over the pumps. A cancel is set
+    // before the channel is dropped, so `None` above can only follow a cancel.
     let result = tokio::select! {
+        biased;
         _ = shutdown_rx.changed() => Err(anyhow::anyhow!("tunnel was deleted")),
+        reason = cancelled(&mut channel_shutdown) => Err(anyhow::anyhow!("cancelled by bridge: {reason}")),
         result = async { tokio::try_join!(pump_up, pump_down).map(|_| ()) } => result,
     };
-    if let Err(error) = result {
-        let reset = serde_json::to_string(&proto::ServerMessage::Reset {
-            conn,
-            code: "connection_terminated".into(),
-        })
-        .unwrap();
-        let _ = bridge_tx.try_send(OutMsg::Text(reset));
-        tracing::debug!(%conn, error = %error, "proxy connection terminated");
-    }
+    // Read before `close_channel`, which sets its own cancel reason.
+    let cancelled_by_bridge = channel_shutdown.borrow().is_some();
     session.close_channel(conn).await;
+    if let Err(error) = result {
+        if cancelled_by_bridge {
+            tracing::debug!(%conn, error = %error, "proxy connection cancelled");
+        } else {
+            tracing::debug!(%conn, error = %error, "proxy connection terminated");
+            let reset = serde_json::to_string(&proto::ServerMessage::Reset {
+                conn,
+                code: "connection_terminated".into(),
+            })?;
+            let stall = state.config.timeouts.bridge_stall;
+            if tokio::time::timeout(stall, bridge_tx.send(OutMsg::Text(reset)))
+                .await
+                .is_err()
+            {
+                tracing::debug!(%conn, "connection_terminated reset not delivered");
+            }
+        }
+    }
     Ok(())
 }
 
-fn channel_cancel_reason(shutdown: &tokio::sync::watch::Receiver<Option<String>>) -> String {
-    shutdown
-        .borrow()
-        .clone()
-        .unwrap_or_else(|| "channel closed".into())
+/// Resolves with the reason once the bridge cancels this connection.
+async fn cancelled(cancel: &mut watch::Receiver<Option<String>>) -> String {
+    loop {
+        if let Some(reason) = cancel.borrow_and_update().clone() {
+            return reason;
+        }
+        if cancel.changed().await.is_err() {
+            return "channel closed".into();
+        }
+    }
 }
 
 #[cfg(test)]
