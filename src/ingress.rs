@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ConnectInfo;
+use axum::http::{header::CONNECTION, HeaderValue, StatusCode};
 use axum::Router;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -252,7 +253,16 @@ async fn serve_api(
             req.extensions_mut().insert(ConnectInfo(peer));
             async move {
                 match router.oneshot(req.map(axum::body::Body::new)).await {
-                    Ok(res) => Ok(res),
+                    Ok(mut res) => {
+                        // A kept-alive socket would hold its admission slot until the
+                        // client closes it. The bridge upgrade is exempt: a 101 must
+                        // keep its own Connection header.
+                        if res.status() != StatusCode::SWITCHING_PROTOCOLS {
+                            res.headers_mut()
+                                .insert(CONNECTION, HeaderValue::from_static("close"));
+                        }
+                        Ok(res)
+                    }
                     Err(never) => Err(std::io::Error::other(format!("router error: {never:?}"))),
                 }
             }

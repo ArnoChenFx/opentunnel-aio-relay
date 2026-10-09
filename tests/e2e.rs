@@ -1129,6 +1129,25 @@ async fn stalled_api_request_is_closed_by_the_header_timeout() {
 }
 
 #[tokio::test]
+async fn api_response_closes_the_connection_it_arrived_on() {
+    let srv = start_server().await;
+    let mut tls = tls_connect(srv.port, &srv.cert_pem).await;
+    tls.write_all(format!("GET /health HTTP/1.1\r\nHost: {DOMAIN}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), tls.read_to_end(&mut response))
+        .await
+        .expect("API connection stayed open after its response")
+        .unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.to_ascii_lowercase().contains("connection: close"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
 async fn connection_limit_refuses_excess_and_recovers() {
     let srv = start_server_with(|c| {
         c.max_connections = 1;
