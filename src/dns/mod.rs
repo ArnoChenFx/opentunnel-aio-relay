@@ -100,6 +100,15 @@ async fn query_doh(http: &Client, url: &str, name: &str) -> HashSet<String> {
     out
 }
 
+/// Public DNS-over-HTTPS resolvers consulted by [`wait_for_txt`]. Alibaba's
+/// answers the JSON query format and is reachable from inside China, where
+/// `dns.google` is not.
+const DOH_RESOLVERS: &[&str] = &[
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/resolve",
+    "https://dns.alidns.com/resolve",
+];
+
 /// Waits until every expected TXT value is visible for `name` via public
 /// DNS-over-HTTPS resolvers (or the timeout elapses, like the original).
 pub async fn wait_for_txt(
@@ -110,14 +119,55 @@ pub async fn wait_for_txt(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let cf = query_doh(http, "https://cloudflare-dns.com/dns-query", name).await;
-        let google = query_doh(http, "https://dns.google/resolve", name).await;
-        if expected.iter().all(|v| cf.contains(v)) || expected.iter().all(|v| google.contains(v)) {
+        let (cf, google, alidns) = tokio::join!(
+            query_doh(http, DOH_RESOLVERS[0], name),
+            query_doh(http, DOH_RESOLVERS[1], name),
+            query_doh(http, DOH_RESOLVERS[2], name),
+        );
+        if [cf, google, alidns]
+            .iter()
+            .any(|seen| expected.iter().all(|v| seen.contains(v)))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
             anyhow::bail!("DNS TXT records not visible before propagation timeout");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::test_support::serve;
+
+    /// The Alibaba DoH JSON shape (from `https://dns.alidns.com/resolve`)
+    /// parses like the Google one `query_doh` was written for.
+    #[tokio::test]
+    async fn query_doh_reads_alidns_resolve_format() {
+        let server = serve(|_| {
+            (
+                200,
+                r#"{"Status":0,"TC":false,"RD":true,"RA":true,"AD":false,"CD":false,"Question":{"name":"_acme-challenge.example.com.","type":16},"Answer":[{"name":"_acme-challenge.example.com.","TTL":600,"type":16,"data":"\"digest-value\""}]}"#.to_string(),
+            )
+        })
+        .await;
+        let http = Client::new();
+        let seen = query_doh(
+            &http,
+            &format!("{}/resolve", server.base_url),
+            "_acme-challenge.example.com",
+        )
+        .await;
+        assert!(seen.contains("digest-value"), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn query_doh_ignores_error_status() {
+        let server = serve(|_| (200, r#"{"Status":3,"Answer":[]}"#.to_string())).await;
+        let http = Client::new();
+        let seen = query_doh(&http, &format!("{}/resolve", server.base_url), "x.example.com").await;
+        assert!(seen.is_empty(), "{seen:?}");
     }
 }
