@@ -58,6 +58,22 @@ pub struct Config {
     pub timeouts: Timeouts,
 }
 
+impl Config {
+    /// Puts operator-supplied values into the canonical form the rest of the
+    /// server compares against. Run once at startup, before anything serves.
+    pub fn normalize(&mut self) -> anyhow::Result<()> {
+        self.domain = normalize_domain(&self.domain);
+        anyhow::ensure!(!self.domain.is_empty(), "OT_DOMAIN is empty");
+        Ok(())
+    }
+}
+
+/// Lowercases a domain and strips surrounding whitespace and trailing dots,
+/// so `Tunnel.Example.COM.` and `tunnel.example.com` name the same zone.
+pub fn normalize_domain(raw: &str) -> String {
+    raw.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Internal time budgets. Not exposed as flags: they only need to change in tests.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
@@ -73,5 +89,36 @@ impl Default for Timeouts {
         Self {
             bridge_stall: Duration::from_secs(10),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn domain_is_normalized() {
+        assert_eq!(
+            normalize_domain("Tunnel.Example.COM."),
+            "tunnel.example.com"
+        );
+        assert_eq!(normalize_domain("  relay.test  "), "relay.test");
+        assert_eq!(normalize_domain("relay.test.."), "relay.test");
+    }
+
+    #[test]
+    fn empty_domain_is_rejected() {
+        let mut config = Config::try_parse_from([
+            "opentunnel-relay",
+            "--domain",
+            " . ",
+            "--cf-token",
+            "t",
+            "--cf-zone-id",
+            "z",
+        ])
+        .unwrap();
+        assert!(config.normalize().is_err());
     }
 }

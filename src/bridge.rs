@@ -135,6 +135,16 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// Checks a presented token against its stored hash. The comparison touches
+/// every byte, so response timing does not reveal how much of the hash matched.
+pub fn token_matches(token: &str, stored_hash: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    hash_token(token)
+        .as_bytes()
+        .ct_eq(stored_hash.as_bytes())
+        .into()
+}
+
 const TUNNEL_ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 pub fn random_tunnel_id() -> String {
@@ -213,7 +223,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         return Ok(());
     }
 
-    if hash_token(&token) != session.token_hash {
+    if !token_matches(&token, &session.token_hash) {
         send_text(
             socket,
             &ServerMessage::AttachError {

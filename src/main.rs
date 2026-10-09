@@ -27,7 +27,8 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config = Config::parse();
+    let mut config = Config::parse();
+    config.normalize()?;
     // rustls uses the process-wide default provider; make it ring explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
 

@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 
-use crate::bridge::{self, hash_token, random_token, random_tunnel_id};
+use crate::bridge::{self, hash_token, random_token, random_tunnel_id, token_matches};
 use crate::db::{CertState, Db};
 use crate::error::{Error, Result};
 use crate::proto::api::{
@@ -51,8 +51,10 @@ fn authed_record(db: &Db, id: &str, headers: &HeaderMap) -> Result<crate::db::Tu
     let record = db
         .get_tunnel(id)?
         .filter(|r| r.deleted_at.is_none())
-        .ok_or_else(|| Error::NotFound("tunnel not found".into()))?;
-    if hash_token(&token) != record.token_hash {
+        .ok_or_else(|| Error::TunnelNotFound {
+            tunnel_id: id.to_string(),
+        })?;
+    if !token_matches(&token, &record.token_hash) {
         return Err(Error::Unauthorized("bad token".into()));
     }
     Ok(record)
@@ -72,12 +74,12 @@ fn tunnel_info(record: &crate::db::TunnelRecord) -> TunnelInfo {
 }
 
 fn certificate_info(record: &crate::db::TunnelRecord) -> Result<CertificateInfo> {
-    let id = record
-        .cert_id
-        .clone()
-        .ok_or_else(|| Error::NotFound("no certificate".into()))?;
+    let no_certificate = || Error::CertificateNotFound {
+        tunnel_id: record.id.clone(),
+    };
+    let id = record.cert_id.clone().ok_or_else(no_certificate)?;
     let state = match record.cert_state {
-        CertState::None => return Err(Error::NotFound("no certificate".into())),
+        CertState::None => return Err(no_certificate()),
         CertState::Challenge => CertificateState::Challenge {
             token: record.challenge_token.clone().unwrap_or_default(),
             key: record.challenge_key.clone().unwrap_or_default(),
@@ -155,7 +157,9 @@ async fn bind_certificate(
         return Ok((StatusCode::ACCEPTED, Json(certificate_info(&record)?)));
     }
     if matches!(record.cert_state, CertState::Challenge | CertState::Issuing) {
-        return Err(Error::Conflict("certificate issuance in progress".into()));
+        return Err(Error::CertificateInProgress {
+            tunnel_id: record.id.clone(),
+        });
     }
 
     let cert_id = format!("cert_{}", bridge::random_session_id());
@@ -167,13 +171,15 @@ async fn bind_certificate(
             .db
             .get_tunnel(&record.id)?
             .filter(|r| r.deleted_at.is_none())
-            .ok_or_else(|| Error::NotFound("tunnel not found".into()))?;
+            .ok_or_else(|| Error::TunnelNotFound {
+                tunnel_id: record.id.clone(),
+            })?;
         if latest.cert_id.is_some() && latest.csr_pem.as_deref() == Some(body.csr.as_str()) {
             return Ok((StatusCode::ACCEPTED, Json(certificate_info(&latest)?)));
         }
-        return Err(Error::Conflict(
-            "certificate issuance state changed; retry request".into(),
-        ));
+        return Err(Error::CertificateInProgress {
+            tunnel_id: record.id.clone(),
+        });
     }
     tracing::info!(tunnel = %record.id, cert = %cert_id, hostname = %request_hostname, identifiers = ?identifiers, "certificate issuance started");
     crate::acme::spawn_issuance(state.clone(), record.id.clone(), cert_id.clone());
