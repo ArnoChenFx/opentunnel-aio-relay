@@ -104,6 +104,7 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | — (empty) | Only for CAs that require EAB (e.g. ZeroSSL) |
 | `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
 | `OT_ACME_EMAIL` | — (empty: no contact) | ACME account contact. Recommended: Let's Encrypt sends certificate expiry notices there. When set, it must look like `name@domain.tld`, and reserved domains such as `example.com` are rejected by Let's Encrypt. Changing it does not update an existing account |
+| `OT_DNS_PROPAGATION_SECS` | `120` | Seconds, in total for one order, to wait for new TXT records to show up through public DoH resolvers (Cloudflare, Google, Alibaba) before the CA is asked to validate. A miss is logged as a warning and the order goes on. `0` skips the wait |
 | `OT_MAX_CONNECTIONS` | `1024` | Connections open at once on the listener (API, bridge, and visitor sockets). Extra connections are refused at accept. `0` disables |
 | `OT_RESERVED_CONNECTIONS` | `64` | Slots within `OT_MAX_CONNECTIONS` that visitor sockets may never take, so API and bridge connections still get in while visitors are at their limit. Must be below `OT_MAX_CONNECTIONS` unless that is `0` |
 | `OT_MAX_CONNECTIONS_PER_IP` | `64` | Sockets one source address may hold open at once. IPv6 sources are counted per /64. Extra sockets are refused at accept. `0` disables |
@@ -227,6 +228,10 @@ relay also restricts the SQLite database and API private key to mode 600.
 - **Failed renewals do not replace the active certificate.** The tunnel keeps
   serving its current certificate until it expires. Failed attempts are retried
   with exponential backoff: 1 h, 2 h, 4 h, 8 h, then every 12 h.
+- **DNS propagation check**: before asking the CA to validate, the relay waits
+  up to `OT_DNS_PROPAGATION_SECS` for the new TXT records to show up through
+  public DoH resolvers. If they do not, a warning is logged and the CA is asked
+  anyway. A record the CA cannot see then fails the order with the CA's reason.
 - **Time limit per order**: an ACME order must finish within 10 minutes,
   including DNS propagation. Its DNS TXT records are removed when the order
   ends. Orders interrupted by a restart are requeued at startup.
