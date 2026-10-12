@@ -121,7 +121,7 @@ export OT_DATA_DIR=./data-staging
 ```
 
 - **切回生产前删除旧的 API 证书。** 中转只检查已保存的 API 证书是否有效、是否覆盖 `OT_DOMAIN`，不检查签发机构。从 staging 切到生产后，删掉数据目录里的 `api-cert.pem` 和 `api-key.pem`（默认是 `./data/`）再启动。否则会一直用 staging 证书，直到进入到期前 30 天的续签窗口。
-- **`OT_ACME_EMAIL` 默认为空，账号注册时不带联系方式。** Let's Encrypt 允许这样注册，但不会给你发证书到期提醒。建议设成你能收信的地址，例如 `export OT_ACME_EMAIL=ops@example.com`。设置后它会以 `mailto:` 形式提交给 ACME 服务器，格式须为 `本地部分@域名.含点`，否则启动时直接报错。账号注册后再改这个值，不会更新已有账号的联系方式。
+- **`OT_ACME_EMAIL` 默认为空，账号注册时不带联系方式。** Let's Encrypt 允许这样注册，但不会给你发证书到期提醒。建议设成你能收信的地址，例如 `export OT_ACME_EMAIL=ops@your-domain.com`（换成你自己的域名）。设置后它会以 `mailto:` 形式提交给 ACME 服务器，格式须为 `本地部分@域名.含点`，否则启动时直接报错。Let's Encrypt 会拒绝 `example.com` 这类保留域名。账号注册后再改这个值，不会更新已有账号的联系方式。
 
 ### 给慢访客的缓冲
 

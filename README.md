@@ -103,7 +103,7 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_ALIYUN_ENDPOINT` | `alidns.aliyuncs.com` | Alibaba Cloud DNS API host |
 | `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | — (empty) | Only for CAs that require EAB (e.g. ZeroSSL) |
 | `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
-| `OT_ACME_EMAIL` | — (empty: no contact) | ACME account contact. Recommended: Let's Encrypt sends certificate expiry notices there. Must look like `ops@example.com` when set. Changing it does not update an existing account |
+| `OT_ACME_EMAIL` | — (empty: no contact) | ACME account contact. Recommended: Let's Encrypt sends certificate expiry notices there. When set, it must look like `name@domain.tld`, and reserved domains such as `example.com` are rejected by Let's Encrypt. Changing it does not update an existing account |
 | `OT_MAX_CONNECTIONS` | `1024` | Connections open at once on the listener (API, bridge, and visitor sockets). Extra connections are refused at accept. `0` disables |
 | `OT_RESERVED_CONNECTIONS` | `64` | Slots within `OT_MAX_CONNECTIONS` that visitor sockets may never take, so API and bridge connections still get in while visitors are at their limit. Must be below `OT_MAX_CONNECTIONS` unless that is `0` |
 | `OT_MAX_CONNECTIONS_PER_IP` | `64` | Sockets one source address may hold open at once. IPv6 sources are counted per /64. Extra sockets are refused at accept. `0` disables |
