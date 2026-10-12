@@ -87,6 +87,17 @@ pub struct Config {
     #[arg(long, env = "OT_ACME_EMAIL", default_value = "")]
     pub acme_email: String,
 
+    /// Seconds to wait for new ACME TXT records to show up through public DNS
+    /// resolvers before asking the CA to validate. A miss is logged and does not
+    /// fail the order. 0 asks the CA as soon as the records are placed.
+    #[arg(
+        long = "dns-propagation-secs",
+        env = "OT_DNS_PROPAGATION_SECS",
+        default_value = "120",
+        value_parser = parse_seconds
+    )]
+    pub dns_propagation: Duration,
+
     /// Maximum number of live (not deleted) tunnels. 0 disables the limit.
     #[arg(long, env = "OT_MAX_TUNNELS", default_value_t = 1000)]
     pub max_tunnels: u64,
@@ -607,6 +618,19 @@ mod tests {
         assert_eq!(endpoint_after_normalize("").unwrap(), "alidns.aliyuncs.com");
         assert!(endpoint_after_normalize("https://alidns.aliyuncs.com").is_err());
         assert!(endpoint_after_normalize("alidns.aliyuncs.com/path").is_err());
+    }
+
+    #[test]
+    fn dns_propagation_is_read_in_seconds_and_zero_skips_the_wait() {
+        assert_eq!(parse(&[]).dns_propagation, Duration::from_secs(120));
+        assert_eq!(
+            parse(&["--dns-propagation-secs", "45"]).dns_propagation,
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            parse(&["--dns-propagation-secs", "0"]).dns_propagation,
+            Duration::ZERO
+        );
     }
 
     #[test]

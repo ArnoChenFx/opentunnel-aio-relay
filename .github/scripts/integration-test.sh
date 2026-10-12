@@ -105,13 +105,23 @@ sudo --preserve-env=OT_DNS_PROVIDER,OT_ACME_EMAIL,OT_ALIYUN_ACCESS_KEY_ID,OT_ALI
 RELAY_PID=$!
 
 echo "==> wait for relay API (includes first ACME issuance, up to ~10 min)"
+api_up=false
 for _ in $(seq 1 60); do
+  if ! sudo kill -0 "$RELAY_PID" 2> /dev/null; then
+    echo "relay exited before its API came up"
+    exit 1
+  fi
   if curl -fsS "https://${DOMAIN}/health" > /dev/null 2>&1; then
-    echo "relay API is up"
+    api_up=true
     break
   fi
   sleep 10
 done
+if [ "$api_up" != true ]; then
+  echo "relay API did not come up within 10 minutes"
+  exit 1
+fi
+echo "relay API is up"
 curl -fsS "https://${DOMAIN}/health" > /dev/null
 echo "relay health check passed (publicly-trusted TLS)"
 
