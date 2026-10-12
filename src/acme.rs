@@ -9,7 +9,7 @@
 //! clients (only CSRs are submitted), and the ACME account key is generated
 //! once and kept in the local database.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use crate::bridge::random_session_id;
 use crate::config::Config;
 use crate::db::{renewal_backoff_ms, CertState, Db, TunnelRecord, ISSUANCE_WINDOW_MS};
-use crate::dns::DnsProvider;
+use crate::dns::{DnsProvider, PropagationCheck};
 use crate::state::{now_millis, AppState};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -45,6 +45,8 @@ pub struct AcmeConfig {
     pub dns: Arc<dyn DnsProvider>,
     /// Upper bound for one order, from the first request to the download.
     pub issuance_timeout: Duration,
+    /// Waits for new TXT records to be visible before the CA is asked.
+    pub propagation: PropagationCheck,
 }
 
 impl AcmeConfig {
@@ -56,6 +58,7 @@ impl AcmeConfig {
             eab_hmac: config.acme_eab_hmac.clone(),
             dns: crate::dns::from_config(config, http.clone())?,
             issuance_timeout: config.timeouts.issuance,
+            propagation: PropagationCheck::public(config.dns_propagation),
         })
     }
 }
@@ -504,19 +507,21 @@ where
         on_challenge(first.token.clone(), first.key.clone()).await;
     }
 
+    // Every record is placed before the first lookup, so no resolver can cache
+    // a name's answer while only some of its values exist.
+    let mut values_by_name: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     for ch in &challenges {
         let name = format!("_acme-challenge.{}", ch.base);
         let id = cfg.dns.create_txt(&name, &ch.key).await?;
         placed.push(id);
+        values_by_name
+            .entry(name)
+            .or_default()
+            .insert(ch.key.clone());
     }
 
-    // --- wait for propagation, then trigger validation ---
-    for ch in &challenges {
-        let name = format!("_acme-challenge.{}", ch.base);
-        let mut expected = HashSet::new();
-        expected.insert(ch.key.clone());
-        crate::dns::wait_for_txt(http, &name, &expected, Duration::from_secs(60)).await?;
-    }
+    await_propagation(http, &cfg.propagation, &values_by_name).await;
+
     for ch in &challenges {
         acme.signal_challenge_ready(&ch.url).await?;
     }
@@ -530,7 +535,11 @@ where
             auth = acme.post_as_get(auth_url).await?;
         }
         if auth.get("status").and_then(|s| s.as_str()) != Some("valid") {
-            bail!("ACME authorization ended in {:?}", auth.get("status"));
+            bail!(
+                "ACME authorization ended in {:?}{}",
+                auth.get("status"),
+                challenge_problem(&auth)
+            );
         }
     }
 
@@ -568,6 +577,60 @@ where
         chain_pem: chain,
         expiry_rfc3339,
     })
+}
+
+/// Waits, up to `check.timeout` in total, for each name's TXT values to be
+/// visible through public resolvers. The names are checked side by side, so one
+/// that never appears does not leave the others unchecked. All values of a name
+/// are required together, so a resolver that shows only some of them is not
+/// taken as done. A miss is logged and the order goes on: the CA checks from its
+/// own resolvers, and if it cannot see the records either, its authorization
+/// reports that.
+async fn await_propagation(
+    http: &Client,
+    check: &PropagationCheck,
+    values_by_name: &BTreeMap<String, HashSet<String>>,
+) {
+    if check.timeout.is_zero() || check.resolvers.is_empty() {
+        return;
+    }
+    let started = tokio::time::Instant::now();
+    let deadline = started + check.timeout;
+    let waits = values_by_name.iter().map(|(name, expected)| async move {
+        let outcome = crate::dns::wait_for_txt(http, check, name, expected, deadline).await;
+        (name, expected.len(), outcome)
+    });
+    for (name, values, outcome) in futures_util::future::join_all(waits).await {
+        match outcome {
+            Ok(()) => tracing::info!(
+                name = %name,
+                values,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "TXT records visible through public resolvers"
+            ),
+            Err(error) => tracing::warn!(
+                name = %name,
+                values,
+                timeout_secs = check.timeout.as_secs(),
+                error = %error,
+                "TXT records not seen by public resolvers in time; asking the CA to validate anyway"
+            ),
+        }
+    }
+}
+
+/// The problem the CA reported for an authorization's challenge, such as the
+/// TXT values it found in place of the expected one, as an error-message suffix.
+fn challenge_problem(authorization: &Value) -> String {
+    authorization
+        .get("challenges")
+        .and_then(|challenges| challenges.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|challenge| challenge.get("error")?.get("detail")?.as_str())
+        .map(|detail| format!(": {detail}"))
+        .next()
+        .unwrap_or_default()
 }
 
 fn pem_to_der(pem: &str, label: &str) -> Result<Vec<u8>> {
@@ -1131,7 +1194,9 @@ pub async fn maybe_renew_on_attach(state: Arc<AppState>, tunnel_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::test_support::NoDns;
+    use crate::dns::test_support::{serve, NoDns};
+    use crate::dns::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_key() -> Vec<u8> {
         ring::signature::EcdsaKeyPair::generate_pkcs8(
@@ -1187,6 +1252,7 @@ mod tests {
                 eab_hmac: String::new(),
                 dns: Arc::new(NoDns),
                 issuance_timeout: Duration::from_secs(600),
+                propagation: PropagationCheck::disabled(),
             },
             key_pkcs8: test_key(),
             account_jwk: json!({}),
@@ -1305,6 +1371,7 @@ mod tests {
                 eab_hmac: String::new(),
                 dns: Arc::new(NoDns),
                 issuance_timeout: Duration::from_secs(600),
+                propagation: PropagationCheck::disabled(),
             },
             key_pkcs8,
             account_jwk: public_jwk(&x, &y),
@@ -1406,6 +1473,7 @@ mod tests {
                 eab_hmac: String::new(),
                 dns: Arc::new(NoDns),
                 issuance_timeout: Duration::from_secs(600),
+                propagation: PropagationCheck::disabled(),
             },
             key_pkcs8,
             account_jwk: public_jwk(&x, &y),
@@ -1522,6 +1590,7 @@ mod tests {
             eab_hmac: String::new(),
             dns: Arc::new(NoDns),
             issuance_timeout: Duration::from_millis(300),
+            propagation: PropagationCheck::disabled(),
         };
 
         let started = std::time::Instant::now();
@@ -1619,5 +1688,411 @@ mod tests {
         }
         assert_eq!(record.cert_state, CertState::Failed);
         assert!(record.fail_reason.is_some());
+    }
+
+    /// A DNS-01 provider that keeps the records it creates. The test's DoH
+    /// resolver lists these values.
+    #[derive(Default)]
+    struct FakeZone {
+        live: std::sync::Mutex<Vec<(String, String, String)>>,
+        created: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeZone {
+        fn values_of(&self, name: &str) -> Vec<String> {
+            self.live
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, record_name, _)| record_name == name)
+                .map(|(_, _, value)| value.clone())
+                .collect()
+        }
+    }
+
+    impl DnsProvider for FakeZone {
+        fn create_txt<'a>(
+            &'a self,
+            name: &'a str,
+            value: &'a str,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async move {
+                let id = {
+                    let mut created = self.created.lock().unwrap();
+                    created.push((name.to_string(), value.to_string()));
+                    format!("rec-{}", created.len())
+                };
+                self.live
+                    .lock()
+                    .unwrap()
+                    .push((id.clone(), name.to_string(), value.to_string()));
+                Ok(id)
+            })
+        }
+
+        fn delete_txt<'a>(&'a self, record_id: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.live
+                    .lock()
+                    .unwrap()
+                    .retain(|(id, _, _)| id != record_id);
+                Ok(())
+            })
+        }
+    }
+
+    /// The CA's side of one order: the directory, nonces, an account, the
+    /// order, a dns-01 authorization per identifier that turns valid once its
+    /// challenge is posted, and the certificate. Each challenge post records how
+    /// many DoH queries had been answered by then.
+    struct FakeCa {
+        base: String,
+        identifiers: Vec<String>,
+        certificate_pem: String,
+        doh_queries: Arc<AtomicUsize>,
+        posted: std::sync::Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl FakeCa {
+        fn respond(&self, path: &str) -> axum::response::Response {
+            use axum::http::{header, HeaderValue, StatusCode};
+            use axum::response::IntoResponse;
+
+            let base = &self.base;
+            let reply =
+                |status: StatusCode, body: Value| (status, axum::Json(body)).into_response();
+            let mut response = if let Some(index) = path.strip_prefix("/authz/") {
+                let index: usize = index.parse().unwrap();
+                let valid = self
+                    .posted
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(posted, _)| *posted == index);
+                let status = if valid { "valid" } else { "pending" };
+                reply(
+                    StatusCode::OK,
+                    json!({
+                        "identifier": {"type": "dns", "value": self.identifiers[index]},
+                        "status": status,
+                        "challenges": [{
+                            "type": "dns-01",
+                            "status": status,
+                            "token": format!("token-{index}"),
+                            "url": format!("{base}/chal/{index}"),
+                        }],
+                    }),
+                )
+            } else if let Some(index) = path.strip_prefix("/chal/") {
+                let index: usize = index.parse().unwrap();
+                let queries = self.doh_queries.load(Ordering::SeqCst);
+                self.posted.lock().unwrap().push((index, queries));
+                reply(
+                    StatusCode::OK,
+                    json!({"type": "dns-01", "status": "processing"}),
+                )
+            } else {
+                match path {
+                    "/directory" => reply(
+                        StatusCode::OK,
+                        json!({
+                            "newNonce": format!("{base}/nonce"),
+                            "newAccount": format!("{base}/account"),
+                            "newOrder": format!("{base}/order"),
+                        }),
+                    ),
+                    "/nonce" => StatusCode::OK.into_response(),
+                    "/account" => (
+                        StatusCode::CREATED,
+                        [(header::LOCATION, format!("{base}/account/1"))],
+                        axum::Json(json!({"status": "valid"})),
+                    )
+                        .into_response(),
+                    "/order" => (
+                        StatusCode::CREATED,
+                        [(header::LOCATION, format!("{base}/order/1"))],
+                        axum::Json(json!({
+                            "status": "pending",
+                            "authorizations": (0..self.identifiers.len())
+                                .map(|index| format!("{base}/authz/{index}"))
+                                .collect::<Vec<_>>(),
+                            "finalize": format!("{base}/finalize"),
+                        })),
+                    )
+                        .into_response(),
+                    "/finalize" => reply(
+                        StatusCode::OK,
+                        json!({"status": "valid", "certificate": format!("{base}/cert")}),
+                    ),
+                    "/cert" => self.certificate_pem.clone().into_response(),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            };
+            response
+                .headers_mut()
+                .insert("replay-nonce", HeaderValue::from_static("test-nonce"));
+            response
+        }
+    }
+
+    async fn spawn_fake_ca(
+        identifiers: Vec<String>,
+        certificate_pem: String,
+        doh_queries: Arc<AtomicUsize>,
+    ) -> Arc<FakeCa> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let ca = Arc::new(FakeCa {
+            base,
+            identifiers,
+            certificate_pem,
+            doh_queries,
+            posted: Default::default(),
+        });
+        let app = axum::Router::new().fallback({
+            let ca = ca.clone();
+            move |request: axum::extract::Request| {
+                let ca = ca.clone();
+                async move { ca.respond(request.uri().path()) }
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ca
+    }
+
+    fn csr_for_names(names: &[String]) -> String {
+        let mut params = rcgen::CertificateParams::new(names.to_vec()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, names[0].as_str());
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        params.serialize_request(&key).unwrap().pem().unwrap()
+    }
+
+    /// The `name` parameter of a DoH request target such as
+    /// `/resolve?name=_acme-challenge.example&type=TXT`.
+    fn query_name(target: &str) -> String {
+        target
+            .split_once("name=")
+            .map_or_else(String::new, |(_, rest)| {
+                rest.split('&').next().unwrap_or_default().to_string()
+            })
+    }
+
+    struct FakeOrder {
+        result: Result<Issued>,
+        zone: Arc<FakeZone>,
+        doh_queries: usize,
+        doh_names: Vec<String>,
+        posted: Vec<(usize, usize)>,
+    }
+
+    /// Runs one order for `identifiers` against the fake CA. The DoH resolver
+    /// lists no values on its first `hidden` queries, only the first value on
+    /// the next `partial`, and every value after that. Names in `silent` never
+    /// get an answer.
+    async fn run_fake_order(
+        identifiers: &[&str],
+        hidden: usize,
+        partial: usize,
+        propagation: Duration,
+        silent: &[&str],
+    ) -> FakeOrder {
+        let identifiers: Vec<String> = identifiers.iter().map(|id| id.to_string()).collect();
+        let silent: Vec<String> = silent.iter().map(|name| name.to_string()).collect();
+        let zone = Arc::new(FakeZone::default());
+        let doh_queries = Arc::new(AtomicUsize::new(0));
+        let doh = {
+            let zone = zone.clone();
+            let queries = doh_queries.clone();
+            serve(move |request| {
+                let query = queries.fetch_add(1, Ordering::SeqCst) + 1;
+                let name = query_name(&request.target);
+                let values = if silent.contains(&name) {
+                    Vec::new()
+                } else {
+                    zone.values_of(&name)
+                };
+                let listed = if query <= hidden {
+                    0
+                } else if query <= hidden.saturating_add(partial) {
+                    1
+                } else {
+                    values.len()
+                };
+                let answers: Vec<Value> = values
+                    .iter()
+                    .take(listed)
+                    .map(|value| {
+                        json!({"name": "_acme-challenge.", "type": 16, "TTL": 60, "data": format!("\"{value}\"")})
+                    })
+                    .collect();
+                (200, json!({"Status": 0, "Answer": answers}).to_string())
+            })
+            .await
+        };
+        let certificate_pem = self_signed_pem(&identifiers[0], 90).0;
+        let ca = spawn_fake_ca(identifiers.clone(), certificate_pem, doh_queries.clone()).await;
+        let dir = test_dir("order");
+        let db = Db::open(&dir.join("relay.db")).unwrap();
+        let cfg = AcmeConfig {
+            directory_url: format!("{}/directory", ca.base),
+            email: String::new(),
+            eab_kid: String::new(),
+            eab_hmac: String::new(),
+            dns: zone.clone(),
+            issuance_timeout: Duration::from_secs(30),
+            propagation: PropagationCheck {
+                timeout: propagation,
+                interval: Duration::from_millis(20),
+                resolvers: vec![format!("{}/resolve", doh.base_url)],
+            },
+        };
+        let result = issue(
+            &Client::new(),
+            &db,
+            &cfg,
+            &identifiers,
+            &csr_for_names(&identifiers),
+            |_, _| async {},
+        )
+        .await;
+        let doh_names = doh
+            .requests()
+            .iter()
+            .map(|request| query_name(&request.target))
+            .collect();
+        let posted = ca.posted.lock().unwrap().clone();
+        FakeOrder {
+            result,
+            zone,
+            doh_queries: doh_queries.load(Ordering::SeqCst),
+            doh_names,
+            posted,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_propagation_miss_still_lets_the_ca_validate_and_issue() {
+        let order = run_fake_order(
+            &["relay.test"],
+            usize::MAX,
+            0,
+            Duration::from_millis(300),
+            &[],
+        )
+        .await;
+        assert!(
+            order.result.is_ok(),
+            "issuance failed: {:?}",
+            order.result.as_ref().err()
+        );
+        assert_eq!(order.posted.len(), 1);
+        assert!(
+            order.doh_queries >= 2,
+            "the check should have kept asking: {}",
+            order.doh_queries
+        );
+        assert!(order.zone.live.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wildcard_and_base_names_share_one_txt_name_and_wait_for_both_values() {
+        let order = run_fake_order(
+            &["abc.relay.test", "*.abc.relay.test"],
+            0,
+            2,
+            Duration::from_secs(10),
+            &[],
+        )
+        .await;
+        assert!(
+            order.result.is_ok(),
+            "issuance failed: {:?}",
+            order.result.as_ref().err()
+        );
+        let created = order.zone.created.lock().unwrap().clone();
+        assert_eq!(created.len(), 2, "{created:?}");
+        assert!(
+            created
+                .iter()
+                .all(|(name, _)| name == "_acme-challenge.abc.relay.test"),
+            "{created:?}"
+        );
+        assert_ne!(created[0].1, created[1].1);
+        assert!(
+            order
+                .doh_names
+                .iter()
+                .all(|name| name == "_acme-challenge.abc.relay.test"),
+            "{:?}",
+            order.doh_names
+        );
+        assert_eq!(order.posted.len(), 2);
+        assert!(
+            order.posted.iter().all(|(_, queries)| *queries >= 3),
+            "the CA was asked before both values were visible: {:?}",
+            order.posted
+        );
+    }
+
+    #[tokio::test]
+    async fn every_name_is_polled_even_when_an_earlier_name_never_appears() {
+        let order = run_fake_order(
+            &["a.relay.test", "b.relay.test"],
+            0,
+            0,
+            Duration::from_millis(500),
+            &["_acme-challenge.a.relay.test"],
+        )
+        .await;
+        assert!(
+            order.result.is_ok(),
+            "issuance failed: {:?}",
+            order.result.as_ref().err()
+        );
+        assert!(
+            order
+                .doh_names
+                .iter()
+                .any(|name| name == "_acme-challenge.b.relay.test"),
+            "the second name was never checked: {:?}",
+            order.doh_names
+        );
+        assert_eq!(order.posted.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_zero_propagation_timeout_asks_the_ca_at_once() {
+        let order = run_fake_order(&["relay.test"], usize::MAX, 0, Duration::ZERO, &[]).await;
+        assert!(
+            order.result.is_ok(),
+            "issuance failed: {:?}",
+            order.result.as_ref().err()
+        );
+        assert_eq!(order.doh_queries, 0);
+    }
+
+    #[test]
+    fn a_failed_authorization_carries_the_reason_the_ca_gave() {
+        let authorization = json!({
+            "status": "invalid",
+            "challenges": [
+                {"type": "http-01", "status": "pending"},
+                {
+                    "type": "dns-01",
+                    "status": "invalid",
+                    "error": {
+                        "type": "urn:ietf:params:acme:error:unauthorized",
+                        "detail": "Incorrect TXT record \"abc\" found at _acme-challenge.relay.test",
+                    },
+                },
+            ],
+        });
+        assert_eq!(
+            challenge_problem(&authorization),
+            ": Incorrect TXT record \"abc\" found at _acme-challenge.relay.test"
+        );
+        assert_eq!(challenge_problem(&json!({"challenges": []})), "");
     }
 }

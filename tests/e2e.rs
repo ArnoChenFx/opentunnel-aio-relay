@@ -44,6 +44,7 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         acme_eab_hmac: "test".to_string(),
         acme_url: "https://example.invalid".to_string(),
         acme_email: "test@example.invalid".to_string(),
+        dns_propagation: Duration::ZERO,
         max_tunnels: 0,
         max_certs_per_day: 0,
         max_connections: 1024,
