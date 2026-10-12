@@ -167,7 +167,12 @@ mod tests {
     async fn query_doh_ignores_error_status() {
         let server = serve(|_| (200, r#"{"Status":3,"Answer":[]}"#.to_string())).await;
         let http = Client::new();
-        let seen = query_doh(&http, &format!("{}/resolve", server.base_url), "x.example.com").await;
+        let seen = query_doh(
+            &http,
+            &format!("{}/resolve", server.base_url),
+            "x.example.com",
+        )
+        .await;
         assert!(seen.is_empty(), "{seen:?}");
     }
 }
