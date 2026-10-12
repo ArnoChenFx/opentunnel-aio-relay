@@ -207,6 +207,17 @@ fn external_account_binding(
     }))
 }
 
+/// `contact` is optional (RFC 8555 section 7.3). With no address configured it
+/// is left out, because a placeholder such as `acme@localhost` is rejected by
+/// Let's Encrypt with `invalidContact`.
+fn new_account_payload(email: &str) -> Value {
+    let mut payload = json!({"termsOfServiceAgreed": true});
+    if !email.is_empty() {
+        payload["contact"] = json!([format!("mailto:{email}")]);
+    }
+    payload
+}
+
 // ---------------------------------------------------------------------------
 // Minimal ACME protocol driver.
 // ---------------------------------------------------------------------------
@@ -316,10 +327,7 @@ impl Acme {
     }
 
     async fn new_account(&mut self) -> Result<()> {
-        let mut payload = json!({
-            "contact": [format!("mailto:{}", self.cfg.email)],
-            "termsOfServiceAgreed": true,
-        });
+        let mut payload = new_account_payload(&self.cfg.email);
         // External account binding is only sent for CAs that require it
         // (e.g. ZeroSSL). Let's Encrypt does not use EAB.
         if !self.cfg.eab_kid.is_empty() && !self.cfg.eab_hmac.is_empty() {
@@ -1321,6 +1329,109 @@ mod tests {
             assert_eq!(protected["nonce"], format!("nonce-{index}"));
             assert!(protected.get("jwk").is_some());
         }
+    }
+
+    #[test]
+    fn new_account_payload_leaves_out_contact_without_an_email() {
+        assert_eq!(
+            new_account_payload(""),
+            json!({"termsOfServiceAgreed": true})
+        );
+    }
+
+    #[test]
+    fn new_account_payload_lists_the_email_as_a_mailto_contact() {
+        assert_eq!(
+            new_account_payload("ops@example.com"),
+            json!({
+                "contact": ["mailto:ops@example.com"],
+                "termsOfServiceAgreed": true,
+            })
+        );
+    }
+
+    /// Runs `new_account` against a mock ACME server and returns the decoded
+    /// newAccount payload that reached the wire.
+    async fn new_account_payload_on_the_wire(email: &str) -> Value {
+        use axum::body::Bytes;
+        use axum::http::{header, HeaderValue, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let account_route = {
+            let received = received.clone();
+            post(move |body: Bytes| {
+                let received = received.clone();
+                async move {
+                    received
+                        .lock()
+                        .await
+                        .push(serde_json::from_slice(&body).unwrap());
+                    let mut response = StatusCode::CREATED.into_response();
+                    response.headers_mut().insert(
+                        header::LOCATION,
+                        HeaderValue::from_static("https://acme.test/account/1"),
+                    );
+                    response
+                }
+            })
+        };
+        let app = Router::new()
+            .route(
+                "/nonce",
+                get(|| async { ([("replay-nonce", "test-nonce")], "") }),
+            )
+            .route("/account", account_route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let key_pkcs8 = test_key();
+        let (x, y) = public_jwk_coords(&key_pkcs8).unwrap();
+        let mut acme = Acme {
+            http: Client::new(),
+            dir: Directory {
+                new_nonce: format!("{base}/nonce"),
+                new_account: format!("{base}/account"),
+                new_order: format!("{base}/order"),
+            },
+            cfg: AcmeConfig {
+                directory_url: base,
+                email: email.into(),
+                eab_kid: String::new(),
+                eab_hmac: String::new(),
+                dns: Arc::new(NoDns),
+                issuance_timeout: Duration::from_secs(600),
+            },
+            key_pkcs8,
+            account_jwk: public_jwk(&x, &y),
+            account_url: None,
+        };
+        let result = acme.new_account().await;
+        server.abort();
+        result.unwrap();
+
+        let bodies = received.lock().await;
+        assert_eq!(bodies.len(), 1);
+        let payload = b64d(bodies[0]["payload"].as_str().unwrap()).unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_account_request_has_no_contact_without_an_email() {
+        let payload = new_account_payload_on_the_wire("").await;
+        assert!(payload.get("contact").is_none(), "{payload}");
+        assert_eq!(payload["termsOfServiceAgreed"], true);
+    }
+
+    #[tokio::test]
+    async fn new_account_request_carries_the_configured_contact() {
+        let payload = new_account_payload_on_the_wire("ops@example.com").await;
+        assert_eq!(payload["contact"], json!(["mailto:ops@example.com"]));
     }
 
     #[test]
