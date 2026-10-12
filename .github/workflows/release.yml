@@ -228,6 +228,7 @@ jobs:
           CI_ALIYUN_ACCESS_KEY_ID: ${{ secrets.CI_ALIYUN_ACCESS_KEY_ID }}
           CI_ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.CI_ALIYUN_ACCESS_KEY_SECRET }}
           CI_ALIYUN_DOMAIN: ${{ secrets.CI_ALIYUN_DOMAIN }}
+          CI_ACME_EMAIL: ${{ secrets.CI_ACME_EMAIL }}
         run: |
           tar -xzf relay-dist/opentunnel-relay-x86_64-unknown-linux-gnu.tar.gz -C /tmp
           RELAY_BIN=/tmp/opentunnel-relay-x86_64-unknown-linux-gnu/opentunnel-relay \

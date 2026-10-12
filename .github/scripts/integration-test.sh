@@ -21,6 +21,10 @@
 #   CI_ALIYUN_DOMAIN                    registered domain that contains CI_DOMAIN
 # Cloudflare wins when both are set, as in the relay (see dns-cleanup.sh).
 #
+# Optional:
+#   CI_ACME_EMAIL       contact address for the ACME account. Unset registers the
+#                       account without one, which Let's Encrypt accepts.
+#
 # Each run serves its own hostname, run-<run id>-<attempt>.<CI_DOMAIN>. Let's
 # Encrypt allows only 5 certificates per identical name set per week, so a
 # fixed hostname would hit that limit after a few reruns. TXT records left
@@ -83,6 +87,7 @@ BACKEND_PID=$!
 
 echo "==> start relay (real ACME via DNS-01, ${DNS_PROVIDER})"
 export OT_DNS_PROVIDER="$DNS_PROVIDER"
+export OT_ACME_EMAIL="${CI_ACME_EMAIL:-}"
 relay_dns_args=()
 if [ "$DNS_PROVIDER" = aliyun ]; then
   : "${CI_ALIYUN_DOMAIN:?CI_ALIYUN_DOMAIN not set}"
@@ -92,7 +97,7 @@ if [ "$DNS_PROVIDER" = aliyun ]; then
 else
   relay_dns_args=(--cf-token "$CI_CF_TOKEN" --cf-zone-id "$CI_CF_ZONE_ID")
 fi
-sudo --preserve-env=OT_DNS_PROVIDER,OT_ALIYUN_ACCESS_KEY_ID,OT_ALIYUN_ACCESS_KEY_SECRET,OT_ALIYUN_DOMAIN \
+sudo --preserve-env=OT_DNS_PROVIDER,OT_ACME_EMAIL,OT_ALIYUN_ACCESS_KEY_ID,OT_ALIYUN_ACCESS_KEY_SECRET,OT_ALIYUN_DOMAIN \
   "$RELAY_BIN" \
   --domain "$DOMAIN" \
   "${relay_dns_args[@]}" \

@@ -91,7 +91,7 @@ opentunnel route add 3000
 | `OT_ALIYUN_ENDPOINT` | `alidns.aliyuncs.com` | 阿里云 DNS API 地址，只填主机名 |
 | `OT_ACME_EAB_KID` / `OT_ACME_EAB_HMAC` | —（空） | 只给需要 EAB 的 CA 用（如 ZeroSSL） |
 | `OT_ACME_URL` | `https://acme-v02.api.letsencrypt.org/directory`（Let's Encrypt 生产） | ACME 目录。测试用 staging，见[ACME 地址和联系邮箱](#acme-地址和联系邮箱) |
-| `OT_ACME_EMAIL` | `acme@localhost`（占位符） | ACME 账号联系邮箱，见[ACME 地址和联系邮箱](#acme-地址和联系邮箱) |
+| `OT_ACME_EMAIL` | —（空，注册时不带联系方式） | ACME 账号联系邮箱，用于证书到期提醒，建议设成能收信的地址。见[ACME 地址和联系邮箱](#acme-地址和联系邮箱) |
 | `OT_MAX_CONNECTIONS` | `1024` | 监听器上同时打开的连接数（API、bridge、访客 socket 都算）。超出的在 accept 时直接拒绝。`0` 表示不限制 |
 | `OT_RESERVED_CONNECTIONS` | `64` | 在 `OT_MAX_CONNECTIONS` 里给访客 socket 禁止占用的预留位，保证访客满了 API 和 bridge 还能连进来。必须小于 `OT_MAX_CONNECTIONS`（除非后者为 `0`） |
 | `OT_MAX_CONNECTIONS_PER_IP` | `64` | 单个源地址同时可保持的 socket 数。IPv6 按 /64 统计。超出的在 accept 时拒绝。`0` 表示不限制 |
@@ -121,7 +121,7 @@ export OT_DATA_DIR=./data-staging
 ```
 
 - **切回生产前删除旧的 API 证书。** 中转只检查已保存的 API 证书是否有效、是否覆盖 `OT_DOMAIN`，不检查签发机构。从 staging 切到生产后，删掉数据目录里的 `api-cert.pem` 和 `api-key.pem`（默认是 `./data/`）再启动。否则会一直用 staging 证书，直到进入到期前 30 天的续签窗口。
-- **`OT_ACME_EMAIL` 默认是 `acme@localhost`，只是占位符。** 签发时它会以 `mailto:` 形式提交给 ACME 服务器，作为账号联系方式。生产环境请设成你能收信的地址，例如 `export OT_ACME_EMAIL=ops@example.com`。
+- **`OT_ACME_EMAIL` 默认为空，账号注册时不带联系方式。** Let's Encrypt 允许这样注册，但不会给你发证书到期提醒。建议设成你能收信的地址，例如 `export OT_ACME_EMAIL=ops@your-domain.com`（换成你自己的域名）。设置后它会以 `mailto:` 形式提交给 ACME 服务器，格式须为 `本地部分@域名.含点`，否则启动时直接报错。Let's Encrypt 会拒绝 `example.com` 这类保留域名。账号注册后再改这个值，不会更新已有账号的联系方式。
 
 ### 给慢访客的缓冲
 
@@ -186,7 +186,7 @@ export OT_ALIYUN_DOMAIN=example.com   # 可省略，见下文"域名查找"
 
 - **域名查找**：`OT_ALIYUN_DOMAIN` 没设置时，第一次添加 TXT 记录会调用 `DescribeDomains`（分页读取，最多 5000 个域名），取账号里包含 `OT_DOMAIN` 的最长注册域名，结果在进程内缓存。找不到时签发失败，并提示设置 `OT_ALIYUN_DOMAIN`。设置了的话，`OT_DOMAIN` 必须在它之内，否则启动报错。
 - **记录**：TXT 记录的 TTL 固定为 600 秒，阿里云免费版不接受更小的 TTL。如果同名同值的记录已经存在（比如上次中断的签发留下的），直接复用，不报错。
-- **传播等待**：和 Cloudflare 相同。记录添加后，中转用公共 DoH 解析器（Cloudflare 和 Google）确认记录可见，最多等 60 秒，然后才让 CA 验证。
+- **传播等待**：和 Cloudflare 相同。记录添加后，中转用公共 DoH 解析器（Cloudflare、Google 和阿里 DNS，任一能看到记录即可）确认记录可见，最多等 60 秒，然后才让 CA 验证。
 - **清理**：签发结束后（无论成功还是失败）删除这次添加的记录，已经不存在的记录视为删除成功。删除失败只记 warning 日志，记录会留在 DNS 中。
 - **认证与重试**：每个请求都使用阿里云 V3 签名（`ACS3-HMAC-SHA256`），不需要额外的 token，也不支持 STS 临时凭证。遇到限流错误（错误码以 `Throttling` 开头）时最多尝试 3 次，间隔 1 秒和 2 秒。
 - **错误信息**：阿里云返回的错误码和消息会写进日志。日志和错误信息里不会出现 AccessKey secret。
@@ -293,6 +293,7 @@ cargo test
 | `CI_ALIYUN_ACCESS_KEY_ID` | 阿里云 RAM 用户的 AccessKey ID（用阿里云时），权限见[阿里云 DNS](#阿里云-dns) |
 | `CI_ALIYUN_ACCESS_KEY_SECRET` | 上面 AccessKey 的 secret（用阿里云时） |
 | `CI_ALIYUN_DOMAIN` | 阿里云账号里包含 `CI_DOMAIN` 的注册域名，如 `example.com`（用阿里云时） |
+| `CI_ACME_EMAIL` | 可选。CI 用的 ACME 账号联系邮箱。不配置则注册时不带联系方式 |
 
 没配 DNS 相关 secret 的话任务自动跳过（fork 保持绿色）。两套都配时用 Cloudflare，和中转的选择规则一致；要用阿里云，就不要配 `CI_CF_*`。
 
