@@ -81,7 +81,10 @@ pub struct Config {
     )]
     pub acme_url: String,
 
-    #[arg(long, env = "OT_ACME_EMAIL", default_value = "acme@localhost")]
+    /// Contact address for the ACME account, used by Let's Encrypt for expiry
+    /// notices. Empty registers the account without one. Must look like
+    /// `local@domain.example`. Changing it does not update an existing account.
+    #[arg(long, env = "OT_ACME_EMAIL", default_value = "")]
     pub acme_email: String,
 
     /// Maximum number of live (not deleted) tunnels. 0 disables the limit.
@@ -182,6 +185,10 @@ impl Config {
         self.aliyun_access_key_secret = self.aliyun_access_key_secret.trim().to_string();
         self.aliyun_domain = normalize_domain(&self.aliyun_domain);
         self.aliyun_endpoint = normalize_endpoint(&self.aliyun_endpoint)?;
+        self.acme_email = self.acme_email.trim().to_string();
+        if !self.acme_email.is_empty() {
+            validate_acme_email(&self.acme_email)?;
+        }
         if self.dns_provider_kind()? == DnsProviderKind::Aliyun && !self.aliyun_domain.is_empty() {
             anyhow::ensure!(
                 self.domain == self.aliyun_domain
@@ -255,6 +262,27 @@ fn normalize_endpoint(raw: &str) -> anyhow::Result<String> {
         "OT_ALIYUN_ENDPOINT must be a host name such as alidns.aliyuncs.com, got {raw:?}"
     );
     Ok(endpoint)
+}
+
+/// Checks an ACME contact address for the shape Let's Encrypt requires: a
+/// non-empty local part, then a domain with at least one dot and no empty
+/// labels. This is not a full RFC 5322 parse.
+fn validate_acme_email(email: &str) -> anyhow::Result<()> {
+    let well_formed = !email.chars().any(char::is_whitespace)
+        && email.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && domain.contains('.')
+                && domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+        });
+    anyhow::ensure!(
+        well_formed,
+        "OT_ACME_EMAIL must look like local@domain.example, got {email:?}; \
+         leave it empty to register the ACME account without a contact address"
+    );
+    Ok(())
 }
 
 /// Two full-size frames: enough for one in flight and one waiting.
@@ -579,5 +607,54 @@ mod tests {
         assert_eq!(endpoint_after_normalize("").unwrap(), "alidns.aliyuncs.com");
         assert!(endpoint_after_normalize("https://alidns.aliyuncs.com").is_err());
         assert!(endpoint_after_normalize("alidns.aliyuncs.com/path").is_err());
+    }
+
+    #[test]
+    fn acme_email_is_optional_and_empty_by_default() {
+        let mut config = parse(&[]);
+        assert_eq!(config.acme_email, "");
+        assert!(config.normalize().is_ok());
+        assert_eq!(config.acme_email, "");
+    }
+
+    #[test]
+    fn acme_email_must_look_like_an_address_with_a_dotted_domain() {
+        for email in [
+            "ops@example.com",
+            "first.last+acme@mail.example.co.uk",
+            "ops@my-host.example.org",
+        ] {
+            assert!(validate_acme_email(email).is_ok(), "{email}");
+        }
+        for email in [
+            "acme@localhost",
+            "ops",
+            "@example.com",
+            "ops@",
+            "ops@example.",
+            "ops@.example.com",
+            "ops@example..com",
+            "ops@exa mple.com",
+            "ops@example,com",
+            "ops@example.com@example.org",
+        ] {
+            assert!(validate_acme_email(email).is_err(), "{email}");
+        }
+    }
+
+    #[test]
+    fn acme_email_is_trimmed_and_rejected_at_startup_when_malformed() {
+        let mut config = parse(&["--acme-email", "  ops@example.com  "]);
+        config.normalize().unwrap();
+        assert_eq!(config.acme_email, "ops@example.com");
+
+        let mut config = parse(&["--acme-email", "   "]);
+        config.normalize().unwrap();
+        assert_eq!(config.acme_email, "");
+
+        let mut config = parse(&["--acme-email", "acme@localhost"]);
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("OT_ACME_EMAIL"), "{error}");
+        assert!(error.contains("acme@localhost"), "{error}");
     }
 }
