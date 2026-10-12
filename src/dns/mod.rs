@@ -231,10 +231,14 @@ fn rcode_name(status: u16) -> String {
     }
 }
 
-/// The value of a TXT record as a DoH `data` field presents it: its character
-/// strings in quotes, separated by spaces. The strings are joined, so
-/// `"abc" "def"` is `abcdef`, and a backslash escapes the next character.
+/// The value of a TXT record as a DoH `data` field presents it. Cloudflare and
+/// Alibaba quote each character string and separate the strings with spaces, so
+/// `"abc" "def"` is `abcdef`, and a backslash escapes the next character. Google
+/// presents the text without quotes, and that text is taken as it is.
 fn txt_value(data: &str) -> String {
+    if !data.contains('"') {
+        return data.to_string();
+    }
     let mut value = String::new();
     let mut quoted = false;
     let mut escaped = false;
@@ -322,6 +326,27 @@ mod tests {
         assert_eq!(txt_value(r#""abc" "def""#), "abcdef");
         assert_eq!(txt_value(r#""a\"b\\c""#), r#"a"b\c"#);
         assert_eq!(txt_value("plain"), "plain");
+    }
+
+    #[test]
+    fn txt_value_takes_unquoted_text_as_it_is() {
+        assert_eq!(txt_value("v=DMARC1; p=reject"), "v=DMARC1; p=reject");
+        assert_eq!(txt_value(r"a\b"), r"a\b");
+    }
+
+    #[tokio::test]
+    async fn query_doh_reads_google_resolve_format() {
+        let server = serve(|_| {
+            (
+                200,
+                r#"{"Status":0,"TC":false,"RD":true,"RA":true,"AD":false,"CD":false,"Question":[{"name":"_acme-challenge.host.example.","type":16}],"Answer":[{"name":"_acme-challenge.host.example.","type":16,"TTL":60,"data":"one two"}],"Comment":"Response from 216.239.38.10."}"#.to_string(),
+            )
+        })
+        .await;
+        let seen = query_doh(&Client::new(), &url_of(&server), NAME)
+            .await
+            .unwrap();
+        assert_eq!(seen, expected(&["one two"]));
     }
 
     #[tokio::test]
