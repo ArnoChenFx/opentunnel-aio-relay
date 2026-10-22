@@ -3,8 +3,8 @@
 # Download the official OpenTunnel client from its GitHub release and verify
 # the tarball against the sha256 digest GitHub reports for that asset.
 #
-# Upstream publishes no checksum file, so the digest from the release API is
-# the integrity reference. It comes from the same response that names the
+# The digest from the release API is the integrity reference (newer upstream
+# releases also publish SHA256SUMS). It comes from the same response that names the
 # download URL, so the file we fetch is the one that digest describes. The
 # download is verified before anything is extracted, and a missing or
 # mismatched digest fails the job. The digest guards against corruption and

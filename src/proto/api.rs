@@ -21,7 +21,12 @@ pub struct TunnelInfo {
     pub id: String,
     pub hostname: String,
     pub state: TunnelState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "certificateID",
+        alias = "certificateId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub certificate_id: Option<String>,
 }
 

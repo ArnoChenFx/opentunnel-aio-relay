@@ -661,9 +661,15 @@ type Bridge = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream
 /// Provisions a tunnel with a ready certificate and attaches one bridge that
 /// serves the base route.
 async fn attached_bridge(srv: &TestServer) -> (String, Bridge, String) {
-    use futures_util::SinkExt;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (id, token) = ready_tunnel(srv).await;
+    let mut ws = bridge_with_claims(srv, &id, &token, vec!["@".into()], 256).await;
+    let attached: serde_json::Value = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
+    assert_eq!(attached["type"], "attached");
+    let bridge_id = attached["session"].as_str().unwrap().to_string();
+    (id, ws, bridge_id)
+}
 
+async fn ready_tunnel(srv: &TestServer) -> (String, String) {
     let (status, body) = http_request(srv, "POST", "/api/tunnel", None, "{}").await;
     assert_eq!(status, 201, "{body}");
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -680,6 +686,26 @@ async fn attached_bridge(srv: &TestServer) -> (String, Bridge, String) {
         .await
         .unwrap());
 
+    // Assert the wire spelling, not just a round-trip through our Rust types.
+    let (status, body) =
+        http_request(srv, "GET", &format!("/api/tunnel/{id}"), Some(&token), "").await;
+    assert_eq!(status, 200);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["certificateID"], cert_id);
+    assert!(info.get("certificateId").is_none());
+    (id, token)
+}
+
+async fn bridge_with_claims(
+    srv: &TestServer,
+    id: &str,
+    token: &str,
+    routes: Vec<String>,
+    max_conns: u32,
+) -> Bridge {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
     let tls = tls_connect(srv.port, &srv.cert_pem).await;
     let mut req = format!("wss://{DOMAIN}:{}/api/tunnel/{id}/connect", srv.port)
         .into_client_request()
@@ -691,18 +717,105 @@ async fn attached_bridge(srv: &TestServer) -> (String, Bridge, String) {
         "type": "attach",
         "token": token,
         "transport": "ws",
-        "routes": ["@"],
-        "client": {"version": "0.1.0", "max_conns": 256},
+        "routes": routes,
+        "client": {"version": "0.5.5", "max_conns": max_conns},
     });
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         attach.to_string().into(),
     ))
     .await
     .unwrap();
-    let attached: serde_json::Value = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
-    assert_eq!(attached["type"], "attached");
-    let bridge_id = attached["session"].as_str().unwrap().to_string();
-    (id, ws, bridge_id)
+    ws
+}
+
+#[tokio::test]
+async fn bridge_route_limits_are_atomic_and_detach_releases_routes() {
+    let srv = start_server().await;
+    let (id, token) = ready_tunnel(&srv).await;
+    // Duplicate names still count against the request-size limit.
+    for routes in [
+        vec!["same".into(); 129],
+        (0..129).map(|i| format!("r{i}")).collect(),
+    ] {
+        let mut ws = bridge_with_claims(&srv, &id, &token, routes, 256).await;
+        let reply: serde_json::Value = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
+        assert_eq!(reply["type"], "attach_error");
+        assert_eq!(reply["code"], "too_many_routes");
+        expect_close(&mut ws).await;
+    }
+    let mut first = bridge_with_claims(
+        &srv,
+        &id,
+        &token,
+        (0..128).map(|i| format!("a{i}")).collect(),
+        256,
+    )
+    .await;
+    assert!(recv_text(&mut first).await.contains("\"attached\""));
+    let mut second = bridge_with_claims(
+        &srv,
+        &id,
+        &token,
+        (0..128).map(|i| format!("b{i}")).collect(),
+        256,
+    )
+    .await;
+    assert!(recv_text(&mut second).await.contains("\"attached\""));
+    let mut third = bridge_with_claims(&srv, &id, &token, vec!["extra".into()], 256).await;
+    assert!(recv_text(&mut third).await.contains("too_many_routes"));
+    expect_close(&mut third).await;
+
+    first.close(None).await.unwrap();
+    expect_close(&mut first).await;
+    // Closing first must release its routes without affecting second.
+    let mut replacement = bridge_with_claims(
+        &srv,
+        &id,
+        &token,
+        (0..128).map(|i| format!("a{i}")).collect(),
+        256,
+    )
+    .await;
+    assert!(recv_text(&mut replacement).await.contains("\"attached\""));
+}
+
+async fn upgraded_bridge_holds_admission(per_ip: bool) {
+    let srv = start_server_with(|c| {
+        if per_ip {
+            c.max_connections_per_ip = 2;
+        } else {
+            c.max_connections = 2;
+            c.reserved_connections = 0;
+            c.max_connections_per_ip = 0;
+        }
+    })
+    .await;
+    let (_, ws, _) = attached_bridge(&srv).await;
+    // This live TLS socket uses the only other slot. The upgrade already
+    // completed, so retaining a guard merely in serve_api would fail here.
+    let holder = tls_connect(srv.port, &srv.cert_pem).await;
+    let mut excess = TcpStream::connect(("127.0.0.1", srv.port)).await.unwrap();
+    let mut byte = [0];
+    let n = tokio::time::timeout(Duration::from_secs(2), excess.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0, "upgraded WebSocket was not counted");
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Leave holder open: only releasing the bridge can make this succeed.
+    assert_eq!(http_request(&srv, "GET", "/health", None, "").await.0, 200);
+    drop(holder);
+}
+
+#[tokio::test]
+async fn upgraded_bridge_keeps_global_admission_until_transport_closes() {
+    upgraded_bridge_holds_admission(false).await;
+}
+
+#[tokio::test]
+async fn upgraded_bridge_keeps_source_admission_until_transport_closes() {
+    upgraded_bridge_holds_admission(true).await;
 }
 
 /// Connects a visitor with the given SNI and waits for the bridge to announce
