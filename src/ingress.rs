@@ -76,6 +76,10 @@ pub async fn run_on(
                 continue;
             }
         };
+        // Small TLS and bridge frames must not wait for Nagle's algorithm.
+        if let Err(error) = socket.set_nodelay(true) {
+            tracing::debug!(%peer, %error, "could not enable TCP_NODELAY");
+        }
         let Some(source) = sources.acquire(peer.ip()) else {
             tracing::warn!(%peer, "per-address connection limit reached; refusing connection");
             drop(socket);
@@ -188,6 +192,9 @@ async fn read_client_hello_until(
 struct Prepended<R> {
     buf: std::io::Cursor<Vec<u8>>,
     inner: R,
+    // Hyper transfers this stream into the upgraded WebSocket. Keep both
+    // admission permits with the transport, rather than the HTTP task.
+    _admission: Admission,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Prepended<R> {
@@ -237,13 +244,14 @@ async fn serve_api(
     router: Router,
     deadline: tokio::time::Instant,
     peer: SocketAddr,
-    _admission: Admission,
+    admission: Admission,
 ) -> Result<()> {
     let tls_config = state.api_tls.read().await.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
     let stream = Prepended {
         buf: std::io::Cursor::new(initial),
         inner: socket,
+        _admission: admission,
     };
     let tls = accept_tls_until(&acceptor, stream, deadline).await?;
     let io = TokioIo::new(tls);

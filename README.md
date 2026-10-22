@@ -87,6 +87,28 @@ opentunnel route add 3000
 Tip: use a separate client profile (`--profile home` / `OPENTUNNEL_PROFILE`)
 so you don't overwrite the tunnel identity you use with the official service.
 
+### Certificate trust for development
+
+The official v0.5.5 client trusts the bundled Mozilla roots **and the system
+certificate store** (`SSL_CERT_FILE` and `SSL_CERT_DIR` are honored). For a
+private or local test CA, add its PEM certificate with `--ca-cert` or
+`OPENTUNNEL_CA_CERT`:
+
+```bash
+export OPENTUNNEL_API=https://tunnel.example.com
+export OPENTUNNEL_CA_CERT=/path/to/test-ca.pem
+opentunnel route add 3000 --profile local
+# Equivalent: opentunnel --ca-cert /path/to/test-ca.pem route add 3000 --profile local
+```
+
+This adds trust for both the API and the bridge WebSocket; TLS certificate and
+hostname verification stay enabled. Visitors must trust the CA that issued the
+**tunnel** certificate separately (for curl, use `--cacert /path/to/test-ca.pem`).
+The relay still needs valid API and tunnel certificates: adding a CA to the
+client does not configure a local issuer or replace ACME DNS-01 validation.
+Use publicly trusted certificates for public tunnels. Older client releases
+may not support these trust options; check their `--help` before using them.
+
 ## Configuration
 
 All options are flags or `OT_*` environment variables (`--help` for the list):
@@ -114,6 +136,11 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_MAX_CERTS_PER_DAY` | `7` | New certificate orders per rolling 24 hours across all tunnels. Renewals are never refused. `0` disables |
 | `OT_RATE_LIMIT_PER_HOUR` | `30` | Requests per hour from one source address to tunnel creation and certificate binding. IPv6 sources are counted per /64. `0` disables |
 | `OT_CREATE_ALLOW_CIDRS` | — (empty: any source) | Comma-separated IPv4/IPv6 addresses or CIDR ranges allowed to create tunnels and bind certificates |
+
+A bridge may claim at most 128 routes, and all bridges of one tunnel at most
+256 routes together; excess claims return `too_many_routes`. Each bridge is
+limited to its advertised `client.max_conns`, clamped to 1–256 simultaneous
+visitor connections. New visitors beyond that limit are closed before `open`.
 
 Fixed limits that are not configurable: the ClientHello and TLS handshake must
 finish within 10 s, and each request's headers must arrive within 10 s. A
@@ -289,17 +316,21 @@ release. `OFFICIAL_CLIENT_RELEASE` selects the release: `latest` (the default)
 or a tag such as `v0.4.0` to pin. `.github/scripts/fetch-official-client.sh`
 resolves that release through the GitHub API, reads the sha256 digest GitHub
 reports for `opentunnel-linux-x64.tar.gz`, and refuses to run the binary unless
-the downloaded file matches it. The resolved tag is logged. Upstream publishes
-no checksum file, so this API digest is the integrity reference. It guards
+the downloaded file matches it. The resolved tag is logged. This script uses
+the API digest as its integrity reference; newer releases also publish a
+`SHA256SUMS` asset. The digest guards
 against corruption and substitution in transit. It does not guard against a
 compromised upstream release, because GitHub serves both the asset and its
 digest.
 
 The job then starts this relay and runs a real tunnel: provision via the HTTP
 API → attach the bridge WebSocket → fetch a page through the SNI-routed TLS
-connection that the client terminates. It needs real Let's Encrypt
-certificates (the official client only trusts the bundled Mozilla roots), so
-it performs live ACME DNS-01 issuance — 2 certificates per run.
+connection that the client terminates. This job deliberately uses real Let's
+Encrypt certificates to cover live ACME DNS-01 issuance — 2 certificates per
+run. It also validates publicly trusted TLS without extra CA configuration.
+Local tests with v0.5.5 can instead trust a test CA as described above; those
+tests exercise client interoperability but do not establish that public DNS-01
+validation works.
 
 Each run serves its own hostname, `run-<run id>-<attempt>.<CI_DOMAIN>`, so the
 certificate names never repeat. Let's Encrypt allows only 5 certificates per

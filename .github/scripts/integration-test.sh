@@ -30,9 +30,10 @@
 # fixed hostname would hit that limit after a few reruns. TXT records left
 # behind by an interrupted run are removed at the start of the next one.
 #
-# Trust notes: the official client only trusts bundled Mozilla roots, so the
-# relay must serve a publicly-trusted certificate -> real Let's Encrypt
-# issuance happens here (2 certificates per run: API domain + tunnel).
+# Trust notes: v0.5.5 also uses the system trust store and supports --ca-cert /
+# OPENTUNNEL_CA_CERT for local CAs. This job deliberately uses real Let's Encrypt
+# issuance (2 certificates per run: API domain + tunnel) to cover public DNS-01
+# and publicly-trusted TLS, rather than just local client interoperability.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -75,6 +75,25 @@ opentunnel route add 3000
 
 建议：用单独的客户端 profile（`--profile home` / `OPENTUNNEL_PROFILE`），别覆盖掉你在官方服务上用的隧道身份。
 
+## 开发环境的证书信任
+
+官方 v0.5.5 客户端同时信任内置 Mozilla 根证书和系统证书库，也支持
+`SSL_CERT_FILE`、`SSL_CERT_DIR`。使用私有或本地测试 CA 时，可以通过
+`--ca-cert` 或 `OPENTUNNEL_CA_CERT` 添加 PEM 格式的 CA 证书：
+
+```bash
+export OPENTUNNEL_API=https://tunnel.example.com
+export OPENTUNNEL_CA_CERT=/path/to/test-ca.pem
+opentunnel route add 3000 --profile local
+# 等价：opentunnel --ca-cert /path/to/test-ca.pem route add 3000 --profile local
+```
+
+该设置同时用于 API 和 bridge WebSocket，仍然验证证书和主机名。访客还需要
+单独信任签发**隧道证书**的 CA，例如 curl 使用 `--cacert /path/to/test-ca.pem`。
+中转仍需有效的 API 和隧道证书；客户端添加 CA 不会自动为中转配置本地签发器，
+也不替代 ACME DNS-01 验证。公网隧道应使用公开受信任的证书。旧版客户端未必
+支持这些选项，使用前请检查对应版本的 `--help`。
+
 ## 配置
 
 所有选项都是 flag 或 `OT_*` 环境变量（完整列表看 `--help`）：
@@ -105,6 +124,8 @@ opentunnel route add 3000
 
 不可配置的固定限制：ClientHello 和 TLS 握手必须在 10 秒内完成，每个请求的 header 必须在 10 秒内到达。访客 ClientHello 发出后 15 秒内 bridge 还没发来第一个字节，该转发连接会被以 `connection_terminated` 重置；第一个字节到达后这个检查停止，静默流改由 `OT_STREAM_IDLE_SECS` 管。访客 10 秒内一个字节都不读、且有中转数据在等它，会被单独重置并标记 `backpressure`。除 bridge 的 WebSocket 升级外，每个 API 响应都带 `Connection: close`。单个 ACME 订单最多跑 10 分钟。ACME 和 DNS API（Cloudflare、阿里云）的调用 10 秒建连超时、30 秒总超时。
 
+单条 bridge 最多声明 128 个 route，同一隧道的所有 bridge 合计最多 256 个；超限返回 `too_many_routes`。每条 bridge 的并发访客数遵守客户端声明的 `client.max_conns`，取值限制在 1–256。超限的新访客会在发送 `open` 前关闭。
+
 ### ACME 地址和联系邮箱
 
 `OT_ACME_URL` 指定签发证书的 ACME 目录，`OT_ACME_EMAIL` 是 ACME 账号的联系邮箱。两者可以用环境变量设置，也可以用命令行参数 `--acme-url`、`--acme-email`。
@@ -112,7 +133,7 @@ opentunnel route add 3000
 | 环境 | `OT_ACME_URL` | 说明 |
 |---|---|---|
 | 生产（代码默认值） | `https://acme-v02.api.letsencrypt.org/directory` | 证书受浏览器和官方客户端信任。受 Let's Encrypt 速率限制，每注册域名每周 50 张 |
-| staging（测试） | `https://acme-staging-v02.api.letsencrypt.org/directory` | 限额宽松，但签发的证书不受信任。官方客户端会拒绝连接，这是预期的 |
+| staging（测试） | `https://acme-staging-v02.api.letsencrypt.org/directory` | 限额宽松，签发的证书默认不受信任。默认配置的客户端会拒绝连接；测试时可显式信任对应的 staging CA，见上文证书信任说明 |
 
 测试时用单独的数据目录，避免 staging 证书混进生产数据：
 
@@ -279,9 +300,9 @@ cargo test
 
 ### 用官方客户端做端到端（CI）
 
-`integration` 任务从 GitHub release 下载官方 `opentunnel` CLI。`OFFICIAL_CLIENT_RELEASE` 选版本：`latest`（默认）或 `v0.4.0` 这样的 tag 来 pin。`.github/scripts/fetch-official-client.sh` 通过 GitHub API 解析该 release，读取 GitHub 给 `opentunnel-linux-x64.tar.gz` 报告的 sha256 digest，下载文件对不上就拒绝运行。解析到的 tag 会打到日志里。上游不发布 checksum 文件，所以这个 API digest 就是完整性依据。它防传输损坏和中途替换，防不了上游 release 本身被黑——因为 asset 和 digest 都是 GitHub 给的。
+`integration` 任务从 GitHub release 下载官方 `opentunnel` CLI。`OFFICIAL_CLIENT_RELEASE` 选版本：`latest`（默认）或 `v0.4.0` 这样的 tag 来 pin。`.github/scripts/fetch-official-client.sh` 通过 GitHub API 解析该 release，读取 GitHub 给 `opentunnel-linux-x64.tar.gz` 报告的 sha256 digest，下载文件对不上就拒绝运行。解析到的 tag 会打到日志里。脚本以 API digest 为完整性依据；较新的上游版本也发布 `SHA256SUMS` 文件。digest 防传输损坏和中途替换，防不了上游 release 本身被黑——因为 asset 和 digest 都是 GitHub 给的。
 
-任务接着启动本中转跑一条真隧道：HTTP API 开通 → bridge WebSocket attach → 走客户端终止的 SNI 路由 TLS 连接抓一个页面。需要真 Let's Encrypt 证书（官方客户端只认内置的 Mozilla 根），所以这里会做真实的 ACME DNS-01 签发——每次跑 2 张证书。
+任务接着启动本中转跑一条真隧道：HTTP API 开通 → bridge WebSocket attach → 走客户端终止的 SNI 路由 TLS 连接抓一个页面。该任务特意使用真实 Let's Encrypt 证书，覆盖公网 ACME DNS-01 签发和无需额外 CA 配置的 TLS 验证，每次跑 2 张证书。使用 v0.5.5 做本地测试时，也可以按上文说明信任测试 CA；这能验证客户端互通，但不能证明公网 DNS-01 验证成功。
 
 每次跑用自己的 hostname：`run-<run id>-<attempt>.<CI_DOMAIN>`，证书名永不重复。Let's Encrypt 限制完全相同的名字集合每周只能签 5 张，固定 hostname 跑几次重跑就超了。脚本退出时删掉该 hostname 下的 DNS-01 TXT 记录，启动前也会删掉被打断的 run 留下的 `_acme-challenge.run-*` 记录。删失败只记日志，不让任务失败。
 

@@ -25,6 +25,9 @@ use crate::proto::names;
 use crate::state::{now_rfc3339, AppState};
 
 const MAX_INBOUND_WS_BINARY_SIZE: usize = bridge::CONN_ID_SIZE + bridge::MAX_PAYLOAD_SIZE;
+const MAX_BRIDGE_ROUTES: usize = 128;
+const MAX_TUNNEL_ROUTES: usize = 256;
+const MAX_BRIDGE_CONNECTIONS: usize = 256;
 
 /// Bookkeeping charged against a visitor's buffer for each queued frame, on top
 /// of its payload. Without it, a flood of one-byte frames could hold far more
@@ -56,6 +59,7 @@ pub struct BridgeHandle {
     pub id: String,
     pub routes: Vec<String>,
     pub tx: mpsc::Sender<OutMsg>,
+    pub max_conns: usize,
 }
 
 /// Result of queueing one inbound data frame for a visitor.
@@ -227,7 +231,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         Message::Text(text) => parse_client_message(&text),
         _ => None,
     };
-    let (token, routes, _client) = match attach {
+    let (token, routes, client) = match attach {
         Some(ClientMessage::Attach {
             token,
             transport: Transport::Ws,
@@ -239,6 +243,20 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             return Err(Error::Internal("attach required".into()));
         }
     };
+
+    // Bound the original request, including duplicate route names, before
+    // loading a session. Deduplication must not bypass the protocol limit.
+    if routes.len() > MAX_BRIDGE_ROUTES {
+        send_text(
+            socket,
+            &ServerMessage::AttachError {
+                code: "too_many_routes".into(),
+            },
+        )
+        .await?;
+        let _ = socket.close().await;
+        return Ok(());
+    }
 
     let session = match state.sessions.get_or_load(&state.db, tunnel_id).await? {
         Some(s) => s,
@@ -307,21 +325,22 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
     }
     let bridge_id = format!("sess_{}", random_session_id());
     let (tx, mut rx) = mpsc::channel::<OutMsg>(512);
-    let conflict = !register_bridge(
+    let rejected = register_bridge(
         &state.db,
         &session,
         BridgeHandle {
             id: bridge_id.clone(),
             routes: routes.clone(),
             tx,
+            max_conns: (client.max_conns as usize).clamp(1, MAX_BRIDGE_CONNECTIONS),
         },
     )
     .await?;
-    if conflict {
+    if let Some(code) = rejected {
         send_text(
             socket,
             &ServerMessage::AttachError {
-                code: "route_conflict".to_string(),
+                code: code.to_string(),
             },
         )
         .await?;
@@ -424,10 +443,21 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
     Ok(())
 }
 
-async fn register_bridge(db: &Db, session: &Session, bridge: BridgeHandle) -> Result<bool> {
+/// Returns a protocol rejection code, or None after registering the bridge.
+async fn register_bridge(
+    db: &Db,
+    session: &Session,
+    bridge: BridgeHandle,
+) -> Result<Option<&'static str>> {
     let mut bridges = session.bridges.lock().await;
     if session.is_closed() {
         return Err(Error::Internal("tunnel was deleted".into()));
+    }
+    if bridge.routes.len() > MAX_BRIDGE_ROUTES
+        || bridges.iter().map(|b| b.routes.len()).sum::<usize>() + bridge.routes.len()
+            > MAX_TUNNEL_ROUTES
+    {
+        return Ok(Some("too_many_routes"));
     }
     let conflict = bridges.iter().any(|b| {
         b.routes
@@ -435,14 +465,14 @@ async fn register_bridge(db: &Db, session: &Session, bridge: BridgeHandle) -> Re
             .any(|r| bridge.routes.iter().any(|want| want == r))
     });
     if conflict {
-        return Ok(false);
+        return Ok(Some("route_conflict"));
     }
 
     // Persist membership transitions while holding the same lock used by
     // detach, so a delayed offline write cannot overwrite a newer attach.
     db.set_online(&session.id, true, &now_rfc3339()).await?;
     bridges.push(bridge);
-    Ok(true)
+    Ok(None)
 }
 
 async fn detach_bridge(db: &Db, session: &Session, bridge_id: &str) {
@@ -547,12 +577,23 @@ impl Session {
         if self.is_closed() {
             return None;
         }
-        let (bridge_id, bridge_tx) = _bridges
+        let bridge = _bridges
             .iter()
-            .find(|bridge| bridge.routes.iter().any(|candidate| candidate == route))
-            .map(|bridge| (bridge.id.clone(), bridge.tx.clone()))?;
+            .find(|bridge| bridge.routes.iter().any(|candidate| candidate == route))?;
 
         let mut channels = self.channels.lock().await;
+        // Resolve ownership and reserve capacity under the same locks used
+        // by detach, so concurrent visitors cannot oversubscribe a bridge.
+        if channels
+            .values()
+            .filter(|c| c.bridge_id == bridge.id)
+            .count()
+            >= bridge.max_conns
+        {
+            return None;
+        }
+        let bridge_id = bridge.id.clone();
+        let bridge_tx = bridge.tx.clone();
         let mut conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
         while conn == 0 || channels.contains_key(&conn) {
             conn = self.next_conn.fetch_add(1, Ordering::SeqCst);
@@ -761,7 +802,49 @@ mod tests {
             id: id.into(),
             routes: vec![route.into()],
             tx,
+            max_conns: MAX_BRIDGE_CONNECTIONS,
         }
+    }
+
+    #[tokio::test]
+    async fn bridge_capacity_is_atomic_isolated_and_released_on_reset() {
+        let session = test_session("test");
+        let mut limited = bridge("limited", "@");
+        limited.max_conns = 1;
+        session
+            .bridges
+            .lock()
+            .await
+            .extend([limited, bridge("other", "api")]);
+        let (one, two) = tokio::join!(
+            session.open_channel_for_route("@", TEST_BUDGET),
+            session.open_channel_for_route("@", TEST_BUDGET),
+        );
+        assert_eq!(usize::from(one.is_some()) + usize::from(two.is_some()), 1);
+        let admitted = one.or(two).unwrap();
+        assert!(session
+            .open_channel_for_route("api", TEST_BUDGET)
+            .await
+            .is_some());
+        assert!(!session.abort_channel("other", admitted.conn, "reset").await);
+        assert!(session
+            .open_channel_for_route("@", TEST_BUDGET)
+            .await
+            .is_none());
+        assert!(
+            session
+                .abort_channel("limited", admitted.conn, "reset")
+                .await
+        );
+        let replacement = session
+            .open_channel_for_route("@", TEST_BUDGET)
+            .await
+            .unwrap();
+        session.close_channel(replacement.conn).await;
+        assert!(session
+            .open_channel_for_route("@", TEST_BUDGET)
+            .await
+            .is_some());
     }
 
     #[tokio::test]
@@ -770,7 +853,8 @@ mod tests {
         let session = test_session("test");
         assert!(register_bridge(&db, &session, bridge("old", "@"))
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
 
         let db_detach = db.clone();
         let session_detach = session.clone();
@@ -780,7 +864,7 @@ mod tests {
             detach_bridge(&db_detach, &session_detach, "old"),
             register_bridge(&db_attach, &session_attach, bridge("new", "api")),
         );
-        assert!(attached.unwrap());
+        assert!(attached.unwrap().is_none());
         assert_eq!(session.bridges.lock().await.len(), 1);
         assert_eq!(
             db.get_tunnel("test").await.unwrap().unwrap().state,
@@ -804,7 +888,8 @@ mod tests {
         let session = test_session("test");
         assert!(register_bridge(&db, &session, bridge("only", "@"))
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
 
         let (opened, ()) = tokio::join!(
             session.open_channel_for_route("@", TEST_BUDGET),
@@ -847,7 +932,8 @@ mod tests {
         let session = test_session("test");
         assert!(register_bridge(&db, &session, bridge("bridge", "@"))
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         let (handle, mut cancel_rx, _inbound) = full_channel("bridge");
         session.channels.lock().await.insert(1, handle);
 
