@@ -87,28 +87,6 @@ opentunnel route add 3000
 Tip: use a separate client profile (`--profile home` / `OPENTUNNEL_PROFILE`)
 so you don't overwrite the tunnel identity you use with the official service.
 
-### Certificate trust for development
-
-The official v0.5.5 client trusts the bundled Mozilla roots **and the system
-certificate store** (`SSL_CERT_FILE` and `SSL_CERT_DIR` are honored). For a
-private or local test CA, add its PEM certificate with `--ca-cert` or
-`OPENTUNNEL_CA_CERT`:
-
-```bash
-export OPENTUNNEL_API=https://tunnel.example.com
-export OPENTUNNEL_CA_CERT=/path/to/test-ca.pem
-opentunnel route add 3000 --profile local
-# Equivalent: opentunnel --ca-cert /path/to/test-ca.pem route add 3000 --profile local
-```
-
-This adds trust for both the API and the bridge WebSocket; TLS certificate and
-hostname verification stay enabled. Visitors must trust the CA that issued the
-**tunnel** certificate separately (for curl, use `--cacert /path/to/test-ca.pem`).
-The relay still needs valid API and tunnel certificates: adding a CA to the
-client does not configure a local issuer or replace ACME DNS-01 validation.
-Use publicly trusted certificates for public tunnels. Older client releases
-may not support these trust options; check their `--help` before using them.
-
 ## Configuration
 
 All options are flags or `OT_*` environment variables (`--help` for the list):
@@ -328,7 +306,8 @@ API → attach the bridge WebSocket → fetch a page through the SNI-routed TLS
 connection that the client terminates. This job deliberately uses real Let's
 Encrypt certificates to cover live ACME DNS-01 issuance — 2 certificates per
 run. It also validates publicly trusted TLS without extra CA configuration.
-Local tests with v0.5.5 can instead trust a test CA as described above; those
+Local tests with v0.5.5 can instead trust a test CA through the system store or
+`--ca-cert` / `OPENTUNNEL_CA_CERT`; those
 tests exercise client interoperability but do not establish that public DNS-01
 validation works.
 
