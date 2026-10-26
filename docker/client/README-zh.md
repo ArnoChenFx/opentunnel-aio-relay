@@ -54,6 +54,29 @@ docker compose -f docker/client/docker-compose.yml up -d --build
 | `OT_CLIENT_ADMIN_TOKEN` | — | 设置后，API 与页面请求需 `Authorization: Bearer <token>` |
 | `XDG_*` / `/data` | 见 Dockerfile | 隧道密钥、route 配置等持久化在 `/data` 卷 |
 
+## 从旧版「只跑 serve」的 Docker 迁移
+
+若以前把数据挂到 `/root/.config/opentunnel`、`/root/.local/share/opentunnel` 等路径，**必须**让进程读到同一位置，二选一：
+
+1. **显式设置 XDG**（推荐，行为确定）：
+
+```yaml
+environment:
+  XDG_CONFIG_HOME: /root/.config
+  XDG_DATA_HOME: /root/.local/share
+  XDG_STATE_HOME: /root/.local/state
+volumes:
+  - ./opentunnel-config:/root/.config/opentunnel
+  - ./opentunnel-data:/root/.local/share/opentunnel
+  - ./opentunnel-state:/root/.local/state/opentunnel
+```
+
+2. **保持上述卷挂载、不设 XDG**：较新镜像的 entrypoint 会在 `/data` 下找不到 `tunnel.json` 时，自动检测 `/root/.local/share/opentunnel/<profile>/tunnel.json` 并切换 XDG。
+
+仅挂载旧目录而不满足以上任一条件时，客户端会在空的 `/data` 里重新初始化，**管理页看不到原来的 tunnel**（数据仍在宿主机目录里，只是容器没读到）。
+
+启动日志里会打印 `tunnel identity: ... (present|missing)`，便于核对。
+
 ## 转发到本机服务
 
 容器内的 route **目标**填容器能访问的地址：

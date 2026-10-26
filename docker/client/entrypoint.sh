@@ -9,7 +9,35 @@ export XDG_DATA_HOME="${XDG_DATA_HOME:-/data/data}"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-/data/state}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/opentunnel}"
 
+# Older DIY images mounted host dirs under /root/.config|opentunnel and
+# /root/.local/share|opentunnel without setting XDG_*. The client always
+# reads $XDG_* paths, so those mounts were invisible when XDG pointed at /data.
+tunnel_json() {
+  echo "${XDG_DATA_HOME}/opentunnel/${OPENTUNNEL_PROFILE}/tunnel.json"
+}
+if [[ ! -f "$(tunnel_json)" && -f "/root/.local/share/opentunnel/${OPENTUNNEL_PROFILE}/tunnel.json" ]]; then
+  echo "==> legacy tunnel data detected under /root/.local/share/opentunnel/${OPENTUNNEL_PROFILE}"
+  echo "==> switching XDG paths to match typical root compose volume mounts"
+  export XDG_CONFIG_HOME=/root/.config
+  export XDG_DATA_HOME=/root/.local/share
+  export XDG_STATE_HOME=/root/.local/state
+fi
+
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+
+tunnel_file="$(tunnel_json)"
+config_file="${XDG_CONFIG_HOME}/opentunnel/${OPENTUNNEL_PROFILE}.toml"
+echo "==> XDG config=${XDG_CONFIG_HOME} data=${XDG_DATA_HOME} state=${XDG_STATE_HOME}"
+if [[ -f "$tunnel_file" ]]; then
+  echo "==> tunnel identity: ${tunnel_file} (present)"
+else
+  echo "==> tunnel identity: ${tunnel_file} (missing — UI will show no tunnel until created or volumes are fixed)" >&2
+fi
+if [[ -f "$config_file" ]]; then
+  echo "==> routes config: ${config_file} (present)"
+else
+  echo "==> routes config: ${config_file} (missing)"
+fi
 
 ADMIN_PORT="${OT_CLIENT_ADMIN_PORT:-9080}"
 SERVE_PID=""
