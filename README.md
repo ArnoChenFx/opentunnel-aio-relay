@@ -254,6 +254,10 @@ relay also restricts the SQLite database and API private key to mode 600.
   before expiry, and new TLS handshakes use the renewed certificate. If renewal
   fails, the still-valid certificate stays in service and a warning is logged.
 
+## OpenTunnel client Docker image
+
+To run the official `opentunnel` client in Docker with a small web UI for managing routes, see [`docker/client/README-zh.md`](docker/client/README-zh.md) (`opentunnel serve`, persistent `/data` volume).
+
 ## Building
 
 ```bash
