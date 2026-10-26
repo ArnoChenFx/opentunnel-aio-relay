@@ -50,8 +50,12 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         max_connections: 1024,
         reserved_connections: 64,
         max_connections_per_ip: 0,
-        stream_buffer_bytes: 2 * 1024 * 1024,
+        stream_buffer_bytes: 512 * 1024,
         stream_idle: Duration::from_secs(3600),
+        stream_max_lifetime: Duration::ZERO,
+        session_cache_idle: Duration::ZERO,
+        tunnel_tombstone_days: 0,
+        acme_concurrency: 8,
         create_allow_cidrs: CidrList::default(),
         rate_limit_per_hour: 0,
         timeouts: Timeouts {
@@ -123,6 +127,7 @@ async fn start_server_with(tweak: impl FnOnce(&mut Config)) -> TestServer {
         api_tls: Arc::new(tokio::sync::RwLock::new(api_tls)),
         http,
         limiter: RateLimiter::new(rate_limit),
+        acme_jobs: Arc::new(tokio::sync::Semaphore::new(8)),
     });
     let router = api::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

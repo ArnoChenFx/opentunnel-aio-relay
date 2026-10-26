@@ -137,6 +137,9 @@ impl RateLimiter {
             .buckets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if buckets.len() > 4096 {
+            buckets.retain(|_, bucket| now.duration_since(bucket.started) < self.window);
+        }
         if buckets.len() >= MAX_TRACKED_SOURCES && !buckets.contains_key(&key) {
             buckets.retain(|_, bucket| now.duration_since(bucket.started) < self.window);
             if buckets.len() >= MAX_TRACKED_SOURCES {

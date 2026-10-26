@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
+
 use crate::bridge::SessionManager;
 use crate::config::Config;
 use crate::db::Db;
@@ -16,6 +18,8 @@ pub struct AppState {
     pub api_tls: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>>,
     pub http: reqwest::Client,
     pub limiter: RateLimiter,
+    /// Bounds concurrent ACME orders (issuance and renewal).
+    pub acme_jobs: Arc<Semaphore>,
 }
 
 pub fn now_rfc3339() -> String {

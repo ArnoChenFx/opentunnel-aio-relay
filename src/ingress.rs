@@ -362,11 +362,20 @@ async fn serve_tunnel(
         sni: sni.clone(),
         alpn,
     })?;
-    if bridge_tx.send(OutMsg::Text(open)).await.is_err() {
+    let send_timeout = state.config.timeouts.bridge_stall;
+    if tokio::time::timeout(send_timeout, bridge_tx.send(OutMsg::Text(open)))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_none()
+    {
         session.close_channel(conn).await;
         return Err(Error::Internal("bridge gone".into()));
     }
-    if !session.send_data(&bridge_tx, conn, &initial).await {
+    if !session
+        .send_data(&bridge_tx, conn, &initial, send_timeout)
+        .await
+    {
         session.close_channel(conn).await;
         return Err(Error::Internal("bridge gone".into()));
     }
@@ -378,20 +387,23 @@ async fn serve_tunnel(
     let bridge_up = bridge_tx.clone();
     let session_up = session.clone();
     let activity_up = activity.clone();
+    let send_timeout_up = send_timeout;
     let pump_up = async move {
         let mut chunk = [0u8; 32 * 1024];
         loop {
             let n = reader.read(&mut chunk).await?;
             if n == 0 {
-                let _ = bridge_up
-                    .send(OutMsg::Text(
-                        serde_json::to_string(&proto::ServerMessage::End { conn }).unwrap(),
-                    ))
-                    .await;
+                let end = OutMsg::Text(
+                    serde_json::to_string(&proto::ServerMessage::End { conn }).unwrap(),
+                );
+                let _ = tokio::time::timeout(send_timeout_up, bridge_up.send(end)).await;
                 break;
             }
             activity_up.touch();
-            if !session_up.send_data(&bridge_up, conn, &chunk[..n]).await {
+            if !session_up
+                .send_data(&bridge_up, conn, &chunk[..n], send_timeout_up)
+                .await
+            {
                 break;
             }
         }
@@ -431,6 +443,14 @@ async fn serve_tunnel(
     };
 
     let idle_limit = state.config.stream_idle;
+    let max_lifetime = state.config.stream_max_lifetime;
+    let lifetime_sleep = async {
+        if max_lifetime.is_zero() {
+            std::future::pending::<()>().await;
+        } else {
+            tokio::time::sleep(max_lifetime).await;
+        }
+    };
     // `biased` makes a bridge-side cancel win over the pumps. A cancel is set
     // before the channel is dropped, so `None` above can only follow a cancel.
     let result = tokio::select! {
@@ -438,6 +458,7 @@ async fn serve_tunnel(
         _ = shutdown_rx.changed() => Err(anyhow::anyhow!("tunnel was deleted")),
         reason = cancelled(&mut channel_shutdown) => Err(anyhow::anyhow!("cancelled by bridge: {reason}")),
         _ = activity.idle(idle_limit) => Err(anyhow::anyhow!("idle for {idle_limit:?}")),
+        _ = lifetime_sleep => Err(anyhow::anyhow!("connection lifetime exceeded {max_lifetime:?}")),
         result = async { tokio::try_join!(pump_up, pump_down).map(|_| ()) } => result,
     };
     // Read before `close_channel`, which sets its own cancel reason.

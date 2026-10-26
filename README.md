@@ -105,14 +105,18 @@ All options are flags or `OT_*` environment variables (`--help` for the list):
 | `OT_ACME_URL` | Let's Encrypt production | ACME directory; use `https://acme-staging-v02.api.letsencrypt.org/directory` for testing |
 | `OT_ACME_EMAIL` | — (empty: no contact) | ACME account contact. Recommended: Let's Encrypt sends certificate expiry notices there. When set, it must look like `name@domain.tld`, and reserved domains such as `example.com` are rejected by Let's Encrypt. Changing it does not update an existing account |
 | `OT_DNS_PROPAGATION_SECS` | `120` | Seconds, in total for one order, to wait for new TXT records to show up through public DoH resolvers (Cloudflare, Google, Alibaba) before the CA is asked to validate. A miss is logged as a warning and the order goes on. `0` skips the wait |
-| `OT_MAX_CONNECTIONS` | `1024` | Connections open at once on the listener (API, bridge, and visitor sockets). Extra connections are refused at accept. `0` disables |
+| `OT_MAX_CONNECTIONS` | `1024` | Connections open at once on the listener (API, bridge, and visitor sockets). Extra connections are refused at accept. **`0` disables the cap (unlimited)** |
 | `OT_RESERVED_CONNECTIONS` | `64` | Slots within `OT_MAX_CONNECTIONS` that visitor sockets may never take, so API and bridge connections still get in while visitors are at their limit. Must be below `OT_MAX_CONNECTIONS` unless that is `0` |
 | `OT_MAX_CONNECTIONS_PER_IP` | `64` | Sockets one source address may hold open at once. IPv6 sources are counted per /64. Extra sockets are refused at accept. `0` disables |
-| `OT_STREAM_BUFFER_BYTES` | `2097152` (2 MiB) | Data held for one visitor that has not read it yet. A visitor that falls further behind is reset with `backpressure`. Minimum `65536` |
+| `OT_STREAM_BUFFER_BYTES` | `524288` (512 KiB) | Data held for one visitor that has not read it yet. A visitor that falls further behind is reset with `backpressure`. Minimum `65536` |
 | `OT_STREAM_IDLE_SECS` | `3600` (1 h) | Seconds a forwarded connection may go without bytes in either direction before it is closed and the bridge is told with `connection_terminated`. `0` disables the limit; raise it for long SSH or WebSocket sessions that stay quiet |
-| `OT_MAX_TUNNELS` | `1000` | Live tunnels (not deleted). Creating one past the cap returns `503`. `0` disables |
+| `OT_STREAM_MAX_SECS` | `86400` (24 h) | Maximum lifetime of one proxied visitor connection, even when bytes or heartbeats keep moving. `0` disables |
+| `OT_SESSION_CACHE_IDLE_SECS` | `86400` (24 h) | How long an offline tunnel may stay in the in-memory session cache after its last bridge detaches. `0` disables eviction |
+| `OT_TUNNEL_TOMBSTONE_DAYS` | `30` | Hard-delete soft-deleted tunnel rows from SQLite after this many days (hourly job). `0` keeps tombstones forever |
+| `OT_ACME_CONCURRENCY` | `3` | Maximum ACME orders (issuance and renewal) running at once. `0` means no limit |
+| `OT_MAX_TUNNELS` | `1000` | Live tunnels (not deleted). Creating one past the cap returns `503`. **`0` disables the cap (unlimited)** |
 | `OT_MAX_CERTS_PER_DAY` | `7` | New certificate orders per rolling 24 hours across all tunnels. Renewals are never refused. `0` disables |
-| `OT_RATE_LIMIT_PER_HOUR` | `30` | Requests per hour from one source address to tunnel creation and certificate binding. IPv6 sources are counted per /64. `0` disables |
+| `OT_RATE_LIMIT_PER_HOUR` | `30` | Requests per hour from one source address to tunnel creation and certificate binding. IPv6 sources are counted per /64. **`0` disables rate limiting** |
 | `OT_CREATE_ALLOW_CIDRS` | — (empty: any source) | Comma-separated IPv4/IPv6 addresses or CIDR ranges allowed to create tunnels and bind certificates |
 
 A bridge may claim at most 128 routes, and all bridges of one tunnel at most
@@ -143,8 +147,13 @@ The protocol has no per-stream flow control, so the relay cannot pause one
 connection without pausing all of them. A visitor that reads more slowly than
 the bridge sends, for longer than its buffer holds, is reset. Raise
 `OT_STREAM_BUFFER_BYTES` for bulk transfers to slow clients. Worst-case buffer
-memory is `OT_MAX_CONNECTIONS` times `OT_STREAM_BUFFER_BYTES`, which is 2 GiB at
-the defaults. Size the two together for the host's RAM.
+memory is roughly (visitor connection slots) times `OT_STREAM_BUFFER_BYTES`
+(about 960 slots at the defaults, so ~480 MiB of stream buffers). Each attached
+bridge also queues outbound frames proportional to `OT_STREAM_BUFFER_BYTES`
+(capped at 128 frames). Size buffer bytes and connection caps together for the
+host's RAM. Bridge and visitor WebSocket/TCP sends use the same 10 s stall
+budget as visitor backpressure, so a stuck peer cannot bypass bridge idle
+timeout or hold routes indefinitely.
 
 ### Connection limits
 
