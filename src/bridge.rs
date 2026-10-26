@@ -7,9 +7,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -28,6 +29,14 @@ const MAX_INBOUND_WS_BINARY_SIZE: usize = bridge::CONN_ID_SIZE + bridge::MAX_PAY
 const MAX_BRIDGE_ROUTES: usize = 128;
 const MAX_TUNNEL_ROUTES: usize = 256;
 const MAX_BRIDGE_CONNECTIONS: usize = 256;
+const MIN_BRIDGE_OUTBOUND_QUEUE: usize = 8;
+const MAX_BRIDGE_OUTBOUND_QUEUE: usize = 128;
+
+/// Outbound WebSocket frames queued per bridge (~one max-size frame each).
+pub fn bridge_outbound_queue_depth(stream_buffer_bytes: usize) -> usize {
+    let frames = stream_buffer_bytes.div_ceil(crate::proto::bridge::MAX_PAYLOAD_SIZE);
+    frames.saturating_add(4).clamp(MIN_BRIDGE_OUTBOUND_QUEUE, MAX_BRIDGE_OUTBOUND_QUEUE)
+}
 
 /// Bookkeeping charged against a visitor's buffer for each queued frame, on top
 /// of its payload. Without it, a flood of one-byte frames could hold far more
@@ -107,6 +116,8 @@ pub struct Session {
     next_conn: AtomicU32,
     closed: AtomicBool,
     shutdown: watch::Sender<bool>,
+    /// Unix millis when the last bridge detached; 0 while a bridge is attached.
+    idle_since_ms: AtomicI64,
 }
 
 struct ChannelHandle {
@@ -155,6 +166,7 @@ impl SessionManager {
             next_conn: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             shutdown,
+            idle_since_ms: AtomicI64::new(crate::state::now_millis()),
         });
         sessions.insert(id.to_string(), session.clone());
         Ok(Some(session))
@@ -170,6 +182,41 @@ impl SessionManager {
             session.signal_shutdown();
             session.shutdown_live_connections().await;
         }
+    }
+
+    /// Drops cached sessions that have been offline with no live channels longer
+    /// than `max_idle`. The database row is untouched; the next lookup reloads.
+    pub async fn evict_idle(&self, max_idle: Duration) -> usize {
+        if max_idle.is_zero() {
+            return 0;
+        }
+        let cutoff = crate::state::now_millis() - i64::try_from(max_idle.as_millis()).unwrap_or(i64::MAX);
+        let mut sessions = self.inner.write().await;
+        let before = sessions.len();
+        sessions.retain(|_, session| {
+            if session.is_closed() {
+                return false;
+            }
+            if session.idle_since_ms.load(Ordering::Relaxed) == 0 {
+                return true;
+            }
+            if session.idle_since_ms.load(Ordering::Relaxed) > cutoff {
+                return true;
+            }
+            // Still busy tearing down visitors.
+            if !session.bridges.try_lock().is_ok_and(|b| b.is_empty()) {
+                return true;
+            }
+            if !session
+                .channels
+                .try_lock()
+                .is_ok_and(|c| c.is_empty())
+            {
+                return true;
+            }
+            false
+        });
+        before.saturating_sub(sessions.len())
     }
 }
 
@@ -220,6 +267,7 @@ pub async fn run_bridge(state: Arc<AppState>, tunnel_id: String, mut socket: Web
 }
 
 async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSocket) -> Result<()> {
+    let ws_send_timeout = state.config.timeouts.bridge_stall;
     // The client must send `attach` within 10 seconds (protocol spec).
     let first = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
         .await
@@ -252,6 +300,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             &ServerMessage::AttachError {
                 code: "too_many_routes".into(),
             },
+            ws_send_timeout,
         )
         .await?;
         let _ = socket.close().await;
@@ -266,6 +315,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                 &ServerMessage::AttachError {
                     code: bridge::codes::BAD_TOKEN.to_string(),
                 },
+                ws_send_timeout,
             )
             .await?;
             let _ = socket.close().await;
@@ -284,6 +334,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             &ServerMessage::AttachError {
                 code: bridge::codes::BAD_TOKEN.to_string(),
             },
+            ws_send_timeout,
         )
         .await?;
         let _ = socket.close().await;
@@ -295,6 +346,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             &ServerMessage::AttachError {
                 code: bridge::codes::CERT_NOT_READY.to_string(),
             },
+            ws_send_timeout,
         )
         .await?;
         let _ = socket.close().await;
@@ -318,13 +370,15 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             &ServerMessage::AttachError {
                 code: "invalid_route".to_string(),
             },
+            ws_send_timeout,
         )
         .await?;
         let _ = socket.close().await;
         return Ok(());
     }
     let bridge_id = format!("sess_{}", random_session_id());
-    let (tx, mut rx) = mpsc::channel::<OutMsg>(512);
+    let out_depth = bridge_outbound_queue_depth(state.config.stream_buffer_bytes);
+    let (tx, mut rx) = mpsc::channel::<OutMsg>(out_depth);
     let rejected = register_bridge(
         &state.db,
         &session,
@@ -342,12 +396,13 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             &ServerMessage::AttachError {
                 code: code.to_string(),
             },
+            ws_send_timeout,
         )
         .await?;
         let _ = socket.close().await;
         return Ok(());
     }
-    tracing::info!(tunnel = %tunnel_id, bridge = %bridge_id, routes = ?routes, "bridge attached");
+    tracing::debug!(tunnel = %tunnel_id, bridge = %bridge_id, routes = ?routes, "bridge attached");
 
     if let Err(error) = send_text(
         socket,
@@ -357,6 +412,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
             heartbeat_ms: bridge::HEARTBEAT_MS,
             idle_timeout_ms: bridge::IDLE_TIMEOUT_MS,
         },
+        ws_send_timeout,
     )
     .await
     {
@@ -391,7 +447,9 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                     OutMsg::Text(t) => Message::Text(t.into()),
                     OutMsg::Binary(b) => Message::Binary(b.into()),
                 };
-                if socket.send(msg).await.is_err() { break; }
+                if !ws_send_with_timeout(socket, msg, ws_send_timeout).await {
+                    break;
+                }
             }
             incoming = socket.next() => {
                 let Some(incoming) = incoming else { break };
@@ -404,7 +462,10 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                     Message::Text(text) => {
                         if let Some(control) = parse_client_message(&text) {
                             if let Some(reply) = handle_control(&session, &bridge_id, control).await {
-                                if send_text(socket, &reply).await.is_err() {
+                                if send_text(socket, &reply, ws_send_timeout)
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -422,14 +483,18 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                                     conn,
                                     code: bridge::codes::BACKPRESSURE.into(),
                                 };
-                                if send_text(socket, &reset).await.is_err() {
+                                if send_text(socket, &reset, ws_send_timeout)
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
                         }
                     }
                     Message::Ping(data) => {
-                        let _ = socket.send(Message::Pong(data)).await;
+                        let _ =
+                            ws_send_with_timeout(socket, Message::Pong(data), ws_send_timeout).await;
                     }
                     Message::Close(_) => break,
                     _ => {}
@@ -472,6 +537,7 @@ async fn register_bridge(
     // detach, so a delayed offline write cannot overwrite a newer attach.
     db.set_online(&session.id, true, &now_rfc3339()).await?;
     bridges.push(bridge);
+    session.mark_bridge_active();
     Ok(None)
 }
 
@@ -479,9 +545,11 @@ async fn detach_bridge(db: &Db, session: &Session, bridge_id: &str) {
     let owned_channels = {
         let mut bridges = session.bridges.lock().await;
         bridges.retain(|b| b.id != bridge_id);
-        if bridges.is_empty() {
+        let bridges_empty = bridges.is_empty();
+        if bridges_empty {
             // Serialize the persisted online state with later bridge attaches.
             let _ = db.set_online(&session.id, false, &now_rfc3339()).await;
+            session.mark_bridge_idle();
         }
 
         // Route removal and channel cleanup are ordered against
@@ -499,7 +567,7 @@ async fn detach_bridge(db: &Db, session: &Session, bridge_id: &str) {
     for channel in owned_channels {
         cancel_channel(channel, "bridge_disconnected");
     }
-    tracing::info!(tunnel = %session.id, bridge = %bridge_id, "bridge detached");
+    tracing::debug!(tunnel = %session.id, bridge = %bridge_id, "bridge detached");
 }
 
 fn cancel_channel(channel: ChannelHandle, reason: &str) {
@@ -537,13 +605,27 @@ fn parse_client_message(text: &str) -> Option<ClientMessage> {
     }
 }
 
-async fn send_text(socket: &mut WebSocket, msg: &ServerMessage) -> Result<()> {
+async fn ws_send_with_timeout(
+    socket: &mut WebSocket,
+    msg: Message,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn send_text(
+    socket: &mut WebSocket,
+    msg: &ServerMessage,
+    timeout: Duration,
+) -> Result<()> {
     let text = serde_json::to_string(msg)?;
-    socket
-        .send(Message::Text(text.into()))
+    ws_send_with_timeout(socket, Message::Text(text.into()), timeout)
         .await
-        .map_err(|e| Error::Internal(format!("websocket send error: {e}")))?;
-    Ok(())
+        .then_some(())
+        .ok_or_else(|| Error::Internal("websocket send timed out or failed".into()))
 }
 
 pub fn random_session_id() -> String {
@@ -695,17 +777,28 @@ impl Session {
         bridge_tx: &mpsc::Sender<OutMsg>,
         conn: ConnId,
         payload: &[u8],
+        send_timeout: Duration,
     ) -> bool {
         if self.is_closed() {
             return false;
         }
         for chunk in payload.chunks(bridge::MAX_PAYLOAD_SIZE) {
             let frame = encode_data_frame(conn, chunk);
-            if bridge_tx.send(OutMsg::Binary(frame)).await.is_err() {
-                return false;
+            match tokio::time::timeout(send_timeout, bridge_tx.send(OutMsg::Binary(frame))).await {
+                Ok(Ok(())) => {}
+                _ => return false,
             }
         }
         true
+    }
+
+    fn mark_bridge_active(&self) {
+        self.idle_since_ms.store(0, Ordering::Release);
+    }
+
+    fn mark_bridge_idle(&self) {
+        self.idle_since_ms
+            .store(crate::state::now_millis(), Ordering::Release);
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -777,6 +870,7 @@ mod tests {
             next_conn: AtomicU32::new(1),
             closed: AtomicBool::new(false),
             shutdown,
+            idle_since_ms: AtomicI64::new(crate::state::now_millis()),
         })
     }
 
@@ -804,6 +898,16 @@ mod tests {
             tx,
             max_conns: MAX_BRIDGE_CONNECTIONS,
         }
+    }
+
+    #[test]
+    fn bridge_outbound_queue_scales_with_stream_buffer() {
+        assert_eq!(bridge_outbound_queue_depth(512 * 1024), 20);
+        assert_eq!(bridge_outbound_queue_depth(64 * 1024), MIN_BRIDGE_OUTBOUND_QUEUE);
+        assert_eq!(
+            bridge_outbound_queue_depth(8 * 1024 * 1024),
+            MAX_BRIDGE_OUTBOUND_QUEUE
+        );
     }
 
     #[tokio::test]

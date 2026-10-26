@@ -141,7 +141,20 @@ const MIGRATIONS: &[&str] = &[
          created_at INTEGER NOT NULL
      );
      CREATE INDEX IF NOT EXISTS issuances_created_at ON issuances (created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_tunnels_live ON tunnels (id) WHERE deleted_at IS NULL;
+     CREATE INDEX IF NOT EXISTS idx_tunnels_renewal ON tunnels (renewal_next_at, renewal_started_at)
+         WHERE deleted_at IS NULL AND cert_state = 'ready' AND csr_pem IS NOT NULL AND cert_expiry IS NOT NULL;",
 ];
+
+/// Fields needed for the hourly renewal scan (avoids loading full certificate PEMs).
+#[derive(Debug, Clone)]
+pub struct RenewalCandidate {
+    pub id: String,
+    pub state: String,
+    pub last_connected_at: Option<String>,
+    pub cert_expiry: Option<String>,
+    pub csr_pem: Option<String>,
+}
 
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -402,18 +415,26 @@ impl Db {
         &self,
         now_ms: i64,
         lease_ms: i64,
-    ) -> Result<Vec<TunnelRecord>> {
+    ) -> Result<Vec<RenewalCandidate>> {
         self.run(move |conn| {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {RECORD_COLUMNS} FROM tunnels
+            let mut stmt = conn.prepare(
+                "SELECT id, state, last_connected_at, cert_expiry, csr_pem FROM tunnels
                  WHERE deleted_at IS NULL
                    AND cert_state = 'ready'
                    AND csr_pem IS NOT NULL
                    AND cert_expiry IS NOT NULL
                    AND (renewal_id IS NULL OR renewal_started_at IS NULL OR renewal_started_at <= ?1)
-                   AND (renewal_next_at IS NULL OR renewal_next_at <= ?2)"
-            ))?;
-            let rows = stmt.query_map(params![now_ms - lease_ms, now_ms], row_to_record)?;
+                   AND (renewal_next_at IS NULL OR renewal_next_at <= ?2)",
+            )?;
+            let rows = stmt.query_map(params![now_ms - lease_ms, now_ms], |row| {
+                Ok(RenewalCandidate {
+                    id: row.get(0)?,
+                    state: row.get(1)?,
+                    last_connected_at: row.get(2)?,
+                    cert_expiry: row.get(3)?,
+                    csr_pem: row.get(4)?,
+                })
+            })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
@@ -531,6 +552,29 @@ impl Db {
                 "DELETE FROM issuances WHERE created_at < ?1",
                 params![before_ms],
             )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Hard-deletes tunnel rows that were soft-deleted before `deleted_before`
+    /// (RFC 3339, lexicographic compare). Returns rows removed.
+    pub async fn purge_deleted_tunnels(&self, deleted_before: &str) -> Result<u64> {
+        let deleted_before = deleted_before.to_owned();
+        self.run(move |conn| {
+            let rows = conn.execute(
+                "DELETE FROM tunnels WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
+                params![deleted_before],
+            )?;
+            Ok(u64::try_from(rows).unwrap_or(0))
+        })
+        .await
+    }
+
+    /// Reclaims file space after large deletes. Must not run inside a transaction.
+    pub async fn vacuum(&self) -> Result<()> {
+        self.run(move |conn| {
+            conn.execute_batch("VACUUM;")?;
             Ok(())
         })
         .await
@@ -870,6 +914,23 @@ mod tests {
         let record = db.get_tunnel("t1").await.unwrap().unwrap();
         assert_eq!(record.cert_pem.as_deref(), Some("NEW"));
         assert_eq!(record.cert_expiry.as_deref(), Some("2100-01-01T00:00:00Z"));
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn purge_deleted_tunnels_removes_old_tombstones() {
+        let (db, path) = open_with_tunnel("purge", "t1").await;
+        db.delete_tunnel("t1", "2020-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        assert!(db.get_tunnel("t1").await.unwrap().unwrap().deleted_at.is_some());
+        let purged = db
+            .purge_deleted_tunnels("2021-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        assert_eq!(purged, 1);
+        assert!(db.get_tunnel("t1").await.unwrap().is_none());
         drop(db);
         cleanup(&path);
     }

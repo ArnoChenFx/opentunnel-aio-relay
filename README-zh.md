@@ -93,14 +93,18 @@ opentunnel route add 3000
 | `OT_ACME_URL` | `https://acme-v02.api.letsencrypt.org/directory`（Let's Encrypt 生产） | ACME 目录。测试用 staging，见[ACME 地址和联系邮箱](#acme-地址和联系邮箱) |
 | `OT_ACME_EMAIL` | —（空，注册时不带联系方式） | ACME 账号联系邮箱，用于证书到期提醒，建议设成能收信的地址。见[ACME 地址和联系邮箱](#acme-地址和联系邮箱) |
 | `OT_DNS_PROPAGATION_SECS` | `120` | 一个订单里，等新的 TXT 记录在公共 DoH 解析器（Cloudflare、Google、阿里 DNS）上可见的总时长（秒），之后才让 CA 验证。等不到只记 warning 日志，订单继续。`0` 表示不等待 |
-| `OT_MAX_CONNECTIONS` | `1024` | 监听器上同时打开的连接数（API、bridge、访客 socket 都算）。超出的在 accept 时直接拒绝。`0` 表示不限制 |
+| `OT_MAX_CONNECTIONS` | `1024` | 监听器上同时打开的连接数（API、bridge、访客 socket 都算）。超出的在 accept 时直接拒绝。`0` 表示**不限制（非安全默认）** |
 | `OT_RESERVED_CONNECTIONS` | `64` | 在 `OT_MAX_CONNECTIONS` 里给访客 socket 禁止占用的预留位，保证访客满了 API 和 bridge 还能连进来。必须小于 `OT_MAX_CONNECTIONS`（除非后者为 `0`） |
 | `OT_MAX_CONNECTIONS_PER_IP` | `64` | 单个源地址同时可保持的 socket 数。IPv6 按 /64 统计。超出的在 accept 时拒绝。`0` 表示不限制 |
-| `OT_STREAM_BUFFER_BYTES` | `2097152`（2 MiB） | 为还没读数据的访客暂存的数据量。落后超过这个量的访客会被以 `backpressure` 重置。最小 `65536` |
+| `OT_STREAM_BUFFER_BYTES` | `524288`（512 KiB） | 为还没读数据的访客暂存的数据量。落后超过这个量的访客会被以 `backpressure` 重置。最小 `65536` |
 | `OT_STREAM_IDLE_SECS` | `3600`（1 小时） | 转发连接双向无字节多少秒后关闭，并以 `connection_terminated` 通知 bridge。`0` 关闭该限制；长时间静默的 SSH/WebSocket 会话可以调大 |
-| `OT_MAX_TUNNELS` | `1000` | 存活隧道数（未删除的）。超限创建返回 `503`。`0` 表示不限制 |
+| `OT_STREAM_MAX_SECS` | `86400`（24 小时） | 单条访客转发连接的最长存活时间（即使有字节或心跳）。`0` 关闭 |
+| `OT_SESSION_CACHE_IDLE_SECS` | `86400`（24 小时） | bridge 全部断开后，离线隧道在内存 Session 缓存里最多保留多久。`0` 关闭淘汰 |
+| `OT_TUNNEL_TOMBSTONE_DAYS` | `30` | 软删除隧道多少天后从 SQLite 硬删（每小时任务）。`0` 表示永久保留墓碑 |
+| `OT_ACME_CONCURRENCY` | `3` | 同时进行的 ACME 订单（签发与续签）上限。`0` 表示不限 |
+| `OT_MAX_TUNNELS` | `1000` | 存活隧道数（未删除的）。超限创建返回 `503`。`0` 表示**不限制（非安全默认）** |
 | `OT_MAX_CERTS_PER_DAY` | `7` | 所有隧道 24 小时滚动窗口内的新证书订单数。续签永远不受限。`0` 表示不限制 |
-| `OT_RATE_LIMIT_PER_HOUR` | `30` | 单个源地址每小时可调用隧道创建和证书绑定的次数。IPv6 按 /64 统计。`0` 表示不限制 |
+| `OT_RATE_LIMIT_PER_HOUR` | `30` | 单个源地址每小时可调用隧道创建和证书绑定的次数。IPv6 按 /64 统计。`0` 表示**关闭限流（非安全默认）** |
 | `OT_CREATE_ALLOW_CIDRS` | —（空：允许所有来源） | 允许创建隧道和绑定证书的 IPv4/IPv6 地址或 CIDR 段，逗号分隔 |
 
 不可配置的固定限制：ClientHello 和 TLS 握手必须在 10 秒内完成，每个请求的 header 必须在 10 秒内到达。访客 ClientHello 发出后 15 秒内 bridge 还没发来第一个字节，该转发连接会被以 `connection_terminated` 重置；第一个字节到达后这个检查停止，静默流改由 `OT_STREAM_IDLE_SECS` 管。访客 10 秒内一个字节都不读、且有中转数据在等它，会被单独重置并标记 `backpressure`。除 bridge 的 WebSocket 升级外，每个 API 响应都带 `Connection: close`。单个 ACME 订单最多跑 10 分钟。ACME 和 DNS API（Cloudflare、阿里云）的调用 10 秒建连超时、30 秒总超时。
@@ -130,7 +134,7 @@ export OT_DATA_DIR=./data-staging
 
 每个转发连接有自己独立的 buffer，暂存访客还没读走的数据。bridge 的读循环从不等访客，所以一个停读的访客拖不慢其他连接，也拖不慢 bridge 的心跳。buffer 溢出的连接会被立即以 `backpressure` 重置，同时通知客户端。
 
-协议本身没有按流的流量控制，所以中转没法只暂停一条连接而不影响其他。访客读得比 bridge 发得慢、且慢过 buffer 能撑的时间，就会被重置。给慢客户端做大文件传输可以调大 `OT_STREAM_BUFFER_BYTES`。最坏情况的 buffer 内存是 `OT_MAX_CONNECTIONS` 乘以 `OT_STREAM_BUFFER_BYTES`，默认值下是 2 GiB——按主机的内存把这两个一起配好。
+协议本身没有按流的流量控制，所以中转没法只暂停一条连接而不影响其他。访客读得比 bridge 发得慢、且慢过 buffer 能撑的时间，就会被重置。给慢客户端做大文件传输可以调大 `OT_STREAM_BUFFER_BYTES`。最坏情况的 stream buffer 约为（访客连接名额）乘以 `OT_STREAM_BUFFER_BYTES`（默认约 960 个访客位 × 512 KiB ≈ 480 MiB）。每条 bridge 的出站队列深度也与 `OT_STREAM_BUFFER_BYTES` 成比例（最多 128 帧）。按主机内存把 buffer 和连接上限一起配好。Bridge/访客方向的 WebSocket 与 TCP 发送共用 10 秒 stall 超时，对端卡住时不会绕过 bridge 的 45 秒 idle，也不会长期占住 route。
 
 ### 连接数限制
 

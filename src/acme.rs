@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use crate::bridge::random_session_id;
 use crate::config::Config;
-use crate::db::{renewal_backoff_ms, CertState, Db, TunnelRecord, ISSUANCE_WINDOW_MS};
+use crate::db::{renewal_backoff_ms, CertState, Db, ISSUANCE_WINDOW_MS};
 use crate::dns::{DnsProvider, PropagationCheck};
 use crate::state::{now_millis, AppState};
 
@@ -734,7 +734,9 @@ fn identifiers_from_csr(csr_pem: &str) -> Result<Vec<String>> {
 }
 
 pub fn spawn_issuance(state: Arc<AppState>, tunnel_id: String, cert_id: String) {
+    let jobs = state.acme_jobs.clone();
     tokio::spawn(async move {
+        let _permit = jobs.acquire().await;
         match issue_for_tunnel(&state, &tunnel_id, &cert_id).await {
             Ok(()) => tracing::info!(tunnel = %tunnel_id, cert = %cert_id, "certificate ready"),
             Err(e) => {
@@ -852,7 +854,7 @@ async fn scan_for_renewals(state: &Arc<AppState>) -> Result<()> {
                 .as_deref()
                 .and_then(rfc3339_secs)
                 .is_some_and(|connected| now_secs - connected < ACTIVE_WINDOW_SECS);
-        if active && expires_within(&record, now_secs, RENEW_BEFORE_SECS) {
+        if active && expires_within(record.cert_expiry.as_deref(), now_secs, RENEW_BEFORE_SECS) {
             if let Some(csr_pem) = record.csr_pem.as_deref() {
                 start_renewal(state, &record.id, csr_pem).await;
             }
@@ -862,6 +864,24 @@ async fn scan_for_renewals(state: &Arc<AppState>) -> Result<()> {
         .db
         .prune_issuances(now_ms - ISSUANCE_WINDOW_MS)
         .await?;
+    if state.config.tunnel_tombstone_days > 0 {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(i64::try_from(state.config.tunnel_tombstone_days).unwrap_or(i64::MAX));
+        let cutoff = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        match state.db.purge_deleted_tunnels(&cutoff).await {
+            Ok(purged) if purged >= 64 => {
+                tracing::info!(purged, "removed expired tunnel tombstones from the database");
+                if let Err(e) = state.db.vacuum().await {
+                    tracing::warn!(error = %e, "VACUUM after tombstone purge failed");
+                }
+            }
+            Ok(purged) if purged > 0 => {
+                tracing::debug!(purged, "removed expired tunnel tombstones from the database");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "tombstone purge failed"),
+        }
+    }
     Ok(())
 }
 
@@ -882,12 +902,14 @@ async fn start_renewal(state: &Arc<AppState>, tunnel_id: &str, csr_pem: &str) ->
     {
         Ok(true) => {
             tracing::info!(tunnel = %tunnel_id, "starting certificate renewal");
-            tokio::spawn(renew_for_tunnel(
-                state.clone(),
-                tunnel_id.to_string(),
-                renewal_id,
-                csr_pem.to_string(),
-            ));
+            let jobs = state.acme_jobs.clone();
+            let state = state.clone();
+            let tunnel_id = tunnel_id.to_string();
+            let csr_pem = csr_pem.to_string();
+            tokio::spawn(async move {
+                let _permit = jobs.acquire().await;
+                renew_for_tunnel(state, tunnel_id, renewal_id, csr_pem).await;
+            });
             true
         }
         Ok(false) => false,
@@ -979,10 +1001,8 @@ fn rfc3339_secs(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-fn expires_within(record: &TunnelRecord, now_secs: i64, window_secs: i64) -> bool {
-    record
-        .cert_expiry
-        .as_deref()
+fn expires_within(cert_expiry: Option<&str>, now_secs: i64, window_secs: i64) -> bool {
+    cert_expiry
         .and_then(rfc3339_secs)
         .is_some_and(|expiry| expiry - now_secs <= window_secs)
 }
@@ -1183,7 +1203,7 @@ pub async fn maybe_renew_on_attach(state: Arc<AppState>, tunnel_id: &str) {
         Ok(Some(r)) if r.deleted_at.is_none() && r.cert_state == CertState::Ready => r,
         _ => return,
     };
-    if !expires_within(&record, now_millis() / 1000, RENEW_BEFORE_SECS) {
+    if !expires_within(record.cert_expiry.as_deref(), now_millis() / 1000, RENEW_BEFORE_SECS) {
         return;
     }
     if let Some(csr_pem) = record.csr_pem.as_deref() {
@@ -1675,6 +1695,7 @@ mod tests {
             )),
             http: Client::new(),
             limiter: crate::guard::RateLimiter::new(0),
+            acme_jobs: Arc::new(tokio::sync::Semaphore::new(4)),
         });
 
         assert_eq!(resume_interrupted_issuances(&state).await.unwrap(), 1);

@@ -16,6 +16,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 use clap::Parser;
 use opentunnel_relay::{
     acme, api, bridge::SessionManager, config::Config, db::Db, guard::RateLimiter, ingress,
@@ -63,6 +65,11 @@ async fn main() -> anyhow::Result<()> {
         acme::ensure_api_cert(&config, &db, &http).await?,
     ));
 
+    let acme_jobs = Arc::new(if config.acme_concurrency == 0 {
+        Semaphore::new(Semaphore::MAX_PERMITS)
+    } else {
+        Semaphore::new(config.acme_concurrency)
+    });
     let state = Arc::new(AppState {
         config: config.clone(),
         db,
@@ -70,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         api_tls,
         http,
         limiter: RateLimiter::new(config.rate_limit_per_hour),
+        acme_jobs,
     });
     let router = api::router(state.clone());
 
@@ -84,6 +92,19 @@ async fn main() -> anyhow::Result<()> {
     // Background certificate renewals.
     tokio::spawn(acme::renewal_loop(state.clone()));
     tokio::spawn(acme::api_certificate_renewal_loop(state.clone()));
+    if !config.session_cache_idle.is_zero() {
+        let cache_state = state.clone();
+        let idle = config.session_cache_idle;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                let evicted = cache_state.sessions.evict_idle(idle).await;
+                if evicted > 0 {
+                    tracing::debug!(evicted, "evicted idle tunnel sessions from memory");
+                }
+            }
+        });
+    }
 
     tracing::info!(
         domain = %config.domain,

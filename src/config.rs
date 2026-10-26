@@ -130,7 +130,7 @@ pub struct Config {
     /// that falls further behind is reset with `backpressure`; other connections
     /// are unaffected. Worst-case memory is this value times the number of open
     /// connections, so size it with OT_MAX_CONNECTIONS.
-    #[arg(long, env = "OT_STREAM_BUFFER_BYTES", default_value_t = 2 * 1024 * 1024)]
+    #[arg(long, env = "OT_STREAM_BUFFER_BYTES", default_value_t = 512 * 1024)]
     pub stream_buffer_bytes: usize,
 
     /// Seconds a forwarded connection may go without bytes in either direction
@@ -143,6 +143,36 @@ pub struct Config {
         value_parser = parse_seconds
     )]
     pub stream_idle: Duration,
+
+    /// Maximum lifetime of one proxied visitor connection, even when bytes or
+    /// pings keep moving. 0 disables the limit.
+    #[arg(
+        long = "stream-max-secs",
+        env = "OT_STREAM_MAX_SECS",
+        default_value = "86400",
+        value_parser = parse_seconds
+    )]
+    pub stream_max_lifetime: Duration,
+
+    /// How long an offline tunnel may stay in the in-memory session cache after
+    /// its last bridge detaches. 0 disables eviction.
+    #[arg(
+        long = "session-cache-idle-secs",
+        env = "OT_SESSION_CACHE_IDLE_SECS",
+        default_value = "86400",
+        value_parser = parse_seconds
+    )]
+    pub session_cache_idle: Duration,
+
+    /// Deleted tunnels are hard-removed from SQLite after this many days.
+    /// 0 disables purge (rows stay as tombstones forever).
+    #[arg(long, env = "OT_TUNNEL_TOMBSTONE_DAYS", default_value_t = 30)]
+    pub tunnel_tombstone_days: u64,
+
+    /// Maximum ACME orders (initial issuance and renewal) running at once.
+    /// 0 means no limit.
+    #[arg(long, env = "OT_ACME_CONCURRENCY", default_value_t = 3)]
+    pub acme_concurrency: usize,
 
     /// Source addresses allowed to create tunnels and order certificates, as
     /// comma-separated IPv4 or IPv6 addresses or CIDR ranges. Empty allows any
@@ -207,6 +237,21 @@ impl Config {
                 "OT_DOMAIN ({}) is not inside OT_ALIYUN_DOMAIN ({})",
                 self.domain,
                 self.aliyun_domain
+            );
+        }
+        if self.max_connections == 0 {
+            tracing::warn!(
+                "OT_MAX_CONNECTIONS=0 disables the global connection cap (not a safe default)"
+            );
+        }
+        if self.max_tunnels == 0 {
+            tracing::warn!(
+                "OT_MAX_TUNNELS=0 disables the live-tunnel cap (not a safe default)"
+            );
+        }
+        if self.rate_limit_per_hour == 0 {
+            tracing::warn!(
+                "OT_RATE_LIMIT_PER_HOUR=0 disables provisioning rate limiting (not a safe default)"
             );
         }
         Ok(())
