@@ -6,22 +6,38 @@
   <title>OpenTunnel Client</title>
   <style>
     :root {
-      color-scheme: light dark;
-      --bg: #0f1419;
-      --panel: #1a2332;
-      --text: #e7ecf3;
-      --muted: #8b9bb4;
-      --accent: #3d8bfd;
-      --danger: #f07178;
-      --ok: #7fd962;
-      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      color-scheme: dark light;
+      --bg: #121212;
+      --panel: #1c1c1c;
+      --panel-border: #2e2e2e;
+      --text: #e8e8e8;
+      --muted: #9a9a9a;
+      --link: #d6d6d6;
+      --btn-primary-bg: #e8e8e8;
+      --btn-primary-fg: #141414;
+      --danger-fg: #e8a0a0;
+      --danger-border: #6b4040;
+      --ok-fg: #a8c8a0;
+      --ok-bg: #252825;
+      --err-bg: #282424;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 13px;
     }
     @media (prefers-color-scheme: light) {
       :root {
-        --bg: #f4f6fa;
-        --panel: #fff;
-        --text: #1a2332;
-        --muted: #5c6b80;
+        --bg: #f0f0f0;
+        --panel: #fafafa;
+        --panel-border: #ddd;
+        --text: #1a1a1a;
+        --muted: #666;
+        --link: #333;
+        --btn-primary-bg: #262626;
+        --btn-primary-fg: #fafafa;
+        --danger-fg: #9a3030;
+        --danger-border: #d4a0a0;
+        --ok-fg: #2d5a2d;
+        --ok-bg: #eef4ee;
+        --err-bg: #faf0f0;
       }
     }
     * { box-sizing: border-box; }
@@ -29,49 +45,94 @@
       margin: 0;
       background: var(--bg);
       color: var(--text);
-      line-height: 1.5;
+      line-height: 1.35;
     }
-    main { max-width: 960px; margin: 0 auto; padding: 1.5rem; }
-    h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
-    .sub { color: var(--muted); margin-bottom: 1.5rem; }
+    main { max-width: 880px; margin: 0 auto; padding: 0.75rem 1rem 1rem; }
+    h1 { font-size: 1.125rem; font-weight: 600; margin: 0 0 0.15rem; letter-spacing: -0.01em; }
+    .sub { color: var(--muted); margin: 0 0 0.65rem; font-size: 0.923em; }
     section {
       background: var(--panel);
-      border-radius: 12px;
-      padding: 1rem 1.25rem;
-      margin-bottom: 1rem;
-      box-shadow: 0 1px 3px rgba(0,0,0,.15);
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 0.55rem 0.7rem;
+      margin-bottom: 0.55rem;
     }
-    h2 { font-size: 1rem; margin: 0 0 0.75rem; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
-    th, td { text-align: left; padding: 0.5rem 0.35rem; border-bottom: 1px solid rgba(127,127,127,.2); }
-    th { color: var(--muted); font-weight: 600; }
-    a { color: var(--accent); }
-    form { display: grid; gap: 0.75rem; }
-    label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+    h2 {
+      font-size: 0.769em;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin: 0 0 0.4rem;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: inherit; }
+    th, td {
+      text-align: left;
+      padding: 0.3rem 0.25rem;
+      border-bottom: 1px solid var(--panel-border);
+      vertical-align: middle;
+    }
+    th { color: var(--muted); font-weight: 500; font-size: 0.846em; }
+    tr:last-child td { border-bottom: none; }
+    a { color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
+    a:hover { color: var(--text); }
+    form { display: grid; gap: 0.45rem; }
+    label { display: grid; gap: 0.15rem; font-size: 0.846em; color: var(--muted); }
     input, select, button {
       font: inherit;
-      padding: 0.5rem 0.65rem;
-      border-radius: 8px;
-      border: 1px solid rgba(127,127,127,.35);
-      background: transparent;
+      padding: 0.3rem 0.45rem;
+      border-radius: 4px;
+      border: 1px solid var(--panel-border);
+      background: var(--bg);
       color: inherit;
+    }
+    input:focus, select:focus {
+      outline: 1px solid var(--muted);
+      outline-offset: 0;
     }
     button {
       cursor: pointer;
-      background: var(--accent);
-      border: none;
-      color: #fff;
-      font-weight: 600;
+      background: var(--btn-primary-bg);
+      border: 1px solid transparent;
+      color: var(--btn-primary-fg);
+      font-weight: 500;
     }
-    button.secondary { background: transparent; border: 1px solid rgba(127,127,127,.4); color: inherit; }
-    button.danger { background: var(--danger); }
-    .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
-    .row > * { flex: 1 1 140px; }
-    .status-line { font-family: ui-monospace, monospace; font-size: 0.85rem; white-space: pre-wrap; }
-    .flash { padding: 0.65rem 0.75rem; border-radius: 8px; margin-bottom: 1rem; display: none; }
-    .flash.ok { display: block; background: rgba(127,217,98,.15); color: var(--ok); }
-    .flash.err { display: block; background: rgba(240,113,120,.15); color: var(--danger); }
-    #token-row { margin-bottom: 1rem; }
+    button:hover { filter: brightness(0.95); }
+    button.secondary {
+      background: transparent;
+      border-color: var(--panel-border);
+      color: inherit;
+    }
+    button.danger {
+      background: transparent;
+      border-color: var(--danger-border);
+      color: var(--danger-fg);
+    }
+    td .actions { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+    td button { padding: 0.15rem 0.35rem; font-size: 0.846em; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: end; }
+    .row > * { flex: 1 1 120px; }
+    .row-actions { flex: 0 0 auto; }
+    .row-actions button { min-width: 4.5rem; }
+    .status-line {
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-size: 0.846em;
+      white-space: pre-wrap;
+      margin: 0;
+    }
+    .status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+    .flash {
+      padding: 0.4rem 0.55rem;
+      border-radius: 4px;
+      margin-bottom: 0.55rem;
+      display: none;
+      font-size: 0.923em;
+      border: 1px solid var(--panel-border);
+    }
+    .flash.ok { display: block; background: var(--ok-bg); color: var(--ok-fg); }
+    .flash.err { display: block; background: var(--err-bg); color: var(--danger-fg); }
+    code { font-size: 0.923em; }
+    section .sub { margin-bottom: 0.45rem; }
   </style>
 </head>
 <body>
@@ -83,19 +144,21 @@
 
     <section id="token-row">
       <h2>访问令牌</h2>
-      <p class="sub" style="margin:0 0 .75rem">若容器设置了 <code>OT_CLIENT_ADMIN_TOKEN</code>，在此填写后保存到浏览器。</p>
+      <p class="sub">若容器设置了 <code>OT_CLIENT_ADMIN_TOKEN</code>，在此填写后保存到浏览器。</p>
       <div class="row">
         <label style="flex:2">Admin token
           <input id="admin-token" type="password" placeholder="Bearer token（可选）" autocomplete="off" />
         </label>
-        <button type="button" class="secondary" id="save-token">保存</button>
+        <div class="row-actions"><button type="button" class="secondary" id="save-token">保存</button></div>
       </div>
     </section>
 
     <section>
       <h2>隧道状态</h2>
-      <div id="status" class="status-line">加载中…</div>
-      <p><button type="button" class="secondary" id="refresh">刷新</button></p>
+      <div class="status-bar">
+        <div id="status" class="status-line">加载中…</div>
+        <button type="button" class="secondary" id="refresh">刷新</button>
+      </div>
     </section>
 
     <section>
@@ -128,8 +191,8 @@
           </label>
         </div>
         <div class="row">
-          <button type="submit" id="submit-btn">添加</button>
-          <button type="button" class="secondary" id="cancel-edit" hidden>取消编辑</button>
+          <div class="row-actions"><button type="submit" id="submit-btn">添加</button></div>
+          <div class="row-actions"><button type="button" class="secondary" id="cancel-edit" hidden>取消编辑</button></div>
         </div>
       </form>
     </section>
@@ -186,10 +249,10 @@
           <td><code>${escapeHtml(r.name)}</code></td>
           <td><code>${escapeHtml(r.target)}</code></td>
           <td>${url}</td>
-          <td>
+          <td><div class="actions">
             <button type="button" class="secondary edit" data-name="${escapeAttr(r.name)}" data-target="${escapeAttr(r.target)}">编辑</button>
             <button type="button" class="danger del" data-name="${escapeAttr(r.name)}">删除</button>
-          </td>`;
+          </div></td>`;
         tbody.appendChild(tr);
       }
       tbody.querySelectorAll(".edit").forEach(btn => btn.addEventListener("click", () => startEdit(btn.dataset.name, btn.dataset.target)));
