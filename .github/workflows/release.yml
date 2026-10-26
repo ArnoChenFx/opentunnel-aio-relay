@@ -114,18 +114,11 @@ jobs:
     steps:
       # NOTE: checkout first! actions/checkout runs `git clean -ffdx` by
       # default, which would wipe the downloaded artifacts below.
-      # Keep the floating `latest` tag on the commit that produced it.
-      # Credentials persist on purpose: the `git push` in "Move latest tag"
-      # needs them.
+      # Credentials persist so the post-publication step can move `latest`.
       - uses: actions/checkout@v5
-        if: github.ref_type != 'tag'
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Move latest tag
-        if: github.ref_type != 'tag'
-        run: |
-          git tag -f latest ${{ github.sha }}
-          git push -f origin latest
 
       - uses: actions/download-artifact@v8
         with:
@@ -152,12 +145,21 @@ jobs:
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
           name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          target_commitish: ${{ github.sha }}
           prerelease: ${{ github.ref_type != 'tag' || steps.release-class.outputs.prerelease == 'true' }}
           generate_release_notes: ${{ github.ref_type == 'tag' }}
           make_latest: ${{ github.ref_type == 'tag' && steps.release-class.outputs.prerelease != 'true' && 'true' || 'false' }}
           files: |
             dist/*.tar.gz
             dist/sha256sums.txt
+
+      # Keep branch snapshots working, and also point `latest` at a stable
+      # version after it has actually published. Prereleases never move it.
+      - name: Move latest tag after successful publication
+        if: github.ref_type != 'tag' || steps.release-class.outputs.prerelease == 'false'
+        run: |
+          git tag -f latest HEAD
+          git push origin +refs/tags/latest:refs/tags/latest
 
   integration:
     name: Integration (official client E2E)
