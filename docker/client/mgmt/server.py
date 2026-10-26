@@ -20,6 +20,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_FILES: dict[str, str] = {
     "favicon-16x16.png": "image/png",
     "favicon-32x32.png": "image/png",
+    "brand-icon.png": "image/png",
     "apple-touch-icon.png": "image/png",
 }
 
