@@ -1,0 +1,26 @@
+services:
+  opentunnel-client:
+    build:
+      context: ../..
+      dockerfile: docker/client/Dockerfile
+      args:
+        OPENTUNNEL_VERSION: "0.6.1"
+    image: opentunnel-client:local
+    restart: unless-stopped
+    environment:
+      OPENTUNNEL_API: https://tunnel.example.com
+      OPENTUNNEL_PROFILE: default
+      # 访问宿主机上的服务（Linux 需 host-gateway）
+      # route 目标示例: host.docker.internal:3000
+      OT_CLIENT_ADMIN_PORT: "9080"
+      # OT_CLIENT_ADMIN_TOKEN: change-me
+      # OPENTUNNEL_CA_CERT: /data/ca.pem
+    ports:
+      - "9080:9080"
+    volumes:
+      - opentunnel-client-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  opentunnel-client-data:
