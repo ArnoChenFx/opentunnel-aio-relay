@@ -175,7 +175,6 @@
     <div class="page-head">
       <div>
         <h1>OpenTunnel Client</h1>
-        <p class="sub" data-i18n="subtitle"></p>
       </div>
       <div class="lang-switch" role="group" aria-label="Language">
         <button type="button" class="lang-btn secondary" data-lang="zh" id="lang-zh">中文</button>
@@ -408,7 +407,7 @@
 
     function renderStatus(data) {
       cacheStatus = data;
-      const text = (data.raw || "").trim();
+      const text = (data.summary || data.raw || "").trim();
       document.getElementById("status").textContent = text || t("noStatus");
     }
 
@@ -470,11 +469,7 @@
         const { data: st } = await api("/api/status");
         renderStatus(st);
         const { data: rt } = await api("/api/routes");
-        let routes = rt.routes || [];
-        if (!routes.length && cacheStatus && cacheStatus.routes && cacheStatus.routes.length) {
-          routes = cacheStatus.routes;
-        }
-        renderRoutes(routes);
+        renderRoutes(rt.routes || []);
       } catch (e) {
         flash(e.message || String(e), false);
       }

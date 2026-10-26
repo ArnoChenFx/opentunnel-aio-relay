@@ -21,6 +21,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 ROUTE_LINE = re.compile(
     r"^(?P<name>@|[a-z0-9-]+)\s+[→\->]+\s+(?P<target>.+?)\s*$"
 )
+STATUS_MAP_LINE = re.compile(r"^(?P<host>\S+)\s*->\s*(?P<target>.+?)\s*$")
 URL_RE = re.compile(r"https://[^\s]+")
 
 
@@ -76,6 +77,27 @@ def collect_status() -> tuple[str, list[str], int]:
     return "\n\n".join(parts).strip(), profiles, exit_code
 
 
+def is_status_route_line(line: str) -> bool:
+    return STATUS_MAP_LINE.match(line.strip()) is not None
+
+
+def route_name_from_host(host: str, tunnel_hostname: str | None) -> str:
+    host = host.strip().lower()
+    for prefix in ("https://", "http://"):
+        if host.startswith(prefix):
+            host = host[len(prefix) :]
+    if not tunnel_hostname:
+        return host.split(".")[0] if host else "@"
+    th = tunnel_hostname.strip().lower()
+    if host == th:
+        return "@"
+    suffix = "." + th
+    if host.endswith(suffix):
+        prefix = host[: -len(suffix)]
+        return prefix if prefix else "@"
+    return host.split(".")[0]
+
+
 def parse_routes(text: str) -> list[dict[str, str]]:
     routes: list[dict[str, str]] = []
     for line in text.splitlines():
@@ -88,15 +110,51 @@ def parse_routes(text: str) -> list[dict[str, str]]:
     return routes
 
 
+def parse_status_map_routes(text: str, tunnel_hostname: str | None) -> list[dict[str, str]]:
+    routes: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        m = STATUS_MAP_LINE.match(line.strip())
+        if not m:
+            continue
+        host = m.group("host")
+        target = m.group("target").strip()
+        name = route_name_from_host(host, tunnel_hostname)
+        if name in seen:
+            continue
+        seen.add(name)
+        routes.append({"name": name, "target": target})
+    return routes
+
+
+def merge_routes(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
+    by_name: dict[str, dict[str, str]] = {}
+    for group in groups:
+        for route in group:
+            by_name[route["name"]] = route
+    return [by_name[k] for k in sorted(by_name.keys(), key=lambda n: (n != "@", n))]
+
+
+def status_summary(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or is_status_route_line(stripped):
+            continue
+        lines.append(line.rstrip())
+    return "\n".join(lines).strip()
+
+
 def parse_status(text: str) -> dict[str, Any]:
     info: dict[str, Any] = {
         "raw": text,
+        "summary": "",
         "profile": None,
         "tunnel_id": None,
         "hostname": None,
         "connected": None,
         "service": None,
-        "routes": parse_routes(text),
+        "routes": [],
     }
     for line in text.splitlines():
         line = line.strip()
@@ -113,9 +171,25 @@ def parse_status(text: str) -> dict[str, Any]:
                 info["bridge_url"] = m.group(0)
         elif line.startswith("Service:"):
             info["service"] = line.split(":", 1)[1].strip()
-    if not info["routes"]:
-        info["routes"] = parse_routes(text)
+    info["routes"] = merge_routes(
+        parse_routes(text),
+        parse_status_map_routes(text, info.get("hostname")),
+    )
+    info["summary"] = status_summary(text)
     return info
+
+
+def routes_for_profile() -> tuple[list[dict[str, str]], int, str]:
+    profile = active_profile()
+    status_raw = status_text(profile)
+    status = parse_status(status_raw)
+    proc = run_opentunnel("route", "list", "--profile", profile)
+    list_text = (proc.stdout or "") + (proc.stderr or "")
+    routes = merge_routes(parse_routes(list_text), status.get("routes", []))
+    hostname = status.get("hostname")
+    for route in routes:
+        route["url"] = public_url(hostname, route["name"])
+    return routes, proc.returncode, list_text.strip()
 
 
 def public_url(hostname: str | None, route_name: str) -> str | None:
@@ -179,11 +253,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             if not self._require_auth():
                 return
-            raw, profiles, _exit = collect_status()
-            body = parse_status(raw)
-            body["raw"] = raw
+            _raw, profiles, _exit = collect_status()
+            profile = active_profile()
+            active_raw = status_text(profile)
+            body = parse_status(active_raw)
+            if len(profiles) > 1:
+                chunks = [
+                    f"=== profile: {p} ===\n{status_summary(status_text(p))}" for p in profiles
+                ]
+                body["summary"] = "\n\n".join(chunks)
+            else:
+                body["summary"] = status_summary(active_raw)
             body["profiles"] = profiles
-            body["active_profile"] = active_profile()
+            body["active_profile"] = profile
             for route in body.get("routes", []):
                 route["url"] = public_url(body.get("hostname"), route["name"])
             json_response(self, 200, body)
@@ -191,18 +273,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/routes":
             if not self._require_auth():
                 return
-            proc = run_opentunnel("route", "list")
-            text = (proc.stdout or "") + (proc.stderr or "")
-            status = parse_status(status_text(active_profile()))
-            routes = parse_routes(text)
-            if not routes:
-                routes = status.get("routes", [])
-            for route in routes:
-                route["url"] = public_url(status.get("hostname"), route["name"])
+            routes, exit_code, list_raw = routes_for_profile()
             json_response(
                 self,
                 200,
-                {"routes": routes, "exit_code": proc.returncode, "raw": text.strip()},
+                {"routes": routes, "exit_code": exit_code, "raw": list_raw},
             )
             return
         json_response(self, 404, {"error": "not found"})
