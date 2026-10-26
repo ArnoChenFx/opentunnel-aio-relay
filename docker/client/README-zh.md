@@ -37,10 +37,17 @@ docker run --rm \
 
 浏览器打开 `http://localhost:9080`。
 
-或使用 Compose（先改 `docker-compose.yml` 里的 `OPENTUNNEL_API`）：
+**新建安装**可用 Compose（仅 **`/data` 卷**，不会读你以前的 `opentunnel-data` 目录）：
 
 ```bash
 docker compose -f docker/client/docker-compose.yml up -d --build
+```
+
+**从旧的三目录 Docker 迁移**请用 [`docker-compose.legacy.yml`](docker-compose.legacy.yml)（不要和上面混用）：
+
+```bash
+# 在放 opentunnel-data / opentunnel-config 的目录下
+docker compose -f docker-compose.legacy.yml up -d
 ```
 
 ## 环境变量
@@ -55,6 +62,8 @@ docker compose -f docker/client/docker-compose.yml up -d --build
 | `XDG_*` / `/data` | 见 Dockerfile | 隧道密钥、route 配置等持久化在 `/data` 卷 |
 
 ## 从旧版「只跑 serve」的 Docker 迁移
+
+常见误会：只加了 `XDG_CONFIG_HOME` 等环境变量，但 **volumes 仍用 `/data` 或命名卷** —— 宿主机上的 `opentunnel-data` 并没有挂进容器，客户端会在容器内空的 `/root/.local/share` 里跑，**管理页看不到旧 tunnel**。环境变量和 **三条 bind mount 必须同时** 与 [`docker-compose.legacy.yml`](docker-compose.legacy.yml) 一致。
 
 若以前把数据挂到 `/root/.config/opentunnel`、`/root/.local/share/opentunnel` 等路径，**必须**让进程读到同一位置，二选一：
 
