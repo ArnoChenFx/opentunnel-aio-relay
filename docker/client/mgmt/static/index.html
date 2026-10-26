@@ -21,7 +21,7 @@
       --ok-bg: #252825;
       --err-bg: #282424;
       font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      font-size: 13px;
+      font-size: 15px;
     }
     @media (prefers-color-scheme: light) {
       :root {
@@ -45,9 +45,9 @@
       margin: 0;
       background: var(--bg);
       color: var(--text);
-      line-height: 1.35;
+      line-height: 1.5;
     }
-    main { max-width: 880px; margin: 0 auto; padding: 0.75rem 1rem 1rem; }
+    main { max-width: 920px; margin: 0 auto; padding: 1.25rem 1.5rem 1.5rem; }
     .page-head {
       display: flex;
       flex-wrap: wrap;
@@ -58,8 +58,8 @@
       padding-bottom: 0.15rem;
     }
     .page-head .sub { margin-bottom: 0; }
-    h1 { font-size: 1.125rem; font-weight: 600; margin: 0 0 0.15rem; letter-spacing: -0.01em; }
-    .sub { color: var(--muted); margin: 0 0 0.65rem; font-size: 0.923em; }
+    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 0.35rem; letter-spacing: -0.01em; }
+    .sub { color: var(--muted); margin: 0 0 0.75rem; font-size: 0.95em; }
     .lang-switch {
       display: inline-flex;
       border: 1px solid var(--panel-border);
@@ -70,12 +70,12 @@
     .lang-switch button {
       border: none;
       border-radius: 0;
-      padding: 0.22rem 0.55rem;
+      padding: 0.4rem 0.75rem;
       min-width: 0;
       background: transparent;
       color: var(--muted);
       font-weight: 500;
-      font-size: 0.846em;
+      font-size: 0.9em;
     }
     .lang-switch button + button {
       border-left: 1px solid var(--panel-border);
@@ -88,35 +88,35 @@
     section {
       background: var(--panel);
       border: 1px solid var(--panel-border);
-      border-radius: 6px;
-      padding: 0.55rem 0.7rem;
-      margin-bottom: 0.55rem;
+      border-radius: 8px;
+      padding: 0.95rem 1.15rem;
+      margin-bottom: 0.85rem;
     }
     h2 {
-      font-size: 0.769em;
+      font-size: 0.8em;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.04em;
       color: var(--muted);
-      margin: 0 0 0.4rem;
+      margin: 0 0 0.65rem;
     }
     table { width: 100%; border-collapse: collapse; font-size: inherit; }
     th, td {
       text-align: left;
-      padding: 0.3rem 0.25rem;
+      padding: 0.55rem 0.4rem;
       border-bottom: 1px solid var(--panel-border);
       vertical-align: middle;
     }
-    th { color: var(--muted); font-weight: 500; font-size: 0.846em; }
+    th { color: var(--muted); font-weight: 500; font-size: 0.9em; }
     tr:last-child td { border-bottom: none; }
     a { color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
     a:hover { color: var(--text); }
-    form { display: grid; gap: 0.45rem; }
-    label { display: grid; gap: 0.15rem; font-size: 0.846em; color: var(--muted); }
+    form { display: grid; gap: 0.75rem; }
+    label { display: grid; gap: 0.35rem; font-size: 0.92em; color: var(--muted); }
     input, select, button {
       font: inherit;
-      padding: 0.3rem 0.45rem;
-      border-radius: 4px;
+      padding: 0.5rem 0.65rem;
+      border-radius: 6px;
       border: 1px solid var(--panel-border);
       background: var(--bg);
       color: inherit;
@@ -143,31 +143,31 @@
       border-color: var(--danger-border);
       color: var(--danger-fg);
     }
-    td .actions { display: flex; flex-wrap: wrap; gap: 0.25rem; }
-    td button { padding: 0.15rem 0.35rem; font-size: 0.846em; }
-    .row { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: end; }
-    .row > * { flex: 1 1 120px; }
+    td .actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    td button { padding: 0.35rem 0.55rem; font-size: 0.92em; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: end; }
+    .row > * { flex: 1 1 140px; }
     .row-actions { flex: 0 0 auto; }
-    .row-actions button { min-width: 4.5rem; }
+    .row-actions button { min-width: 5.25rem; }
     .status-line {
       font-family: ui-monospace, "SF Mono", monospace;
-      font-size: 0.846em;
+      font-size: 0.92em;
       white-space: pre-wrap;
       margin: 0;
     }
-    .status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+    .status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
     .flash {
-      padding: 0.4rem 0.55rem;
-      border-radius: 4px;
-      margin-bottom: 0.55rem;
+      padding: 0.65rem 0.85rem;
+      border-radius: 6px;
+      margin-bottom: 0.85rem;
       display: none;
-      font-size: 0.923em;
+      font-size: 0.95em;
       border: 1px solid var(--panel-border);
     }
     .flash.ok { display: block; background: var(--ok-bg); color: var(--ok-fg); }
     .flash.err { display: block; background: var(--err-bg); color: var(--danger-fg); }
     code { font-size: 0.923em; }
-    section .sub { margin-bottom: 0.45rem; }
+    section .sub { margin-bottom: 0.65rem; }
   </style>
 </head>
 <body>
