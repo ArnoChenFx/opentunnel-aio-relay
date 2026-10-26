@@ -142,6 +142,13 @@
       background: var(--bg);
       color: inherit;
     }
+    input, select {
+      color: var(--text);
+    }
+    input::placeholder {
+      color: var(--muted);
+      opacity: 1;
+    }
     input:focus, select:focus {
       outline: 1px solid var(--muted);
       outline-offset: 0;
