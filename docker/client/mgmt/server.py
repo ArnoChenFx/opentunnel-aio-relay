@@ -11,7 +11,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 BIN = os.environ.get("OPENTUNNEL_BIN", "/usr/local/bin/opentunnel")
 ADMIN_PORT = int(os.environ.get("OT_CLIENT_ADMIN_PORT", "9080"))
@@ -23,7 +23,7 @@ ROUTE_LINE = re.compile(
 )
 # status(1) prints "fqdn  →  host:port" (Unicode arrow, padded spaces)
 STATUS_MAP_LINE = re.compile(r"^(?P<host>\S+)\s+[→\->]+\s+(?P<target>.+?)\s*$")
-URL_RE = re.compile(r"https://[^\s]+")
+URL_RE = re.compile(r"https?://[^\s]+")
 
 
 def run_opentunnel(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
@@ -193,13 +193,59 @@ def routes_for_profile() -> tuple[list[dict[str, str]], int, str]:
     return routes, proc.returncode, list_text.strip()
 
 
+def api_endpoint() -> tuple[str, int | None]:
+    """Scheme and port from OPENTUNNEL_API (visitor TLS uses the same port as the API)."""
+    raw = os.environ.get("OPENTUNNEL_API", "").strip()
+    if not raw:
+        return "https", None
+    parsed = urlparse(raw)
+    scheme = parsed.scheme or "https"
+    return scheme, parsed.port
+
+
+def public_port_suffix() -> str:
+    scheme, port = api_endpoint()
+    if port is None:
+        return ""
+    default = 443 if scheme == "https" else 80
+    if port == default:
+        return ""
+    return f":{port}"
+
+
+def public_url_meta() -> dict[str, Any]:
+    scheme, port = api_endpoint()
+    suffix = public_port_suffix()
+    exposed_port: int | None = port
+    if not suffix:
+        exposed_port = None
+    return {"public_scheme": scheme, "public_port": exposed_port}
+
+
+def enrich_urls_with_public_port(text: str) -> str:
+    suffix = public_port_suffix()
+    if not suffix:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        url = match.group(0)
+        parsed = urlparse(url)
+        if parsed.port is not None or not parsed.hostname:
+            return url
+        return f"{parsed.scheme}://{parsed.hostname}{suffix}"
+
+    return URL_RE.sub(repl, text)
+
+
 def public_url(hostname: str | None, route_name: str) -> str | None:
     if not hostname:
         return None
+    scheme, _ = api_endpoint()
     host = hostname.strip()
+    suffix = public_port_suffix()
     if route_name == "@":
-        return f"https://{host}"
-    return f"https://{route_name}.{host}"
+        return f"{scheme}://{host}{suffix}"
+    return f"{scheme}://{route_name}.{host}{suffix}"
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, body: Any) -> None:
@@ -265,8 +311,10 @@ class Handler(BaseHTTPRequestHandler):
                 body["summary"] = "\n\n".join(chunks)
             else:
                 body["summary"] = status_summary(active_raw)
+            body["summary"] = enrich_urls_with_public_port(body.get("summary") or "")
             body["profiles"] = profiles
             body["active_profile"] = profile
+            body.update(public_url_meta())
             for route in body.get("routes", []):
                 route["url"] = public_url(body.get("hostname"), route["name"])
             json_response(self, 200, body)
@@ -275,11 +323,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             routes, exit_code, list_raw = routes_for_profile()
-            json_response(
-                self,
-                200,
-                {"routes": routes, "exit_code": exit_code, "raw": list_raw},
-            )
+            payload: dict[str, Any] = {
+                "routes": routes,
+                "exit_code": exit_code,
+                "raw": list_raw,
+            }
+            payload.update(public_url_meta())
+            json_response(self, 200, payload)
             return
         json_response(self, 404, {"error": "not found"})
 
@@ -309,6 +359,9 @@ class Handler(BaseHTTPRequestHandler):
         proc = run_opentunnel(*args, timeout=600.0)
         out = (proc.stdout or "") + (proc.stderr or "")
         url_match = URL_RE.search(out)
+        url = url_match.group(0) if url_match else None
+        if url:
+            url = enrich_urls_with_public_port(url)
         json_response(
             self,
             200 if proc.returncode == 0 else 502,
@@ -316,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": proc.returncode == 0,
                 "exit_code": proc.returncode,
                 "output": out.strip(),
-                "url": url_match.group(0) if url_match else None,
+                "url": url,
             },
         )
 

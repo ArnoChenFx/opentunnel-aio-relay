@@ -176,7 +176,12 @@
       white-space: pre-wrap;
       margin: 0;
     }
-    .status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
+    .status-panel {
+      background: var(--bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 0.75rem 0.9rem;
+    }
     .flash {
       padding: 0.65rem 0.85rem;
       border-radius: 6px;
@@ -217,11 +222,11 @@
     </section>
 
     <section>
-      <h2 data-i18n="sectionStatus"></h2>
-      <div class="status-bar">
-        <div id="status" class="status-line" data-i18n="loading"></div>
-        <button type="button" class="secondary" id="refresh" data-i18n="refresh"></button>
+      <div class="section-head">
+        <h2 data-i18n="sectionStatus"></h2>
+        <button type="button" class="secondary btn-refresh" id="refresh" data-i18n="refresh"></button>
       </div>
+      <div id="status" class="status-line status-panel" data-i18n="loading"></div>
     </section>
 
     <section>
@@ -355,6 +360,7 @@
 
     let cacheStatus = null;
     let cacheRoutes = null;
+    let urlMeta = { public_scheme: "https", public_port: null };
 
     function t(key, vars) {
       let s = (STR[lang] && STR[lang][key]) || key;
@@ -420,14 +426,31 @@
       return { res, data };
     }
 
+    function portSuffix() {
+      const p = urlMeta.public_port;
+      if (p == null) return "";
+      const scheme = urlMeta.public_scheme || "https";
+      if (scheme === "https" && p === 443) return "";
+      if (scheme === "http" && p === 80) return "";
+      return ":" + p;
+    }
+
     function publicUrl(hostname, name) {
       if (!hostname) return null;
-      if (name === "@") return "https://" + hostname;
-      return "https://" + name + "." + hostname;
+      const scheme = urlMeta.public_scheme || "https";
+      const suffix = portSuffix();
+      if (name === "@") return scheme + "://" + hostname + suffix;
+      return scheme + "://" + name + "." + hostname + suffix;
+    }
+
+    function applyUrlMeta(data) {
+      if (data.public_scheme) urlMeta.public_scheme = data.public_scheme;
+      if ("public_port" in data) urlMeta.public_port = data.public_port;
     }
 
     function renderStatus(data) {
       cacheStatus = data;
+      applyUrlMeta(data);
       const text = (data.summary || data.raw || "").trim();
       document.getElementById("status").textContent = text || t("noStatus");
     }
@@ -490,6 +513,7 @@
         const { data: st } = await api("/api/status");
         renderStatus(st);
         const { data: rt } = await api("/api/routes");
+        applyUrlMeta(rt);
         renderRoutes(rt.routes || []);
       } catch (e) {
         flash(e.message || String(e), false);
