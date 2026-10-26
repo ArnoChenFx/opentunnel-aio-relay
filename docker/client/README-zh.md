@@ -4,6 +4,18 @@
 
 容器内运行 `opentunnel serve`（前台服务模式，专为容器设计），管理页通过调用同一 profile 的 CLI 实现 route 的查看、添加、修改和删除。
 
+## 从 GHCR 拉取（推荐）
+
+仓库在 `master` 更新 `docker/client/` 或打 `v*` 标签时会自动构建并推送到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/arnochenfx/opentunnel-aio-relay/opentunnel-client:latest
+```
+
+（包名与 GitHub 用户名/仓库名均为小写。若包为私有，需先 `docker login ghcr.io` 并使用有 `read:packages` 的 token。）
+
+也可在 Actions 里手动运行 **Client Docker (GHCR)** workflow，指定嵌入的 `opentunnel` 版本或仅构建不推送。
+
 ## 快速开始
 
 在仓库根目录构建：
@@ -20,7 +32,7 @@ docker run --rm \
   -p 9080:9080 \
   -v opentunnel-client-data:/data \
   --add-host=host.docker.internal:host-gateway \
-  opentunnel-client
+  ghcr.io/arnochenfx/opentunnel-aio-relay/opentunnel-client:latest
 ```
 
 浏览器打开 `http://localhost:9080`。
