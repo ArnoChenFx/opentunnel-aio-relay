@@ -1,6 +1,6 @@
 [package]
 name = "opentunnel-relay"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Single-binary self-hosted relay server for the OpenTunnel protocol (blind TLS tunnels)"
 license = "MIT"

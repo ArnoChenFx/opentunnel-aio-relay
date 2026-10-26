@@ -30,6 +30,8 @@ jobs:
         run: bash .github/scripts/test-fetch-official-client.sh
       - name: Test DNS cleanup script (offline)
         run: bash .github/scripts/test-dns-cleanup.sh
+      - name: Test release archive permissions (offline)
+        run: bash .github/scripts/test-package-relay.sh
 
   build:
     name: Build (${{ matrix.target }})
@@ -93,12 +95,7 @@ jobs:
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package
-        run: |
-          STAGE="dist/opentunnel-relay-${{ matrix.target }}"
-          mkdir -p "$STAGE"
-          cp "target/${{ matrix.target }}/release/opentunnel-relay" "$STAGE/"
-          cp README.md "$STAGE/"
-          tar -czf "dist/opentunnel-relay-${{ matrix.target }}.tar.gz" -C dist "opentunnel-relay-${{ matrix.target }}"
+        run: bash .github/scripts/package-relay.sh "${{ matrix.target }}" "target/${{ matrix.target }}/release/opentunnel-relay"
 
       - uses: actions/upload-artifact@v7
         with:
