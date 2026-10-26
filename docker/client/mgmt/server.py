@@ -17,6 +17,11 @@ BIN = os.environ.get("OPENTUNNEL_BIN", "/usr/local/bin/opentunnel")
 ADMIN_PORT = int(os.environ.get("OT_CLIENT_ADMIN_PORT", "9080"))
 ADMIN_TOKEN = os.environ.get("OT_CLIENT_ADMIN_TOKEN", "").strip()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_FILES: dict[str, str] = {
+    "favicon-16x16.png": "image/png",
+    "favicon-32x32.png": "image/png",
+    "apple-touch-icon.png": "image/png",
+}
 
 ROUTE_LINE = re.compile(
     r"^(?P<name>@|[a-z0-9-]+)\s+[→\->]+\s+(?P<target>.+?)\s*$"
@@ -293,6 +298,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             self._serve_static("index.html", "text/html; charset=utf-8")
+            return
+        asset = path.lstrip("/")
+        if asset in STATIC_FILES:
+            self._serve_static(asset, STATIC_FILES[asset])
             return
         if path == "/health":
             json_response(self, 200, {"ok": True})

@@ -3,6 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#f0f0f0" media="(prefers-color-scheme: light)" />
+  <link rel="icon" type="image/png" href="/favicon-32x32.png" sizes="32x32" />
+  <link rel="icon" type="image/png" href="/favicon-16x16.png" sizes="16x16" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
   <title>OpenTunnel Client</title>
   <style>
     :root {
@@ -58,7 +63,19 @@
       padding-bottom: 0.15rem;
     }
     .page-head .sub { margin-bottom: 0; }
-    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 0.35rem; letter-spacing: -0.01em; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+    }
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 6px;
+      flex-shrink: 0;
+      display: block;
+    }
+    h1 { font-size: 1.35rem; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
     .sub { color: var(--muted); margin: 0 0 0.75rem; font-size: 0.95em; }
     .lang-switch {
       display: inline-flex;
@@ -206,7 +223,8 @@
 <body>
   <main>
     <div class="page-head">
-      <div>
+      <div class="brand">
+        <img class="brand-icon" src="/favicon-32x32.png" width="36" height="36" alt="" decoding="async" />
         <h1>OpenTunnel Client</h1>
       </div>
       <div class="lang-switch" role="group" aria-label="Language">
