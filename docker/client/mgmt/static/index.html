@@ -400,16 +400,16 @@
       return { res, data };
     }
 
+    function publicUrl(hostname, name) {
+      if (!hostname) return null;
+      if (name === "@") return "https://" + hostname;
+      return "https://" + name + "." + hostname;
+    }
+
     function renderStatus(data) {
       cacheStatus = data;
-      const lines = [];
-      if (data.profile) lines.push("Profile: " + data.profile);
-      if (data.tunnel_id) lines.push("Tunnel ID: " + data.tunnel_id);
-      if (data.hostname) lines.push("Hostname: " + data.hostname);
-      if (data.connected) lines.push(data.connected);
-      if (data.service) lines.push("Service: " + data.service);
-      if (!lines.length) lines.push(data.raw || t("noStatus"));
-      document.getElementById("status").textContent = lines.join("\n");
+      const text = (data.raw || "").trim();
+      document.getElementById("status").textContent = text || t("noStatus");
     }
 
     function renderRoutes(routes) {
@@ -470,7 +470,11 @@
         const { data: st } = await api("/api/status");
         renderStatus(st);
         const { data: rt } = await api("/api/routes");
-        renderRoutes(rt.routes || []);
+        let routes = rt.routes || [];
+        if (!routes.length && cacheStatus && cacheStatus.routes && cacheStatus.routes.length) {
+          routes = cacheStatus.routes;
+        }
+        renderRoutes(routes);
       } catch (e) {
         flash(e.message || String(e), false);
       }

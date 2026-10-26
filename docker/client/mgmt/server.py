@@ -36,6 +36,46 @@ def run_opentunnel(*args: str, timeout: float = 120.0) -> subprocess.CompletedPr
     )
 
 
+def active_profile() -> str:
+    return os.environ.get("OPENTUNNEL_PROFILE", "default")
+
+
+def discover_profiles() -> list[str]:
+    """Profiles seen in config or data dirs (one tunnel identity per profile)."""
+    names: set[str] = set()
+    config_root = Path(os.environ.get("XDG_CONFIG_HOME", "/data/config")) / "opentunnel"
+    data_root = Path(os.environ.get("XDG_DATA_HOME", "/data/data")) / "opentunnel"
+    if config_root.is_dir():
+        for path in config_root.glob("*.toml"):
+            if path.stem:
+                names.add(path.stem)
+    if data_root.is_dir():
+        for path in data_root.iterdir():
+            if path.is_dir() and not path.name.startswith("."):
+                names.add(path.name)
+    if not names:
+        names.add(active_profile())
+    return sorted(names)
+
+
+def status_text(profile: str) -> str:
+    proc = run_opentunnel("status", "--profile", profile)
+    return ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+def collect_status() -> tuple[str, list[str], int]:
+    profiles = discover_profiles()
+    parts: list[str] = []
+    exit_code = 0
+    for profile in profiles:
+        text = status_text(profile)
+        if len(profiles) > 1:
+            parts.append(f"=== profile: {profile} ===\n{text}")
+        else:
+            parts.append(text)
+    return "\n\n".join(parts).strip(), profiles, exit_code
+
+
 def parse_routes(text: str) -> list[dict[str, str]]:
     routes: list[dict[str, str]] = []
     for line in text.splitlines():
@@ -139,9 +179,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             if not self._require_auth():
                 return
-            proc = run_opentunnel("status")
-            body = parse_status((proc.stdout or "") + (proc.stderr or ""))
-            body["exit_code"] = proc.returncode
+            raw, profiles, _exit = collect_status()
+            body = parse_status(raw)
+            body["raw"] = raw
+            body["profiles"] = profiles
+            body["active_profile"] = active_profile()
             for route in body.get("routes", []):
                 route["url"] = public_url(body.get("hostname"), route["name"])
             json_response(self, 200, body)
@@ -151,8 +193,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             proc = run_opentunnel("route", "list")
             text = (proc.stdout or "") + (proc.stderr or "")
-            status = parse_status(run_opentunnel("status").stdout or "")
+            status = parse_status(status_text(active_profile()))
             routes = parse_routes(text)
+            if not routes:
+                routes = status.get("routes", [])
             for route in routes:
                 route["url"] = public_url(status.get("hostname"), route["name"])
             json_response(
