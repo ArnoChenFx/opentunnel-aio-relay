@@ -347,21 +347,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         target = str(payload.get("target", "")).strip()
         name = payload.get("name")
+        route_name = str(name).strip() if name is not None else ""
+        if route_name and not re.fullmatch(r"@|[a-z0-9-]+", route_name):
+            json_response(
+                self,
+                400,
+                {"error": "name must be @ or a lowercase DNS label (a-z, 0-9, hyphen)"},
+            )
+            return
         if not target:
             json_response(self, 400, {"error": "target is required"})
             return
-        args = ["route", "add", target]
-        if name is not None and str(name).strip():
-            args.extend(["--name", str(name).strip()])
+        profile = active_profile()
+        args = ["route", "add", target, "--profile", profile]
+        if route_name:
+            args.extend(["--name", route_name])
         proxy = payload.get("proxy_protocol")
         if proxy in ("v1", "v2"):
             args.extend(["--proxy-protocol", proxy])
         proc = run_opentunnel(*args, timeout=600.0)
         out = (proc.stdout or "") + (proc.stderr or "")
         url_match = URL_RE.search(out)
-        url = url_match.group(0) if url_match else None
-        if url:
-            url = enrich_urls_with_public_port(url)
+        cli_url = url_match.group(0) if url_match else None
+        url = enrich_urls_with_public_port(cli_url) if cli_url else None
+        if not url and route_name:
+            status = parse_status(status_text(profile))
+            url = public_url(status.get("hostname"), route_name)
         json_response(
             self,
             200 if proc.returncode == 0 else 502,
@@ -387,7 +398,7 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             json_response(self, 400, {"error": "route name required"})
             return
-        proc = run_opentunnel("route", "remove", name)
+        proc = run_opentunnel("route", "remove", name, "--profile", active_profile())
         out = (proc.stdout or "") + (proc.stderr or "")
         json_response(
             self,

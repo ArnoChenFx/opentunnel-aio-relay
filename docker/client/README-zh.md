@@ -66,7 +66,7 @@ docker compose -f docker/client/docker-compose.yml up -d --build
 
 - **状态**：profile、Tunnel ID、hostname、bridge 连接情况
 - **Routes 列表**：名称、本地目标、公网 URL（有 hostname 时自动拼接）
-- **添加 / 修改**：与 CLI 相同，`route add` 同名 route 会更新目标；随机名称 route 可在 UI 中编辑目标
+- **添加 / 修改**：与 CLI 相同，`route add <目标> --name <名称>`（如 `gateway-api` → `https://gateway-api.<Hostname>`）；留空名称则随机；同名 route 会更新目标
 - **删除**：`route remove`
 
 首次添加 route 时会自动创建隧道并申请证书，可能需要数分钟；页面会显示 CLI 输出中的公网 URL。

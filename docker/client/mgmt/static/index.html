@@ -194,6 +194,14 @@
     .flash.err { display: block; background: var(--err-bg); color: var(--danger-fg); }
     code { font-size: 0.923em; }
     section .sub { margin-bottom: 0.65rem; }
+    .url-preview {
+      margin: 0;
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-size: 0.88em;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    .url-preview a { font-size: inherit; }
   </style>
 </head>
 <body>
@@ -248,12 +256,13 @@
       <h2 id="form-title" data-i18n="formAddTitle"></h2>
       <form id="route-form">
         <input type="hidden" id="edit-mode" value="add" />
+        <p class="sub" data-i18n="formAddHelp"></p>
         <div class="row">
-          <label><span data-i18n="labelName"></span>
-            <input id="name" name="name" data-i18n-placeholder="placeholderName" pattern="^@?$|^[a-z0-9-]+$" />
-          </label>
           <label><span data-i18n="labelTarget"></span>
             <input id="target" name="target" required data-i18n-placeholder="placeholderTarget" />
+          </label>
+          <label><span data-i18n="labelName"></span>
+            <input id="name" name="name" autocomplete="off" spellcheck="false" data-i18n-placeholder="placeholderName" data-i18n-title="namePatternHint" />
           </label>
           <label><span data-i18n="labelProxy"></span>
             <select id="proxy_protocol" name="proxy_protocol">
@@ -263,6 +272,7 @@
             </select>
           </label>
         </div>
+        <p id="url-preview" class="url-preview" hidden></p>
         <div class="row">
           <div class="row-actions"><button type="submit" id="submit-btn" data-i18n="btnAdd"></button></div>
           <div class="row-actions"><button type="button" class="secondary" id="cancel-edit" hidden data-i18n="cancelEdit"></button></div>
@@ -294,8 +304,12 @@
         delete: "删除",
         formAddTitle: "添加 route",
         formEditTitle: "修改 route",
-        labelName: "名称（可选，小写 DNS 标签或 @）",
-        placeholderName: "留空则随机 16 字符",
+        formAddHelp: "与 CLI 相同：opentunnel route add <目标> --name <名称>。自定义名称会出现在公网 URL 子域名中（如 gateway-api）。",
+        labelName: "自定义名称（--name）",
+        placeholderName: "gateway-api（留空则随机名称）",
+        namePatternHint: "仅小写字母、数字、连字符，或 @ 表示根域名",
+        errBadName: "名称格式无效：小写 DNS 标签（a-z、0-9、-）或 @",
+        urlPreview: "公网 URL 预览：",
         labelTarget: "目标 host:port",
         placeholderTarget: "127.0.0.1:3000 或 3000",
         labelProxy: "PROXY protocol",
@@ -332,8 +346,12 @@
         delete: "Delete",
         formAddTitle: "Add route",
         formEditTitle: "Edit route",
-        labelName: "Name (optional, lowercase DNS label or @)",
-        placeholderName: "Random 16 chars if empty",
+        formAddHelp: "Same as CLI: opentunnel route add <target> --name <name>. A custom name becomes the public URL subdomain (e.g. gateway-api).",
+        labelName: "Custom name (--name)",
+        placeholderName: "gateway-api (empty = random name)",
+        namePatternHint: "Lowercase letters, digits, hyphens only, or @ for apex",
+        errBadName: "Invalid name: use a lowercase DNS label (a-z, 0-9, -) or @",
+        urlPreview: "Public URL preview: ",
         labelTarget: "Target host:port",
         placeholderTarget: "127.0.0.1:3000 or 3000",
         labelProxy: "PROXY protocol",
@@ -380,6 +398,9 @@
       });
       document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
         el.placeholder = t(el.dataset.i18nPlaceholder);
+      });
+      document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+        el.title = t(el.dataset.i18nTitle);
       });
       document.getElementById("lang-zh").classList.toggle("active", lang === "zh");
       document.getElementById("lang-en").classList.toggle("active", lang === "en");
@@ -448,11 +469,39 @@
       if ("public_port" in data) urlMeta.public_port = data.public_port;
     }
 
+    const ROUTE_NAME_RE = /^@?$|^[a-z0-9-]+$/;
+
+    function routeNameValid(raw) {
+      const s = (raw || "").trim();
+      if (!s) return true;
+      return ROUTE_NAME_RE.test(s);
+    }
+
+    function updateUrlPreview() {
+      const box = document.getElementById("url-preview");
+      const name = document.getElementById("name").value.trim();
+      const hostname = cacheStatus && cacheStatus.hostname;
+      if (!hostname || !name || !routeNameValid(name)) {
+        box.hidden = true;
+        box.textContent = "";
+        return;
+      }
+      const url = publicUrl(hostname, name);
+      if (!url) {
+        box.hidden = true;
+        return;
+      }
+      box.hidden = false;
+      box.innerHTML = escapeHtml(t("urlPreview")) +
+        `<a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(url)}</a>`;
+    }
+
     function renderStatus(data) {
       cacheStatus = data;
       applyUrlMeta(data);
       const text = (data.summary || data.raw || "").trim();
       document.getElementById("status").textContent = text || t("noStatus");
+      updateUrlPreview();
     }
 
     function renderRoutes(routes) {
@@ -498,6 +547,7 @@
       document.getElementById("target").value = target;
       document.getElementById("cancel-edit").hidden = false;
       syncFormLabels();
+      updateUrlPreview();
     }
 
     function resetForm() {
@@ -506,6 +556,7 @@
       document.getElementById("name").readOnly = false;
       document.getElementById("cancel-edit").hidden = true;
       syncFormLabels();
+      updateUrlPreview();
     }
 
     async function refresh() {
@@ -531,11 +582,18 @@
       }
     }
 
+    document.getElementById("name").addEventListener("input", updateUrlPreview);
+
     document.getElementById("route-form").addEventListener("submit", async (ev) => {
       ev.preventDefault();
+      const nameRaw = document.getElementById("name").value.trim();
+      if (!routeNameValid(nameRaw)) {
+        flash(t("errBadName"), false);
+        return;
+      }
       const payload = {
         target: document.getElementById("target").value.trim(),
-        name: document.getElementById("name").value.trim() || undefined,
+        name: nameRaw || undefined,
         proxy_protocol: document.getElementById("proxy_protocol").value || undefined,
       };
       try {
