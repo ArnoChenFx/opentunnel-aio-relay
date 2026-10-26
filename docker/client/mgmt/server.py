@@ -21,7 +21,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 ROUTE_LINE = re.compile(
     r"^(?P<name>@|[a-z0-9-]+)\s+[→\->]+\s+(?P<target>.+?)\s*$"
 )
-STATUS_MAP_LINE = re.compile(r"^(?P<host>\S+)\s*->\s*(?P<target>.+?)\s*$")
+# status(1) prints "fqdn  →  host:port" (Unicode arrow, padded spaces)
+STATUS_MAP_LINE = re.compile(r"^(?P<host>\S+)\s+[→\->]+\s+(?P<target>.+?)\s*$")
 URL_RE = re.compile(r"https://[^\s]+")
 
 
