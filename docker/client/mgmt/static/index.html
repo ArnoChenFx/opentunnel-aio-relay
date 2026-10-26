@@ -100,6 +100,27 @@
       color: var(--muted);
       margin: 0 0 0.65rem;
     }
+    .section-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem 0.75rem;
+      margin-bottom: 0.65rem;
+    }
+    .section-head h2 { margin: 0; }
+    .btn-refresh {
+      flex-shrink: 0;
+      padding: 0.38rem 0.85rem;
+      font-size: 0.88em;
+      letter-spacing: 0.01em;
+    }
+    .btn-refresh::before {
+      content: "↻";
+      display: inline-block;
+      margin-right: 0.35em;
+      opacity: 0.85;
+    }
     table { width: 100%; border-collapse: collapse; font-size: inherit; }
     th, td {
       text-align: left;
