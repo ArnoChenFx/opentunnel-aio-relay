@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenTunnel Client</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3d8bfd;
+      --danger: #f07178;
+      --ok: #7fd962;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f6fa;
+        --panel: #fff;
+        --text: #1a2332;
+        --muted: #5c6b80;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    main { max-width: 960px; margin: 0 auto; padding: 1.5rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+    .sub { color: var(--muted); margin-bottom: 1.5rem; }
+    section {
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,.15);
+    }
+    h2 { font-size: 1rem; margin: 0 0 0.75rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { text-align: left; padding: 0.5rem 0.35rem; border-bottom: 1px solid rgba(127,127,127,.2); }
+    th { color: var(--muted); font-weight: 600; }
+    a { color: var(--accent); }
+    form { display: grid; gap: 0.75rem; }
+    label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+    input, select, button {
+      font: inherit;
+      padding: 0.5rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid rgba(127,127,127,.35);
+      background: transparent;
+      color: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      font-weight: 600;
+    }
+    button.secondary { background: transparent; border: 1px solid rgba(127,127,127,.4); color: inherit; }
+    button.danger { background: var(--danger); }
+    .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
+    .row > * { flex: 1 1 140px; }
+    .status-line { font-family: ui-monospace, monospace; font-size: 0.85rem; white-space: pre-wrap; }
+    .flash { padding: 0.65rem 0.75rem; border-radius: 8px; margin-bottom: 1rem; display: none; }
+    .flash.ok { display: block; background: rgba(127,217,98,.15); color: var(--ok); }
+    .flash.err { display: block; background: rgba(240,113,120,.15); color: var(--danger); }
+    #token-row { margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>OpenTunnel Client</h1>
+    <p class="sub">查看隧道状态，管理本地 route（增删改）。</p>
+
+    <div id="flash" class="flash"></div>
+
+    <section id="token-row">
+      <h2>访问令牌</h2>
+      <p class="sub" style="margin:0 0 .75rem">若容器设置了 <code>OT_CLIENT_ADMIN_TOKEN</code>，在此填写后保存到浏览器。</p>
+      <div class="row">
+        <label style="flex:2">Admin token
+          <input id="admin-token" type="password" placeholder="Bearer token（可选）" autocomplete="off" />
+        </label>
+        <button type="button" class="secondary" id="save-token">保存</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>隧道状态</h2>
+      <div id="status" class="status-line">加载中…</div>
+      <p><button type="button" class="secondary" id="refresh">刷新</button></p>
+    </section>
+
+    <section>
+      <h2>Routes</h2>
+      <table>
+        <thead>
+          <tr><th>名称</th><th>目标</th><th>公网 URL</th><th></th></tr>
+        </thead>
+        <tbody id="routes"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2 id="form-title">添加 route</h2>
+      <form id="route-form">
+        <input type="hidden" id="edit-mode" value="add" />
+        <div class="row">
+          <label>名称（可选，小写 DNS 标签或 @）
+            <input id="name" name="name" placeholder="留空则随机 16 字符" pattern="^@?$|^[a-z0-9-]+$" />
+          </label>
+          <label>目标 host:port
+            <input id="target" name="target" required placeholder="127.0.0.1:3000 或 3000" />
+          </label>
+          <label>PROXY protocol
+            <select id="proxy_protocol" name="proxy_protocol">
+              <option value="">关闭</option>
+              <option value="v1">v1</option>
+              <option value="v2">v2</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <button type="submit" id="submit-btn">添加</button>
+          <button type="button" class="secondary" id="cancel-edit" hidden>取消编辑</button>
+        </div>
+      </form>
+    </section>
+  </main>
+  <script>
+    const TOKEN_KEY = "ot-client-admin-token";
+
+    function token() {
+      return localStorage.getItem(TOKEN_KEY) || "";
+    }
+
+    function headers() {
+      const h = { "Content-Type": "application/json" };
+      const t = token();
+      if (t) h["Authorization"] = "Bearer " + t;
+      return h;
+    }
+
+    function flash(msg, ok) {
+      const el = document.getElementById("flash");
+      el.textContent = msg;
+      el.className = "flash " + (ok ? "ok" : "err");
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok && res.status === 401) throw new Error("未授权：请填写正确的 Admin token");
+      return { res, data };
+    }
+
+    function renderStatus(data) {
+      const lines = [];
+      if (data.profile) lines.push("Profile: " + data.profile);
+      if (data.tunnel_id) lines.push("Tunnel ID: " + data.tunnel_id);
+      if (data.hostname) lines.push("Hostname: " + data.hostname);
+      if (data.connected) lines.push(data.connected);
+      if (data.service) lines.push("Service: " + data.service);
+      if (!lines.length) lines.push(data.raw || "（无状态）");
+      document.getElementById("status").textContent = lines.join("\n");
+    }
+
+    function renderRoutes(routes) {
+      const tbody = document.getElementById("routes");
+      tbody.innerHTML = "";
+      if (!routes.length) {
+        tbody.innerHTML = "<tr><td colspan=\"4\">暂无 route</td></tr>";
+        return;
+      }
+      for (const r of routes) {
+        const tr = document.createElement("tr");
+        const url = r.url ? `<a href="${r.url}" target="_blank" rel="noopener">${r.url}</a>` : "—";
+        tr.innerHTML = `
+          <td><code>${escapeHtml(r.name)}</code></td>
+          <td><code>${escapeHtml(r.target)}</code></td>
+          <td>${url}</td>
+          <td>
+            <button type="button" class="secondary edit" data-name="${escapeAttr(r.name)}" data-target="${escapeAttr(r.target)}">编辑</button>
+            <button type="button" class="danger del" data-name="${escapeAttr(r.name)}">删除</button>
+          </td>`;
+        tbody.appendChild(tr);
+      }
+      tbody.querySelectorAll(".edit").forEach(btn => btn.addEventListener("click", () => startEdit(btn.dataset.name, btn.dataset.target)));
+      tbody.querySelectorAll(".del").forEach(btn => btn.addEventListener("click", () => removeRoute(btn.dataset.name)));
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
+    }
+    function escapeAttr(s) {
+      return String(s).replace(/"/g, "&quot;");
+    }
+
+    function startEdit(name, target) {
+      document.getElementById("edit-mode").value = "edit";
+      document.getElementById("form-title").textContent = "修改 route";
+      document.getElementById("name").value = name;
+      document.getElementById("name").readOnly = true;
+      document.getElementById("target").value = target;
+      document.getElementById("submit-btn").textContent = "保存";
+      document.getElementById("cancel-edit").hidden = false;
+    }
+
+    function resetForm() {
+      document.getElementById("edit-mode").value = "add";
+      document.getElementById("form-title").textContent = "添加 route";
+      document.getElementById("route-form").reset();
+      document.getElementById("name").readOnly = false;
+      document.getElementById("submit-btn").textContent = "添加";
+      document.getElementById("cancel-edit").hidden = true;
+    }
+
+    async function refresh() {
+      try {
+        const { data: st } = await api("/api/status");
+        renderStatus(st);
+        const { data: rt } = await api("/api/routes");
+        renderRoutes(rt.routes || []);
+      } catch (e) {
+        flash(e.message || String(e), false);
+      }
+    }
+
+    async function removeRoute(name) {
+      if (!confirm("删除 route「" + name + "」？")) return;
+      try {
+        const { res, data } = await api("/api/routes/" + encodeURIComponent(name), { method: "DELETE" });
+        flash(data.output || (data.ok ? "已删除" : "删除失败"), data.ok);
+        if (res.ok) await refresh();
+      } catch (e) {
+        flash(e.message || String(e), false);
+      }
+    }
+
+    document.getElementById("route-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const payload = {
+        target: document.getElementById("target").value.trim(),
+        name: document.getElementById("name").value.trim() || undefined,
+        proxy_protocol: document.getElementById("proxy_protocol").value || undefined,
+      };
+      try {
+        const { res, data } = await api("/api/routes", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        const msg = data.url ? "已保存，公网 URL: " + data.url : (data.output || (data.ok ? "已保存" : "失败"));
+        flash(msg, data.ok);
+        if (res.ok || data.ok) {
+          resetForm();
+          await refresh();
+        }
+      } catch (e) {
+        flash(e.message || String(e), false);
+      }
+    });
+
+    document.getElementById("refresh").addEventListener("click", refresh);
+    document.getElementById("cancel-edit").addEventListener("click", resetForm);
+    document.getElementById("save-token").addEventListener("click", () => {
+      localStorage.setItem(TOKEN_KEY, document.getElementById("admin-token").value.trim());
+      flash("Token 已保存", true);
+      refresh();
+    });
+
+    document.getElementById("admin-token").value = token();
+    refresh();
+    setInterval(refresh, 15000);
+  </script>
+</body>
+</html>

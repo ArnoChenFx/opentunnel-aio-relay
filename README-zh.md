@@ -253,6 +253,10 @@ WantedBy=multi-user.target
 - **单个订单有时限**：ACME 订单必须在 10 分钟内完成（含 DNS 生效时间），订单结束后（无论成功或失败）删掉它放的 DNS TXT 记录。重启时被打断的订单会在启动时重新排队。
 - **API 证书**：首次启动时签发，之后只要还有效且覆盖 `OT_DOMAIN` 就复用。到期前在后台续签，新握手用新证书。续签失败的话，还有效的旧证书继续服务并记一条 warning 日志。
 
+## OpenTunnel 客户端 Docker 镜像
+
+若希望在 Docker 里长期运行官方 `opentunnel` 客户端，并通过 Web 管理 route，见 [`docker/client/README-zh.md`](docker/client/README-zh.md)（`opentunnel serve` + 管理页，数据持久化在 `/data` 卷）。
+
 ## 构建
 
 ```bash
