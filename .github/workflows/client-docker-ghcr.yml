@@ -76,3 +76,5 @@ jobs:
             OPENTUNNEL_VERSION=${{ env.OPENTUNNEL_VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Re-download the OpenTunnel release on every build; a cached fetch layer would keep an old `latest`.
+          no-cache-filters: fetch
