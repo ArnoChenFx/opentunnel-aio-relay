@@ -77,7 +77,7 @@ aliyun_v3_sign() {
   local query="" pair canonical_headers canonical_request hashed string_to_sign signature
   while IFS= read -r pair; do
     query+="${query:+&}$(aliyun_urlencode "${pair%%=*}")=$(aliyun_urlencode "${pair#*=}")"
-  done < <(printf '%s\n' "$@" | LC_ALL=C sort -t= -k1,1)
+  done < <(printf '%s\n' "$@" | LC_ALL=C sort -t '=' -k1,1)
   printf -v canonical_headers 'host:%s\nx-acs-action:%s\nx-acs-content-sha256:%s\nx-acs-date:%s\nx-acs-signature-nonce:%s\nx-acs-version:%s' \
     "$host" "$action" "$ALIYUN_EMPTY_BODY_SHA256" "$date" "$nonce" "$version"
   printf -v canonical_request 'POST\n/\n%s\n%s\n\n%s\n%s' \
