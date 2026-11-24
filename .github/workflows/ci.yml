@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - name: Test official client fetch script (offline)
+        run: bash .github/scripts/test-fetch-official-client.sh
+      - name: Test DNS cleanup script (offline)
+        run: bash .github/scripts/test-dns-cleanup.sh
+      - name: Test release archive permissions (offline)
+        run: bash .github/scripts/test-package-relay.sh
