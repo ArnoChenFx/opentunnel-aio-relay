@@ -253,6 +253,23 @@ WantedBy=multi-user.target
 - **单个订单有时限**：ACME 订单必须在 10 分钟内完成（含 DNS 生效时间），订单结束后（无论成功或失败）删掉它放的 DNS TXT 记录。重启时被打断的订单会在启动时重新排队。
 - **API 证书**：首次启动时签发，之后只要还有效且覆盖 `OT_DOMAIN` 就复用。到期前在后台续签，新握手用新证书。续签失败的话，还有效的旧证书继续服务并记一条 warning 日志。
 
+## 查看运行状态
+
+二进制自带只读子命令，用来查看数据库里的内容。它们可以和正在运行的中转同时使用，不会修改数据库：
+
+```bash
+opentunnel-relay status                  # 中转状态、隧道和证书数量、每日证书配额
+opentunnel-relay tunnels [--all]         # 隧道列表：状态、证书到期时间、最近连接时间
+opentunnel-relay tunnel <ID>             # 单个隧道：证书、续期状态、最近的证书操作
+opentunnel-relay issuances [--limit 20]  # 最近 24 小时的证书订单、续期和重新排队记录
+```
+
+每个命令都支持 `--json`。它们读取中转的数据目录（`--data-dir` 或 `OT_DATA_DIR`，默认 `./data`），请在中转的工作目录下运行，或者设置该变量。请以中转的运行用户执行，例如 `sudo -u opentunnel`，这样 SQLite 可能创建的文件归属与中转一致。输出不包含任何密钥或证书内容。
+
+中转每 30 秒在数据库里记录一次心跳。心跳距今不足 90 秒时，`status` 显示 `running`，否则显示 `stopped`。中转停止后，所有隧道都不会显示为 `online`，因为数据库会保留停止前的状态，直到下次启动才会清除。访客和 bridge 的实时流量只存在于内存中，不会在这里显示。
+
+中转运行期间，不要用读写模式的 `sqlite3` 打开 `relay.db`。这样的会话可能删除中转的 `relay.db-wal` 和 `relay.db-shm` 文件。之后中转会继续写入已被删除的文件，这些修改在 `relay.db` 中不可见，中转重启时也会丢失。需要手动执行 SQL 时，请使用 `sqlite3 -readonly relay.db` 打开数据库。
+
 ## OpenTunnel 客户端 Docker 镜像
 
 若希望在 Docker 里长期运行官方 `opentunnel` 客户端，并通过 Web 管理 route，见 [`docker/client/README-zh.md`](docker/client/README-zh.md)（`opentunnel serve` + 管理页，数据持久化在 `/data` 卷）。
@@ -280,6 +297,7 @@ cargo test
 
 - `tests/vectors.rs` —— 用从 `anomalyco/opentunnel` 拷来的 spec 向量（`spec/vectors`）校验路由合法性、SNI 路由、数据帧编码和控制消息往返。通过只说明这些向量对得上，不是完整的一致性测试。
 - `tests/e2e.rs` —— 真 socket 全链路：TCP 接入 → SNI 路由 → API TLS → REST 开通 → bridge WebSocket attach → 代理 `open`，含半关闭响应投递、多 bridge 隔离、删隧道后立即断开。还覆盖开通管控、隧道和连接上限（全局、按地址、访客份额）、header 和空闲超时、bridge 停滞和溢出处理。
+- `tests/cli.rs` —— 用真实数据库运行二进制的 `status`、`tunnels`、`tunnel`、`issuances` 子命令，检查输出不含密钥材料，并且不改动隧道状态。
 - 单元测试：ClientHello 解析、CSR 校验（含篡改签名）、CIDR 解析和限流、数据库和 bridge 状态机。
 - DNS 提供方：阿里云 V3 签名对照阿里云文档的示例校验；Cloudflare 和阿里云的 API 调用（请求内容、限流重试、重复记录、删除）用本地 mock 服务器验证；`OT_DNS_PROVIDER` 的自动选择和凭证校验也有单元测试。
 - `.github/scripts/test-fetch-official-client.sh` —— CI 下载脚本的离线检查：digest 对得上才成功，digest 对不上或缺失就 fail-closed，什么都不解压。

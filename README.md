@@ -254,6 +254,36 @@ relay also restricts the SQLite database and API private key to mode 600.
   before expiry, and new TLS handshakes use the renewed certificate. If renewal
   fails, the still-valid certificate stays in service and a warning is logged.
 
+## Inspecting a relay
+
+The binary has read-only subcommands that report what the database holds. They
+run beside a serving relay and never change the database:
+
+```bash
+opentunnel-relay status                  # relay state, tunnel and certificate counts, daily budget
+opentunnel-relay tunnels [--all]         # tunnels: state, certificate expiry, last connection
+opentunnel-relay tunnel <ID>             # one tunnel: certificate, renewal state, recent activity
+opentunnel-relay issuances [--limit 20]  # certificate orders, renewals and requeues from the last 24 hours
+```
+
+Every command accepts `--json`. They read the relay's data directory
+(`--data-dir` or `OT_DATA_DIR`, default `./data`), so run them from the relay's
+working directory or set the variable. Run them as the relay's user, for example
+`sudo -u opentunnel`, so any SQLite files they create keep the owner the relay
+needs. The output never includes key or certificate material.
+
+The relay records a heartbeat in the database every 30 seconds. `status` reports
+it as `running` while the heartbeat is under 90 seconds old, and as `stopped`
+after that. A stopped relay shows no tunnel as `online`, because the database
+keeps the states from before the stop until the next start. Live visitor and
+bridge traffic exists only in memory and is not reported.
+
+Do not open `relay.db` with a read-write `sqlite3` shell while the relay is
+running. That session can delete the relay's `relay.db-wal` and `relay.db-shm`
+files. The relay then keeps writing to the deleted files, so its later changes
+are invisible in `relay.db` and are lost when it restarts. To run SQL by hand,
+open the database with `sqlite3 -readonly relay.db`.
+
 ## OpenTunnel client Docker image
 
 To run the official `opentunnel` client in Docker with a small web UI for managing routes, see [`docker/client/README-zh.md`](docker/client/README-zh.md) (`opentunnel serve`, persistent `/data` volume).
@@ -290,6 +320,9 @@ cargo test
   provisioning controls, the tunnel and connection caps (global, per address,
   and visitor share), header and idle timeouts, and bridge stall and overflow
   handling.
+- `tests/cli.rs` — runs the binary's `status`, `tunnels`, `tunnel`, and
+  `issuances` subcommands against real databases, and checks that their output
+  carries no key material and that they leave tunnel state untouched.
 - Unit tests: ClientHello parser, CSR validation (incl. tampered signatures),
   CIDR parsing and rate limiting, and the database and bridge state machines.
 - `.github/scripts/test-fetch-official-client.sh` — offline checks for the CI
