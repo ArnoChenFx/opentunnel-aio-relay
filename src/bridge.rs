@@ -6,6 +6,7 @@
 //! existing clients work without modification.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering},
@@ -423,9 +424,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         return Err(error);
     }
 
-    // A panic in the relay loop must still unregister the bridge; otherwise it
-    // stays attached and blocks route ownership for reconnecting clients.
-    let relay_result = AssertUnwindSafe(bridge_relay_loop(
+    let relay = bridge_relay_loop(
         state.clone(),
         tunnel_id,
         &session,
@@ -434,16 +433,29 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         &mut shutdown_rx,
         &mut rx,
         ws_send_timeout,
-    ))
-    .catch_unwind()
-    .await;
-
-    detach_bridge(&state.db, &session, &bridge_id).await;
+    );
+    let result = run_attached_relay(&state.db, &session, &bridge_id, tunnel_id, relay).await;
     let _ = socket.close().await;
+    result
+}
 
+/// Runs the relay of an attached bridge and detaches the bridge afterwards, also
+/// when the relay panics. A bridge left registered keeps its routes owned and
+/// blocks reconnecting clients.
+async fn run_attached_relay<F>(
+    db: &Db,
+    session: &Session,
+    bridge_id: &str,
+    tunnel_id: &str,
+    relay: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    let relay_result = AssertUnwindSafe(relay).catch_unwind().await;
+    detach_bridge(db, session, bridge_id).await;
     match relay_result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
+        Ok(result) => result,
         Err(_) => {
             tracing::error!(tunnel = %tunnel_id, bridge = %bridge_id, "bridge relay panicked");
             Ok(())
@@ -987,6 +999,33 @@ mod tests {
             .open_channel_for_route("@", TEST_BUDGET)
             .await
             .is_some());
+    }
+
+    async fn relay_panics() -> Result<()> {
+        panic!("relay bug")
+    }
+
+    #[tokio::test]
+    async fn panicking_relay_detaches_its_bridge() {
+        let (db, path) = test_db().await;
+        let session = test_session("test");
+        assert!(register_bridge(&db, &session, bridge("panicked", "@"))
+            .await
+            .unwrap()
+            .is_none());
+
+        run_attached_relay(&db, &session, "panicked", "test", relay_panics())
+            .await
+            .unwrap();
+
+        assert!(session.bridges.lock().await.is_empty());
+        assert!(register_bridge(&db, &session, bridge("replacement", "@"))
+            .await
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[tokio::test]
