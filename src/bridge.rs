@@ -455,7 +455,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
 async fn bridge_relay_loop(
     state: Arc<AppState>,
     tunnel_id: &str,
-    session: &Session,
+    session: &Arc<Session>,
     bridge_id: &str,
     socket: &mut WebSocket,
     shutdown_rx: &mut watch::Receiver<bool>,
