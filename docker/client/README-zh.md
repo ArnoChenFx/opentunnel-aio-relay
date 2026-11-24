@@ -80,4 +80,4 @@ docker compose -f docker/client/docker-compose.yml up -d --build
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `OPENTUNNEL_VERSION` | `0.6.1` | 官方 release 版本号（可填 `latest`） |
+| `OPENTUNNEL_VERSION` | `0.7.0` | 官方 release 版本号（可填 `latest`） |
