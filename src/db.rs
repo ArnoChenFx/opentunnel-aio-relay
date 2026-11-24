@@ -11,14 +11,26 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::error::{Error, Result};
 
 /// Length of the rolling window the daily certificate budget counts over.
 pub const ISSUANCE_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const HOUR_MS: i64 = 3600 * 1000;
+
+/// File name of the database inside the data directory.
+pub const DATABASE_FILE: &str = "relay.db";
+/// Meta keys a serving relay maintains so `status` can tell a running relay
+/// from one that has stopped.
+pub const META_STARTED_AT: &str = "started_at";
+pub const META_HEARTBEAT_AT: &str = "heartbeat_at";
+/// How often a serving relay refreshes `META_HEARTBEAT_AT`.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+/// A heartbeat older than this means no relay is serving the database.
+pub const HEARTBEAT_STALE_MS: i64 = 3 * 1000 * HEARTBEAT_INTERVAL_SECS as i64;
 
 /// Certificate lifecycle state, mirroring the protocol's CertificateState.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +157,9 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX IF NOT EXISTS idx_tunnels_renewal ON tunnels (renewal_next_at, renewal_started_at)
          WHERE deleted_at IS NULL AND cert_state = 'ready' AND csr_pem IS NOT NULL AND cert_expiry IS NOT NULL;",
 ];
+
+/// The `user_version` a database has once every migration has run.
+pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 
 /// Fields needed for the hourly renewal scan (avoids loading full certificate PEMs).
 #[derive(Debug, Clone)]
@@ -595,6 +610,19 @@ impl Db {
         .await
     }
 
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let (key, value) = (key.to_owned(), value.to_owned());
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Returns the stored value for `key`, storing `candidate` first if the
     /// key is absent. Used for the ACME account key, which must be created once
     /// even when several issuances start together.
@@ -625,6 +653,21 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+/// Opens an existing database for inspection while a relay may be serving it.
+/// Unlike [`Db::open`], this never creates the file, applies no migrations, and
+/// leaves tunnel state alone. SQLite rejects every write on the handle.
+pub fn open_read_only(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
+}
+
+/// The `user_version` of an open database: 0 when it has no schema yet.
+pub fn schema_version(conn: &Connection) -> Result<usize> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(usize::try_from(version).unwrap_or(0))
 }
 
 fn load_record(conn: &Connection, id: &str) -> Result<Option<TunnelRecord>> {
@@ -1020,6 +1063,56 @@ mod tests {
             "offline"
         );
         drop(reopened);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn read_only_inspection_leaves_tunnel_state_alone() {
+        let (db, path) = open_with_tunnel("readonly-state", "t1").await;
+        db.set_online("t1", true, "now").await.unwrap();
+
+        let inspected = open_read_only(&path).unwrap();
+        assert_eq!(schema_version(&inspected).unwrap(), SCHEMA_VERSION);
+        let state: String = inspected
+            .query_row("SELECT state FROM tunnels WHERE id = 't1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "online");
+        drop(inspected);
+
+        assert_eq!(db.get_tunnel("t1").await.unwrap().unwrap().state, "online");
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn read_only_handle_refuses_writes_and_never_creates_a_file() {
+        let (db, path) = open_with_tunnel("readonly-write", "t1").await;
+        let inspected = open_read_only(&path).unwrap();
+        assert!(inspected
+            .execute("UPDATE tunnels SET state = 'online'", [])
+            .is_err());
+        drop(inspected);
+
+        let missing = temp_db_path("readonly-missing");
+        assert!(open_read_only(&missing).is_err());
+        assert!(!missing.exists());
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn set_meta_overwrites_the_previous_value() {
+        let (db, path) = open_with_tunnel("meta", "t1").await;
+        db.set_meta(META_HEARTBEAT_AT, "first").await.unwrap();
+        db.set_meta(META_HEARTBEAT_AT, "second").await.unwrap();
+        assert_eq!(
+            db.get_meta(META_HEARTBEAT_AT).await.unwrap().as_deref(),
+            Some("second")
+        );
+        drop(db);
         cleanup(&path);
     }
 }

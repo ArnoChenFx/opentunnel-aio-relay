@@ -20,8 +20,13 @@ use tokio::sync::Semaphore;
 
 use clap::Parser;
 use opentunnel_relay::{
-    acme, api, bridge::SessionManager, config::Config, db::Db, guard::RateLimiter, ingress,
-    state::AppState,
+    acme, api,
+    bridge::SessionManager,
+    config::Config,
+    db::{self, Db},
+    guard::RateLimiter,
+    ingress,
+    state::{now_rfc3339, AppState},
 };
 use tracing_subscriber::EnvFilter;
 
@@ -48,7 +53,9 @@ async fn main() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let db = Arc::new(Db::open(&config.data_dir.join("relay.db"))?);
+    let db = Arc::new(Db::open(&config.data_dir.join(db::DATABASE_FILE))?);
+    db.set_meta(db::META_STARTED_AT, &now_rfc3339()).await?;
+    tokio::spawn(heartbeat(db.clone()));
     let http = reqwest::Client::builder()
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
@@ -112,4 +119,15 @@ async fn main() -> anyhow::Result<()> {
         "opentunnel-relay starting"
     );
     ingress::run(state, router).await
+}
+
+/// Keeps the database heartbeat fresh so `status` can tell a running relay from
+/// one that has stopped.
+async fn heartbeat(db: Arc<Db>) {
+    loop {
+        if let Err(e) = db.set_meta(db::META_HEARTBEAT_AT, &now_rfc3339()).await {
+            tracing::warn!(error = %e, "could not record relay heartbeat");
+        }
+        tokio::time::sleep(Duration::from_secs(db::HEARTBEAT_INTERVAL_SECS)).await;
+    }
 }
