@@ -80,4 +80,6 @@ docker compose -f docker/client/docker-compose.yml up -d --build
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `OPENTUNNEL_VERSION` | `0.6.1` | 官方 release 版本号（可填 `latest`） |
+| `OPENTUNNEL_VERSION` | `latest` | 官方 release 版本号（也可填具体版本，如 `0.7.0`） |
+
+构建时会下载该 release 的 `opentunnel-linux-x64.tar.gz`，并用同一 release 的 `SHA256SUMS` 校验，校验失败则构建中止。`latest` 解析为下载时的最新 release。Docker 会缓存下载层，本地要刷新时使用 `docker buildx build --no-cache-filters fetch ...`；GHCR 工作流每次构建都会重新下载。

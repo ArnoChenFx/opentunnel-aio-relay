@@ -4,7 +4,7 @@ services:
       context: ../..
       dockerfile: docker/client/Dockerfile
       args:
-        OPENTUNNEL_VERSION: "0.6.1"
+        OPENTUNNEL_VERSION: "latest"
     image: opentunnel-client:local
     restart: unless-stopped
     environment:

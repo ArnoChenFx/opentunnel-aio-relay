@@ -6,6 +6,8 @@
 //! existing clients work without modification.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering},
     Arc,
@@ -13,7 +15,7 @@ use std::sync::{
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, RwLock};
 
@@ -422,9 +424,59 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         return Err(error);
     }
 
+    let relay = bridge_relay_loop(
+        state.clone(),
+        tunnel_id,
+        &session,
+        &bridge_id,
+        socket,
+        &mut shutdown_rx,
+        &mut rx,
+        ws_send_timeout,
+    );
+    let result = run_attached_relay(&state.db, &session, &bridge_id, tunnel_id, relay).await;
+    let _ = socket.close().await;
+    result
+}
+
+/// Runs the relay of an attached bridge and detaches the bridge afterwards, also
+/// when the relay panics. A bridge left registered keeps its routes owned and
+/// blocks reconnecting clients.
+async fn run_attached_relay<F>(
+    db: &Db,
+    session: &Session,
+    bridge_id: &str,
+    tunnel_id: &str,
+    relay: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    let relay_result = AssertUnwindSafe(relay).catch_unwind().await;
+    detach_bridge(db, session, bridge_id).await;
+    match relay_result {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(tunnel = %tunnel_id, bridge = %bridge_id, "bridge relay panicked");
+            Ok(())
+        }
+    }
+}
+
+/// Bidirectional relay after a successful attach handshake.
+async fn bridge_relay_loop(
+    state: Arc<AppState>,
+    tunnel_id: &str,
+    session: &Arc<Session>,
+    bridge_id: &str,
+    socket: &mut WebSocket,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    rx: &mut mpsc::Receiver<OutMsg>,
+    ws_send_timeout: Duration,
+) -> Result<()> {
     // Renew now if the certificate is close to expiry (covers idle tunnels
     // coming back). Runs in the background; the current cert keeps serving.
-    crate::acme::maybe_renew_on_attach(state.clone(), tunnel_id).await;
+    crate::acme::maybe_renew_on_attach(state, tunnel_id).await;
 
     let idle = tokio::time::sleep(std::time::Duration::from_millis(bridge::IDLE_TIMEOUT_MS));
     tokio::pin!(idle);
@@ -461,7 +513,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                 match msg {
                     Message::Text(text) => {
                         if let Some(control) = parse_client_message(&text) {
-                            if let Some(reply) = handle_control(&session, &bridge_id, control).await {
+                            if let Some(reply) = handle_control(session, bridge_id, control).await {
                                 if send_text(socket, &reply, ws_send_timeout)
                                     .await
                                     .is_err()
@@ -477,7 +529,7 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
                             break;
                         }
                         if let Some((conn, payload)) = decode_data_frame(&data) {
-                            if session.enqueue_data(&bridge_id, conn, payload).await == Enqueue::Overflowed {
+                            if session.enqueue_data(bridge_id, conn, payload).await == Enqueue::Overflowed {
                                 tracing::debug!(tunnel = %tunnel_id, bridge = %bridge_id, conn, "visitor buffer full; resetting connection");
                                 let reset = ServerMessage::Reset {
                                     conn,
@@ -503,8 +555,6 @@ async fn bridge_loop(state: Arc<AppState>, tunnel_id: &str, socket: &mut WebSock
         }
     }
 
-    detach_bridge(&state.db, &session, &bridge_id).await;
-    let _ = socket.close().await;
     Ok(())
 }
 
@@ -949,6 +999,33 @@ mod tests {
             .open_channel_for_route("@", TEST_BUDGET)
             .await
             .is_some());
+    }
+
+    async fn relay_panics() -> Result<()> {
+        panic!("relay bug")
+    }
+
+    #[tokio::test]
+    async fn panicking_relay_detaches_its_bridge() {
+        let (db, path) = test_db().await;
+        let session = test_session("test");
+        assert!(register_bridge(&db, &session, bridge("panicked", "@"))
+            .await
+            .unwrap()
+            .is_none());
+
+        run_attached_relay(&db, &session, "panicked", "test", relay_panics())
+            .await
+            .unwrap();
+
+        assert!(session.bridges.lock().await.is_empty());
+        assert!(register_bridge(&db, &session, bridge("replacement", "@"))
+            .await
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[tokio::test]
