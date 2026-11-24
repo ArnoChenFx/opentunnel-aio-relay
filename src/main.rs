@@ -18,27 +18,39 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use opentunnel_relay::{
     acme, api,
     bridge::SessionManager,
     config::Config,
     db::{self, Db},
     guard::RateLimiter,
-    ingress,
+    ingress, inspect,
     state::{now_rfc3339, AppState},
 };
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut config = Config::parse();
+    if let Some(command) = config.command.take() {
+        return inspect::run(command, &config);
+    }
+    if config.domain.trim().is_empty() {
+        Config::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "the following required argument was not provided: --domain <DOMAIN>",
+            )
+            .exit();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let mut config = Config::parse();
     config.normalize()?;
     tracing::info!(
         dns_provider = config.dns_provider_kind()?.as_str(),

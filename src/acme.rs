@@ -828,7 +828,7 @@ async fn order_certificate(state: &AppState, csr_pem: &str, cert_id: &str) -> Re
 }
 
 /// Renew a certificate once it is this close to expiry.
-const RENEW_BEFORE_SECS: i64 = 30 * 24 * 3600;
+pub(crate) const RENEW_BEFORE_SECS: i64 = 30 * 24 * 3600;
 /// A tunnel that has not connected for this long is not renewed proactively.
 const ACTIVE_WINDOW_SECS: i64 = 90 * 24 * 3600;
 
@@ -1001,7 +1001,7 @@ fn rfc3339_secs(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-fn expires_within(cert_expiry: Option<&str>, now_secs: i64, window_secs: i64) -> bool {
+pub(crate) fn expires_within(cert_expiry: Option<&str>, now_secs: i64, window_secs: i64) -> bool {
     cert_expiry
         .and_then(rfc3339_secs)
         .is_some_and(|expiry| expiry - now_secs <= window_secs)
