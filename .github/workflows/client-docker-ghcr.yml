@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       opentunnel_version:
-        description: Official opentunnel client release (e.g. 0.7.0 or latest)
+        description: Official opentunnel client release (latest or a version e.g. 0.7.0)
         required: false
-        default: '0.7.0'
+        default: 'latest'
       push:
         description: Push to GHCR (disable to build only)
         type: boolean
@@ -26,7 +26,7 @@ env:
   REGISTRY: ghcr.io
   # GHCR package: ghcr.io/<owner>/<repo>/opentunnel-client (lowercased at push)
   IMAGE: ghcr.io/${{ github.repository }}/opentunnel-client
-  OPENTUNNEL_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.opentunnel_version || '0.7.0' }}
+  OPENTUNNEL_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.opentunnel_version || 'latest' }}
 
 jobs:
   build:

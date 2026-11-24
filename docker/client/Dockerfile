@@ -2,7 +2,7 @@
 #
 # Build:
 #   docker build -f docker/client/Dockerfile \
-#     --build-arg OPENTUNNEL_VERSION=0.7.0 \
+#     --build-arg OPENTUNNEL_VERSION=latest \
 #     -t opentunnel-client .
 #
 # Run:
@@ -11,7 +11,7 @@
 #     --add-host=host.docker.internal:host-gateway \
 #     opentunnel-client
 
-ARG OPENTUNNEL_VERSION=0.7.0
+ARG OPENTUNNEL_VERSION=latest
 
 FROM debian:bookworm-slim AS fetch
 ARG OPENTUNNEL_VERSION
