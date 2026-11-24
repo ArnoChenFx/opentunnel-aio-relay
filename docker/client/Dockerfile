@@ -18,15 +18,21 @@ ARG OPENTUNNEL_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
+# Resolve the tag once so the tarball and its SHA256SUMS come from the same release.
 RUN set -eux; \
   ver="${OPENTUNNEL_VERSION}"; \
   if [ "$ver" = "latest" ]; then \
-    url="https://github.com/anomalyco/opentunnel/releases/latest/download/opentunnel-linux-x64.tar.gz"; \
+    tag="$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/anomalyco/opentunnel/releases/latest)"; \
+    tag="${tag##*/}"; \
   else \
-    url="https://github.com/anomalyco/opentunnel/releases/download/v${ver#v}/opentunnel-linux-x64.tar.gz"; \
+    tag="v${ver#v}"; \
   fi; \
-  curl -fsSL --retry 3 -o opentunnel.tar.gz "$url"; \
-  tar -xzf opentunnel.tar.gz; \
+  base="https://github.com/anomalyco/opentunnel/releases/download/${tag}"; \
+  curl -fsSL --retry 3 -O "${base}/opentunnel-linux-x64.tar.gz"; \
+  curl -fsSL --retry 3 -O "${base}/SHA256SUMS"; \
+  grep -E '  opentunnel-linux-x64\.tar\.gz$' SHA256SUMS > expected.sha256; \
+  sha256sum -c expected.sha256; \
+  tar -xzf opentunnel-linux-x64.tar.gz; \
   chmod +x opentunnel; \
   ./opentunnel --version
 
