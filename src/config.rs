@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,9 +13,10 @@ use crate::guard::CidrList;
 #[derive(Debug, Parser, Clone)]
 #[command(name = "opentunnel-relay", version)]
 pub struct Config {
-    /// Public domain served by this relay, e.g. tunnel.example.com.
-    /// Tunnel hostnames become <id>.<domain>; the API lives at https://<domain>.
-    #[arg(long, env = "OT_DOMAIN")]
+    /// Public domain served by this relay, e.g. tunnel.example.com. Required to
+    /// serve; the inspection subcommands do not read it. Tunnel hostnames become
+    /// <id>.<domain>; the API lives at https://<domain>.
+    #[arg(long, env = "OT_DOMAIN", default_value = "", hide_default_value = true)]
     pub domain: String,
 
     /// TCP listen address. One port serves both the API and tunnel ingress.
@@ -23,7 +24,7 @@ pub struct Config {
     pub listen: String,
 
     /// Directory for the SQLite database and the API TLS certificate/key.
-    #[arg(long, env = "OT_DATA_DIR", default_value = "./data")]
+    #[arg(long, env = "OT_DATA_DIR", default_value = "./data", global = true)]
     pub data_dir: PathBuf,
 
     /// DNS service that publishes the ACME DNS-01 TXT records: `cloudflare` or
@@ -99,13 +100,13 @@ pub struct Config {
     pub dns_propagation: Duration,
 
     /// Maximum number of live (not deleted) tunnels. 0 disables the limit.
-    #[arg(long, env = "OT_MAX_TUNNELS", default_value_t = 1000)]
+    #[arg(long, env = "OT_MAX_TUNNELS", default_value_t = 1000, global = true)]
     pub max_tunnels: u64,
 
     /// Maximum new certificate orders per rolling 24 hours, counted across all
     /// tunnels. Renewals are never refused, but they count toward the total so
     /// the figure reflects what Let's Encrypt sees. 0 disables the limit.
-    #[arg(long, env = "OT_MAX_CERTS_PER_DAY", default_value_t = 7)]
+    #[arg(long, env = "OT_MAX_CERTS_PER_DAY", default_value_t = 7, global = true)]
     pub max_certs_per_day: u64,
 
     /// Maximum connections open at once on the listener: API requests, bridge
@@ -186,8 +187,49 @@ pub struct Config {
     #[arg(long, env = "OT_RATE_LIMIT_PER_HOUR", default_value_t = 30)]
     pub rate_limit_per_hour: u32,
 
+    /// Read-only views of the database. Without one, the relay serves.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     #[arg(skip)]
     pub timeouts: Timeouts,
+}
+
+/// Read-only views of the relay database. They can run while a relay serves.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Relay state, tunnel and certificate counts, and the daily certificate budget.
+    Status {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List tunnels with their state, certificate expiry, and last connection.
+    Tunnels {
+        /// Include deleted tunnels that are still in the database.
+        #[arg(long)]
+        all: bool,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one tunnel: its certificate, renewal state, and recent certificate activity.
+    Tunnel {
+        /// Tunnel id, as printed by `tunnels`.
+        id: String,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Certificate orders, renewals, and requeues from the last 24 hours.
+    Issuances {
+        /// Most recent entries to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The DNS service that publishes ACME DNS-01 TXT records.
@@ -725,5 +767,43 @@ mod tests {
         let error = config.normalize().unwrap_err().to_string();
         assert!(error.contains("OT_ACME_EMAIL"), "{error}");
         assert!(error.contains("acme@localhost"), "{error}");
+    }
+
+    #[test]
+    fn inspection_subcommands_parse_without_a_domain() {
+        let config = Config::try_parse_from(["opentunnel-relay", "status", "--json"]).unwrap();
+        assert!(matches!(
+            config.command,
+            Some(Command::Status { json: true })
+        ));
+    }
+
+    #[test]
+    fn data_dir_and_limits_are_accepted_after_the_subcommand() {
+        let config = Config::try_parse_from([
+            "opentunnel-relay",
+            "tunnels",
+            "--all",
+            "--data-dir",
+            "/srv/relay",
+            "--max-tunnels",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("/srv/relay"));
+        assert_eq!(config.max_tunnels, 5);
+        assert!(matches!(
+            config.command,
+            Some(Command::Tunnels {
+                all: true,
+                json: false
+            })
+        ));
+    }
+
+    #[test]
+    fn serving_without_a_subcommand_still_has_no_command() {
+        let config = parse(&[]);
+        assert!(config.command.is_none());
     }
 }

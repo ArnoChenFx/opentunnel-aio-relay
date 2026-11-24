@@ -18,22 +18,39 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use opentunnel_relay::{
-    acme, api, bridge::SessionManager, config::Config, db::Db, guard::RateLimiter, ingress,
-    state::AppState,
+    acme, api,
+    bridge::SessionManager,
+    config::Config,
+    db::{self, Db},
+    guard::RateLimiter,
+    ingress, inspect,
+    state::{now_rfc3339, AppState},
 };
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut config = Config::parse();
+    if let Some(command) = config.command.take() {
+        return inspect::run(command, &config);
+    }
+    if config.domain.trim().is_empty() {
+        Config::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "the following required argument was not provided: --domain <DOMAIN>",
+            )
+            .exit();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let mut config = Config::parse();
     config.normalize()?;
     tracing::info!(
         dns_provider = config.dns_provider_kind()?.as_str(),
@@ -48,7 +65,9 @@ async fn main() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&config.data_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let db = Arc::new(Db::open(&config.data_dir.join("relay.db"))?);
+    let db = Arc::new(Db::open(&config.data_dir.join(db::DATABASE_FILE))?);
+    db.set_meta(db::META_STARTED_AT, &now_rfc3339()).await?;
+    tokio::spawn(heartbeat(db.clone()));
     let http = reqwest::Client::builder()
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
@@ -112,4 +131,15 @@ async fn main() -> anyhow::Result<()> {
         "opentunnel-relay starting"
     );
     ingress::run(state, router).await
+}
+
+/// Keeps the database heartbeat fresh so `status` can tell a running relay from
+/// one that has stopped.
+async fn heartbeat(db: Arc<Db>) {
+    loop {
+        if let Err(e) = db.set_meta(db::META_HEARTBEAT_AT, &now_rfc3339()).await {
+            tracing::warn!(error = %e, "could not record relay heartbeat");
+        }
+        tokio::time::sleep(Duration::from_secs(db::HEARTBEAT_INTERVAL_SECS)).await;
+    }
 }

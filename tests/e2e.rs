@@ -58,6 +58,7 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         acme_concurrency: 8,
         create_allow_cidrs: CidrList::default(),
         rate_limit_per_hour: 0,
+        command: None,
         timeouts: Timeouts {
             bridge_stall: Duration::from_millis(500),
             ..Timeouts::default()

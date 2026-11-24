@@ -10,6 +10,7 @@ pub mod dns;
 pub mod error;
 pub mod guard;
 pub mod ingress;
+pub mod inspect;
 pub mod proto;
 pub mod sni;
 pub mod state;
